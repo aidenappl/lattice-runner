@@ -31,7 +31,7 @@ command -v go >/dev/null 2>&1 || {
     exit 1
 }
 
-echo "Current binary: $(ls -lh $INSTALL_DIR/lattice-runner | awk '{print $5, $6, $7, $8}')"
+echo "Current version: $($INSTALL_DIR/lattice-runner version 2>/dev/null || echo 'unknown')"
 echo ""
 
 # Clone and build
@@ -40,8 +40,9 @@ rm -rf "$BUILD_DIR"
 git clone --depth=1 "$REPO" "$BUILD_DIR" 2>&1 | tail -1
 cd "$BUILD_DIR"
 
-echo "Building..."
-CGO_ENABLED=0 go build -ldflags="-w -s" -o lattice-runner .
+VERSION=$(git rev-parse --short HEAD)
+echo "Building $VERSION..."
+CGO_ENABLED=0 go build -ldflags="-w -s -X main.Version=${VERSION}" -o lattice-runner .
 echo "  Built: $(ls -lh lattice-runner | awk '{print $5}')"
 echo ""
 

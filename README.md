@@ -1,6 +1,6 @@
 # lattice-runner
 
-Lightweight agent that runs on each worker VM in the Lattice platform. Connects to the central orchestrator via WebSocket, executes container deployments, and reports system metrics.
+Lightweight agent that runs on each worker VM in the Lattice platform. Connects to the central orchestrator via WebSocket, executes container deployments, and reports system metrics. Includes a local web dashboard for at-a-glance status.
 
 ---
 
@@ -8,7 +8,7 @@ Lightweight agent that runs on each worker VM in the Lattice platform. Connects 
 
 The fastest way to set up a worker is from the Lattice dashboard:
 
-1. Go to **Workers** → **Add Worker**, enter a name and hostname
+1. Go to **Workers** -> **Add Worker**, enter a name and hostname
 2. Copy the one-liner shown after creation and run it on the target VM:
 
 ```bash
@@ -107,6 +107,7 @@ sudo systemctl enable --now lattice-runner
 | `WORKER_NAME` | No | Human-readable worker name (defaults to hostname) |
 | `HEARTBEAT_INTERVAL` | No | Metrics reporting interval (default `15s`) |
 | `RECONNECT_INTERVAL` | No | Reconnect backoff on disconnect (default `5s`) |
+| `DASHBOARD_PORT` | No | Local dashboard port (default `9100`) |
 
 ---
 
@@ -115,6 +116,7 @@ sudo systemctl enable --now lattice-runner
 - **Go 1.24** with gorilla/websocket
 - **Docker Engine API** — container lifecycle management
 - **WebSocket** — persistent connection to the orchestrator
+- **Built-in HTTP server** — local status dashboard
 
 ---
 
@@ -123,10 +125,52 @@ sudo systemctl enable --now lattice-runner
 - **One-liner install** — `curl | bash` from the dashboard sets up everything including systemd
 - **Interactive setup** — `lattice-runner setup` walks through configuration
 - **Auto-reconnect** — Maintains persistent WebSocket connection with backoff
-- **Heartbeat** — Reports CPU, memory, disk, network, and container count at configurable intervals
+- **Heartbeat** — Reports CPU, memory, disk, network, swap, load average, and container count at configurable intervals
 - **Deployment strategies** — Rolling, blue-green, and canary deployments
 - **Container lifecycle** — Pull, create, start, stop, restart, remove containers on demand
 - **Registry auth** — Supports authenticated image pulls via credentials from the orchestrator
+- **Local dashboard** — Web UI showing real-time system metrics and container status
+
+---
+
+## Update
+
+To update an existing runner to the latest version:
+
+```bash
+curl -fsSL https://lattice-api.appleby.cloud/install/update.sh | bash
+```
+
+---
+
+## Version Check
+
+```bash
+lattice-runner version
+```
+
+Prints the current version string (e.g. `v0.0.1`). The version is hardcoded in the binary and can be overridden at build time:
+
+```bash
+go build -ldflags "-X main.Version=v1.2.3" -o lattice-runner .
+```
+
+---
+
+## Local Dashboard
+
+Each runner serves a status dashboard on its configured port:
+
+```
+http://<ip>:9100
+```
+
+The dashboard shows:
+- System info (hostname, OS, arch, Docker version, runner version)
+- Real-time CPU, memory, disk, swap, and network metrics
+- Load average and process count
+- Running containers with state and image info
+- Container log viewer
 
 ---
 
@@ -137,4 +181,6 @@ sudo systemctl status lattice-runner      # check status
 sudo journalctl -u lattice-runner -f      # view logs
 sudo systemctl restart lattice-runner     # restart
 sudo systemctl stop lattice-runner        # stop
+sudo systemctl enable lattice-runner      # enable on boot
+sudo systemctl disable lattice-runner     # disable on boot
 ```

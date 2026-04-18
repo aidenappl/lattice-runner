@@ -53,6 +53,7 @@ const dashboardHTML = `<!DOCTYPE html>
       </svg>
     </div>
     <h1 id="worker-name">Lattice Runner</h1>
+    <span id="header-version" style="font-size:12px;color:#555;font-weight:400;margin-left:auto;font-family:'SF Mono','Fira Code',monospace;"></span>
   </div>
 
   <div class="grid" id="metrics"></div>
@@ -132,6 +133,7 @@ async function refresh() {
 
     document.getElementById('worker-name').innerHTML = d.worker_name +
       '<span>up ' + fmtUptime(m.uptime_seconds) + '</span>';
+    document.getElementById('header-version').textContent = d.version;
 
     var cpuPct = pct(m.cpu_percent, 100);
     document.getElementById('metrics').innerHTML =
@@ -148,7 +150,8 @@ async function refresh() {
       info('Hostname', d.hostname) +
       info('OS / Arch', d.os + ' / ' + d.arch) +
       info('Docker', d.docker_version) +
-      info('Go', d.go_version);
+      info('Go', d.go_version) +
+      info('Runner Version', d.version);
 
     document.getElementById('resources').innerHTML =
       info('Load Average', m.load_avg_1.toFixed(2) + ' / ' + m.load_avg_5.toFixed(2) + ' / ' + m.load_avg_15.toFixed(2)) +

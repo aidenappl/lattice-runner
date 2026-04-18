@@ -21,13 +21,20 @@ import (
 	"github.com/aidenappl/lattice-runner/web"
 )
 
+// Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
+var Version = "v0.0.1"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		cmd.RunSetup()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "version" {
+		fmt.Println(Version)
+		return
+	}
 
-	fmt.Println("Lattice Runner starting...")
+	fmt.Printf("Lattice Runner %s\n\n", Version)
 
 	// Load configuration
 	cfg := config.Load()
@@ -74,12 +81,13 @@ func main() {
 			_ = ws.SendJSON(client.OutgoingMessage{
 				Type: "registration",
 				Payload: map[string]any{
-					"name":           cfg.WorkerName,
-					"hostname":       hostname(),
-					"os":             runtime.GOOS,
-					"arch":           runtime.GOARCH,
-					"docker_version": dockerVersion,
-					"ip_address":     localIP(),
+					"name":            cfg.WorkerName,
+					"hostname":        hostname(),
+					"os":              runtime.GOOS,
+					"arch":            runtime.GOARCH,
+					"docker_version":  dockerVersion,
+					"ip_address":      localIP(),
+					"runner_version":  Version,
 				},
 			})
 
@@ -221,6 +229,7 @@ func main() {
 	// Start local dashboard
 	dashboard := &web.Server{
 		Docker:     docker,
+		Version:    Version,
 		WorkerName: cfg.WorkerName,
 		StartedAt:  time.Now(),
 		Port:       cfg.DashboardPort,

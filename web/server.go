@@ -20,6 +20,7 @@ import (
 type Server struct {
 	Docker     *dockerclient.Client
 	WorkerName string
+	Version    string
 	StartedAt  time.Time
 	Port       string
 }
@@ -55,6 +56,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]any{
+		"version":        s.Version,
 		"worker_name":    s.WorkerName,
 		"hostname":       getHostname(),
 		"os":             runtime.GOOS,
