@@ -40,9 +40,8 @@ rm -rf "$BUILD_DIR"
 git clone --depth=1 "$REPO" "$BUILD_DIR" 2>&1 | tail -1
 cd "$BUILD_DIR"
 
-VERSION=$(git rev-parse --short HEAD)
-echo "Building $VERSION..."
-CGO_ENABLED=0 go build -ldflags="-w -s -X main.Version=${VERSION}" -o lattice-runner .
+echo "Building..."
+CGO_ENABLED=0 go build -ldflags="-w -s" -o lattice-runner .
 echo "  Built: $(ls -lh lattice-runner | awk '{print $5}')"
 echo ""
 
