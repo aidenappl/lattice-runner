@@ -18,6 +18,7 @@ import (
 	"github.com/aidenappl/lattice-runner/deploy"
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 	"github.com/aidenappl/lattice-runner/metrics"
+	"github.com/aidenappl/lattice-runner/web"
 )
 
 func main() {
@@ -193,19 +194,38 @@ func main() {
 				_ = ws.SendJSON(client.OutgoingMessage{
 					Type: "heartbeat",
 					Payload: map[string]any{
-						"cpu_percent":      m.CPUPercent,
-						"memory_used_mb":   m.MemoryUsedMB,
-						"memory_total_mb":  m.MemoryTotalMB,
-						"disk_used_mb":     m.DiskUsedMB,
-						"disk_total_mb":    m.DiskTotalMB,
-						"container_count":  m.ContainerCount,
-						"network_rx_bytes": m.NetworkRxBytes,
-						"network_tx_bytes": m.NetworkTxBytes,
+						"cpu_percent":             m.CPUPercent,
+						"cpu_cores":               m.CPUCores,
+						"load_avg_1":              m.LoadAvg1,
+						"load_avg_5":              m.LoadAvg5,
+						"load_avg_15":             m.LoadAvg15,
+						"memory_used_mb":          m.MemoryUsedMB,
+						"memory_total_mb":         m.MemoryTotalMB,
+						"memory_free_mb":          m.MemoryFreeMB,
+						"swap_used_mb":            m.SwapUsedMB,
+						"swap_total_mb":           m.SwapTotalMB,
+						"disk_used_mb":            m.DiskUsedMB,
+						"disk_total_mb":           m.DiskTotalMB,
+						"container_count":         m.ContainerCount,
+						"container_running_count": m.ContainerRunningCount,
+						"network_rx_bytes":        m.NetworkRxBytes,
+						"network_tx_bytes":        m.NetworkTxBytes,
+						"uptime_seconds":          m.UptimeSeconds,
+						"process_count":           m.ProcessCount,
 					},
 				})
 			}
 		}
 	}()
+
+	// Start local dashboard
+	dashboard := &web.Server{
+		Docker:     docker,
+		WorkerName: cfg.WorkerName,
+		StartedAt:  time.Now(),
+		Port:       cfg.DashboardPort,
+	}
+	go dashboard.Start()
 
 	fmt.Println()
 	fmt.Println("Lattice Runner ready")
