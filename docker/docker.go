@@ -244,6 +244,17 @@ func (c *Client) ContainerLogs(ctx context.Context, containerID string, tail str
 	})
 }
 
+// StreamContainerLogs follows a container's logs from the current moment.
+func (c *Client) StreamContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
+	return c.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Since:      "0s",
+		Timestamps: true,
+	})
+}
+
 // CreateNetwork creates a Docker network.
 func (c *Client) CreateNetwork(ctx context.Context, name, driver string) error {
 	_, err := c.cli.NetworkCreate(ctx, name, network.CreateOptions{
@@ -267,6 +278,28 @@ func (c *Client) CreateVolume(ctx context.Context, name, driver string) error {
 
 func (c *Client) RemoveVolume(ctx context.Context, name string, force bool) error {
 	return c.cli.VolumeRemove(ctx, name, force)
+}
+
+// RecreateContainer stops, removes, and recreates a container with the same config.
+func (c *Client) RecreateContainer(ctx context.Context, containerID string, name string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspect container: %w", err)
+	}
+
+	_ = c.StopContainer(ctx, containerID, 10)
+	_ = c.RemoveContainer(ctx, containerID, true)
+
+	resp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, &network.NetworkingConfig{}, nil, name)
+	if err != nil {
+		return "", fmt.Errorf("recreate container: %w", err)
+	}
+
+	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return "", fmt.Errorf("start recreated container: %w", err)
+	}
+
+	return resp.ID, nil
 }
 
 func (c *Client) Close() error {

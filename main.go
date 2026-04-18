@@ -22,7 +22,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.0.1"
+var Version = "v0.0.2"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -81,13 +81,13 @@ func main() {
 			_ = ws.SendJSON(client.OutgoingMessage{
 				Type: "registration",
 				Payload: map[string]any{
-					"name":            cfg.WorkerName,
-					"hostname":        hostname(),
-					"os":              runtime.GOOS,
-					"arch":            runtime.GOARCH,
-					"docker_version":  dockerVersion,
-					"ip_address":      localIP(),
-					"runner_version":  Version,
+					"name":           cfg.WorkerName,
+					"hostname":       hostname(),
+					"os":             runtime.GOOS,
+					"arch":           runtime.GOARCH,
+					"docker_version": dockerVersion,
+					"ip_address":     localIP(),
+					"runner_version": Version,
 				},
 			})
 
@@ -122,12 +122,38 @@ func main() {
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "stop",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
 					return
 				}
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
 					log.Printf("failed to stop %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "stop",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
 				} else {
 					log.Printf("stopped container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "stop",
+							"status":         "success",
+						},
+					})
 				}
 			}()
 
@@ -140,12 +166,38 @@ func main() {
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "restart",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
 					return
 				}
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
 					log.Printf("failed to restart %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "restart",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
 				} else {
 					log.Printf("restarted container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "restart",
+							"status":         "success",
+						},
+					})
 				}
 			}()
 
@@ -157,11 +209,86 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "remove",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
 					return
 				}
 				_ = docker.StopContainer(ctx, id, 10)
-				_ = docker.RemoveContainer(ctx, id, true)
-				log.Printf("removed container %s", containerName)
+				if err := docker.RemoveContainer(ctx, id, true); err != nil {
+					log.Printf("failed to remove %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "remove",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("removed container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "remove",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "recreate":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("container %s not found for recreate", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "recreate",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+
+				newID, err := docker.RecreateContainer(ctx, id, containerName)
+				if err != nil {
+					log.Printf("failed to recreate %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "recreate",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+					return
+				}
+				log.Printf("recreated container %s -> %s", containerName, newID)
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "container_status",
+					Payload: map[string]any{
+						"container_name": containerName,
+						"action":         "recreate",
+						"status":         "success",
+					},
+				})
 			}()
 
 		case "pull_image":
@@ -187,6 +314,19 @@ func main() {
 
 	// Start WebSocket connection in background
 	go ws.Connect(ctx)
+
+	// Stream container logs to orchestrator
+	logStreamer := dockerclient.NewLogStreamer(docker, func(line dockerclient.LogLine) {
+		_ = ws.SendJSON(client.OutgoingMessage{
+			Type: "container_logs",
+			Payload: map[string]any{
+				"container_name": line.ContainerName,
+				"stream":         line.Stream,
+				"message":        line.Message,
+			},
+		})
+	}, 10*time.Second)
+	go logStreamer.Run(ctx)
 
 	// Heartbeat ticker
 	go func() {
