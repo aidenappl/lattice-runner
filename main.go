@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aidenappl/lattice-runner/client"
+	"github.com/aidenappl/lattice-runner/cmd"
 	"github.com/aidenappl/lattice-runner/config"
 	"github.com/aidenappl/lattice-runner/deploy"
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -20,6 +21,11 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		cmd.RunSetup()
+		return
+	}
+
 	fmt.Println("Lattice Runner starting...")
 
 	// Load configuration
