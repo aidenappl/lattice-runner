@@ -194,6 +194,10 @@ func (c *Client) StopContainer(ctx context.Context, containerID string, timeout 
 	return c.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &t})
 }
 
+func (c *Client) StartContainer(ctx context.Context, containerID string) error {
+	return c.cli.ContainerStart(ctx, containerID, container.StartOptions{})
+}
+
 func (c *Client) RemoveContainer(ctx context.Context, containerID string, force bool) error {
 	return c.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: force})
 }

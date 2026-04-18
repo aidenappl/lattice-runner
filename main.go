@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"syscall"
@@ -22,7 +23,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.0.3"
+var Version = "v0.0.4"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -308,6 +309,137 @@ func main() {
 				} else {
 					log.Printf("pulled image %s", imageRef)
 				}
+			}()
+
+		case "reboot_os":
+			go func() {
+				log.Println("reboot command received, rebooting system...")
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"action":  "reboot_os",
+						"status":  "accepted",
+						"message": "system will reboot momentarily",
+					},
+				})
+				time.Sleep(1 * time.Second)
+				out, err := exec.Command("sudo", "reboot").CombinedOutput()
+				if err != nil {
+					log.Printf("reboot failed: %v — %s", err, string(out))
+				}
+			}()
+
+		case "upgrade_runner":
+			go func() {
+				log.Println("upgrade runner command received")
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"action":  "upgrade_runner",
+						"status":  "accepted",
+						"message": "starting runner upgrade",
+					},
+				})
+				out, err := exec.Command("bash", "-c", "curl -fsSL https://lattice-api.appleby.cloud/install/runner | bash").CombinedOutput()
+				if err != nil {
+					log.Printf("upgrade failed: %v — %s", err, string(out))
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": fmt.Sprintf("upgrade failed: %v", err),
+						},
+					})
+				} else {
+					log.Printf("upgrade completed: %s", string(out))
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "success",
+							"message": "upgrade completed, runner will restart via systemd",
+						},
+					})
+				}
+			}()
+
+		case "stop_all":
+			go func() {
+				log.Println("stop all containers command received")
+				containers, err := docker.ListContainers(ctx, "")
+				if err != nil {
+					log.Printf("failed to list containers: %v", err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "stop_all",
+							"status":  "failed",
+							"message": fmt.Sprintf("failed to list containers: %v", err),
+						},
+					})
+					return
+				}
+				stopped := 0
+				failed := 0
+				for _, c := range containers {
+					if c.State == "running" {
+						if err := docker.StopContainer(ctx, c.ID, 30); err != nil {
+							log.Printf("failed to stop %s: %v", c.ID[:12], err)
+							failed++
+						} else {
+							stopped++
+						}
+					}
+				}
+				log.Printf("stop_all complete: stopped=%d failed=%d", stopped, failed)
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"action":  "stop_all",
+						"status":  "success",
+						"message": fmt.Sprintf("stopped %d containers, %d failed", stopped, failed),
+					},
+				})
+			}()
+
+		case "start_all":
+			go func() {
+				log.Println("start all containers command received")
+				containers, err := docker.ListContainers(ctx, "")
+				if err != nil {
+					log.Printf("failed to list containers: %v", err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "start_all",
+							"status":  "failed",
+							"message": fmt.Sprintf("failed to list containers: %v", err),
+						},
+					})
+					return
+				}
+				started := 0
+				failed := 0
+				for _, c := range containers {
+					if c.State != "running" {
+						if err := docker.StartContainer(ctx, c.ID); err != nil {
+							log.Printf("failed to start %s: %v", c.ID[:12], err)
+							failed++
+						} else {
+							started++
+						}
+					}
+				}
+				log.Printf("start_all complete: started=%d failed=%d", started, failed)
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"action":  "start_all",
+						"status":  "success",
+						"message": fmt.Sprintf("started %d containers, %d failed", started, failed),
+					},
+				})
 			}()
 		}
 	})

@@ -149,7 +149,7 @@ curl -fsSL https://lattice-api.appleby.cloud/install/update.sh | bash
 lattice-runner version
 ```
 
-Prints the current version string (e.g. `v0.0.3`). The version is hardcoded in the binary and can be overridden at build time:
+Prints the current version string (e.g. `v0.0.4`). The version is hardcoded in the binary and can be overridden at build time:
 
 ```bash
 go build -ldflags "-X main.Version=v1.2.3" -o lattice-runner .
