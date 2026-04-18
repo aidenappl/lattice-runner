@@ -198,6 +198,18 @@ func (c *Client) StartContainer(ctx context.Context, containerID string) error {
 	return c.cli.ContainerStart(ctx, containerID, container.StartOptions{})
 }
 
+func (c *Client) KillContainer(ctx context.Context, containerID string) error {
+	return c.cli.ContainerKill(ctx, containerID, "SIGKILL")
+}
+
+func (c *Client) PauseContainer(ctx context.Context, containerID string) error {
+	return c.cli.ContainerPause(ctx, containerID)
+}
+
+func (c *Client) UnpauseContainer(ctx context.Context, containerID string) error {
+	return c.cli.ContainerUnpause(ctx, containerID)
+}
+
 func (c *Client) RemoveContainer(ctx context.Context, containerID string, force bool) error {
 	return c.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: force})
 }

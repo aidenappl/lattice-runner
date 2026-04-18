@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.0.4"
+var Version = "v0.0.5"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -158,6 +159,182 @@ func main() {
 				}
 			}()
 
+		case "start":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "start",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				if err := docker.StartContainer(ctx, id); err != nil {
+					log.Printf("failed to start %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "start",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("started container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "start",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "kill":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "kill",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				if err := docker.KillContainer(ctx, id); err != nil {
+					log.Printf("failed to kill %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "kill",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("killed container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "kill",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "pause":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "pause",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				if err := docker.PauseContainer(ctx, id); err != nil {
+					log.Printf("failed to pause %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "pause",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("paused container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "pause",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "unpause":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("container %s not found", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "unpause",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				if err := docker.UnpauseContainer(ctx, id); err != nil {
+					log.Printf("failed to unpause %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "unpause",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("unpaused container %s", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "unpause",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
 		case "restart":
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
@@ -252,6 +429,27 @@ func main() {
 				if containerName == "" {
 					return
 				}
+
+				// Pull the latest image before recreating.
+				imageRef, _ := env.Payload["image"].(string)
+				tag, _ := env.Payload["tag"].(string)
+				if imageRef != "" {
+					fullRef := imageRef
+					if tag != "" {
+						fullRef = imageRef + ":" + tag
+					}
+					var regAuth *dockerclient.RegistryAuth
+					if authData, ok := env.Payload["auth"]; ok {
+						b, _ := json.Marshal(authData)
+						regAuth = &dockerclient.RegistryAuth{}
+						_ = json.Unmarshal(b, regAuth)
+					}
+					log.Printf("pulling image %s before recreate of %s", fullRef, containerName)
+					if err := docker.PullImage(ctx, fullRef, regAuth); err != nil {
+						log.Printf("pull failed for %s: %v — proceeding with recreate anyway", fullRef, err)
+					}
+				}
+
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found for recreate", containerName)
@@ -460,7 +658,7 @@ func main() {
 	}, 10*time.Second)
 	go logStreamer.Run(ctx)
 
-	// Heartbeat ticker
+	// Heartbeat ticker — also pushes live container states each tick
 	go func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
 		defer ticker.Stop()
@@ -494,6 +692,71 @@ func main() {
 						"process_count":           m.ProcessCount,
 					},
 				})
+
+				// Push live container state snapshot so the orchestrator stays in sync
+				// even when containers are stopped/started outside of Lattice.
+				if containers, err := docker.ListContainers(ctx, ""); err == nil {
+					for _, c := range containers {
+						name := ""
+						for _, n := range c.Names {
+							trimmed := strings.TrimPrefix(n, "/")
+							if trimmed != "" {
+								name = trimmed
+								break
+							}
+						}
+						if name == "" {
+							continue
+						}
+
+						// Map Docker state to Lattice status.
+						var latticeStatus string
+						switch c.State {
+						case "running":
+							latticeStatus = "running"
+						case "exited", "dead":
+							latticeStatus = "stopped"
+						case "created", "restarting":
+							latticeStatus = "pending"
+						default:
+							latticeStatus = "error"
+						}
+
+						statePayload := map[string]any{
+							"container_name": name,
+							"state":          c.State,
+							"status":         latticeStatus,
+						}
+
+						// Report health status if available.
+						if c.Status != "" {
+							healthStatus := ""
+							switch {
+							case strings.Contains(c.Status, "(healthy)"):
+								healthStatus = "healthy"
+							case strings.Contains(c.Status, "(unhealthy)"):
+								healthStatus = "unhealthy"
+							case strings.Contains(c.Status, "(health: starting)"):
+								healthStatus = "starting"
+							}
+							if healthStatus != "" {
+								statePayload["health_status"] = healthStatus
+								_ = ws.SendJSON(client.OutgoingMessage{
+									Type: "container_health_status",
+									Payload: map[string]any{
+										"container_name": name,
+										"health_status":  healthStatus,
+									},
+								})
+							}
+						}
+
+						_ = ws.SendJSON(client.OutgoingMessage{
+							Type:    "container_sync",
+							Payload: statePayload,
+						})
+					}
+				}
 			}
 		}
 	}()
