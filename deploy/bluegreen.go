@@ -10,12 +10,12 @@ import (
 )
 
 func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) error {
-	e.reportProgress(spec.DeploymentID, "deploying", "starting blue-green deployment", nil)
+	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting blue-green deployment with %d containers", len(spec.Containers)), nil)
 
 	// Phase 1: Start all "green" containers with a temporary name suffix
 	greenIDs := make(map[string]string) // containerName -> greenContainerID
 
-	for _, cSpec := range spec.Containers {
+	for i, cSpec := range spec.Containers {
 		greenName := cSpec.Name + "-green"
 		imageRef := cSpec.Image + ":" + cSpec.Tag
 
@@ -26,6 +26,10 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				Password: cSpec.RegistryAuth.Password,
 			}
 		}
+
+		e.reportProgress(spec.DeploymentID, "deploying",
+			fmt.Sprintf("[%d/%d] pulling image %s for green container %s", i+1, len(spec.Containers), imageRef, greenName),
+			map[string]any{"container_name": greenName, "step": "pulling"})
 
 		log.Printf("deploy: pulling image %s for green", imageRef)
 		if err := e.Docker.PullImage(ctx, imageRef, regAuth); err != nil {
@@ -74,15 +78,19 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 	}
 
 	// Phase 2: Brief health check delay
-	e.reportProgress(spec.DeploymentID, "deploying", "green containers running, performing health check", nil)
+	e.reportProgress(spec.DeploymentID, "deploying", "all green containers running, performing 5s health check delay", nil)
 	time.Sleep(5 * time.Second)
 
 	// Phase 3: Stop blue (old) and rename green to take over
+	e.reportProgress(spec.DeploymentID, "deploying", "health check passed, swapping blue→green", nil)
 	for _, cSpec := range spec.Containers {
 		blueName := cSpec.Name
 		greenName := cSpec.Name + "-green"
 
 		// Stop and remove blue
+		e.reportProgress(spec.DeploymentID, "deploying",
+			fmt.Sprintf("stopping blue (old) container: %s", blueName),
+			map[string]any{"container_name": blueName, "step": "stopping_blue"})
 		if blueID, err := e.Docker.FindContainerByName(ctx, blueName); err == nil && blueID != "" {
 			_ = e.Docker.StopContainer(ctx, blueID, 30)
 			_ = e.Docker.RemoveContainer(ctx, blueID, true)

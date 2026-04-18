@@ -22,7 +22,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.0.2"
+var Version = "v0.0.3"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {

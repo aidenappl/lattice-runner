@@ -22,7 +22,7 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 	imageRef := canarySpec.Image + ":" + canarySpec.Tag
 
 	e.reportProgress(spec.DeploymentID, "deploying",
-		fmt.Sprintf("starting canary: %s", canaryName), nil)
+		fmt.Sprintf("starting canary deployment: %s (image=%s:%s)", canaryName, canarySpec.Image, canarySpec.Tag), nil)
 
 	// Pull image
 	var regAuth *dockerclient.RegistryAuth
@@ -33,9 +33,17 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 		}
 	}
 
+	e.reportProgress(spec.DeploymentID, "deploying",
+		fmt.Sprintf("pulling canary image: %s:%s", canarySpec.Image, canarySpec.Tag),
+		map[string]any{"container_name": canaryName, "step": "pulling"})
+
 	if err := e.Docker.PullImage(ctx, imageRef, regAuth); err != nil {
 		return fmt.Errorf("pull canary image: %w", err)
 	}
+
+	e.reportProgress(spec.DeploymentID, "deploying",
+		fmt.Sprintf("canary image pulled, creating container: %s", canaryName),
+		map[string]any{"container_name": canaryName, "step": "creating"})
 
 	// Start canary (no port bindings — runs alongside existing)
 	dockerSpec := dockerclient.ContainerSpec{

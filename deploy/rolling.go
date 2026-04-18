@@ -10,11 +10,11 @@ import (
 
 func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) error {
 	for i, cSpec := range spec.Containers {
-		e.reportProgress(spec.DeploymentID, "deploying",
-			fmt.Sprintf("deploying container %d/%d: %s", i+1, len(spec.Containers), cSpec.Name),
-			map[string]any{"container_name": cSpec.Name, "step": "pulling"})
-
 		imageRef := cSpec.Image + ":" + cSpec.Tag
+
+		e.reportProgress(spec.DeploymentID, "deploying",
+			fmt.Sprintf("[%d/%d] pulling image %s for container %s", i+1, len(spec.Containers), imageRef, cSpec.Name),
+			map[string]any{"container_name": cSpec.Name, "step": "pulling"})
 
 		// Pull the image
 		var regAuth *dockerclient.RegistryAuth
@@ -30,27 +30,34 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			return fmt.Errorf("pull image %s: %w", imageRef, err)
 		}
 
-		// Stop and remove old container if it exists
 		e.reportProgress(spec.DeploymentID, "deploying",
-			fmt.Sprintf("stopping old container: %s", cSpec.Name),
-			map[string]any{"container_name": cSpec.Name, "step": "stopping"})
+			fmt.Sprintf("[%d/%d] image %s pulled successfully", i+1, len(spec.Containers), imageRef),
+			map[string]any{"container_name": cSpec.Name, "step": "pulled"})
 
+		// Stop and remove old container if it exists
 		existingID, err := e.Docker.FindContainerByName(ctx, cSpec.Name)
 		if err != nil {
 			log.Printf("deploy: error finding container %s: %v", cSpec.Name, err)
 		}
 		if existingID != "" {
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("[%d/%d] stopping old container: %s", i+1, len(spec.Containers), cSpec.Name),
+				map[string]any{"container_name": cSpec.Name, "step": "stopping"})
 			if err := e.Docker.StopContainer(ctx, existingID, 30); err != nil {
 				log.Printf("deploy: error stopping container %s: %v", cSpec.Name, err)
 			}
 			if err := e.Docker.RemoveContainer(ctx, existingID, true); err != nil {
 				log.Printf("deploy: error removing container %s: %v", cSpec.Name, err)
 			}
+		} else {
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("[%d/%d] no existing container found for %s, creating new", i+1, len(spec.Containers), cSpec.Name),
+				map[string]any{"container_name": cSpec.Name, "step": "new"})
 		}
 
 		// Create and start new container
 		e.reportProgress(spec.DeploymentID, "deploying",
-			fmt.Sprintf("starting new container: %s", cSpec.Name),
+			fmt.Sprintf("[%d/%d] creating and starting container: %s", i+1, len(spec.Containers), cSpec.Name),
 			map[string]any{"container_name": cSpec.Name, "step": "starting"})
 
 		portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))

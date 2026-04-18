@@ -11,12 +11,12 @@ import (
 
 // DeploymentSpec is the deployment specification received from the orchestrator.
 type DeploymentSpec struct {
-	DeploymentID int              `json:"deployment_id"`
-	StackName    string           `json:"stack_name"`
-	Strategy     string           `json:"strategy"`
-	Containers   []ContainerSpec  `json:"containers"`
-	Networks     []NetworkSpec    `json:"networks"`
-	Volumes      []VolumeSpec     `json:"volumes"`
+	DeploymentID int             `json:"deployment_id"`
+	StackName    string          `json:"stack_name"`
+	Strategy     string          `json:"strategy"`
+	Containers   []ContainerSpec `json:"containers"`
+	Networks     []NetworkSpec   `json:"networks"`
+	Volumes      []VolumeSpec    `json:"volumes"`
 }
 
 type ContainerSpec struct {
@@ -75,7 +75,8 @@ func NewExecutor(docker *dockerclient.Client, progress ProgressCallback) *Execut
 func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 	log.Printf("deploy: starting deployment=%d strategy=%s stack=%s", spec.DeploymentID, spec.Strategy, spec.StackName)
 
-	e.reportProgress(spec.DeploymentID, "deploying", "starting deployment", nil)
+	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting deployment: strategy=%s, containers=%d, networks=%d, volumes=%d",
+		spec.Strategy, len(spec.Containers), len(spec.Networks), len(spec.Volumes)), nil)
 
 	// Create networks
 	for _, net := range spec.Networks {
@@ -83,6 +84,8 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		if driver == "" {
 			driver = "bridge"
 		}
+		e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("ensuring network: %s (driver=%s)", net.Name, driver),
+			map[string]any{"step": "network"})
 		if err := e.Docker.CreateNetwork(ctx, net.Name, driver); err != nil {
 			log.Printf("deploy: network %s may already exist: %v", net.Name, err)
 		}
@@ -94,12 +97,15 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		if driver == "" {
 			driver = "local"
 		}
+		e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("ensuring volume: %s (driver=%s)", vol.Name, driver),
+			map[string]any{"step": "volume"})
 		if err := e.Docker.CreateVolume(ctx, vol.Name, driver); err != nil {
 			log.Printf("deploy: volume %s may already exist: %v", vol.Name, err)
 		}
 	}
 
 	var err error
+	strategyName := spec.Strategy
 	switch spec.Strategy {
 	case "rolling":
 		err = e.executeRolling(ctx, spec)
@@ -108,15 +114,16 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 	case "canary":
 		err = e.executeCanary(ctx, spec)
 	default:
+		strategyName = "rolling (default)"
 		err = e.executeRolling(ctx, spec) // default to rolling
 	}
 
 	if err != nil {
-		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("deployment failed: %v", err), nil)
+		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("deployment failed during %s: %v", strategyName, err), nil)
 		return err
 	}
 
-	e.reportProgress(spec.DeploymentID, "deployed", "deployment completed successfully", nil)
+	e.reportProgress(spec.DeploymentID, "deployed", fmt.Sprintf("deployment completed successfully via %s strategy", strategyName), nil)
 	return nil
 }
 

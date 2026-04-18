@@ -100,14 +100,14 @@ sudo systemctl enable --now lattice-runner
 
 ## Environment Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `ORCHESTRATOR_URL` | Yes | WebSocket URL of the orchestrator (e.g. `wss://lattice-api.appleby.cloud/ws/worker`) |
-| `WORKER_TOKEN` | Yes | API token generated from the Lattice dashboard |
-| `WORKER_NAME` | No | Human-readable worker name (defaults to hostname) |
-| `HEARTBEAT_INTERVAL` | No | Metrics reporting interval (default `15s`) |
-| `RECONNECT_INTERVAL` | No | Reconnect backoff on disconnect (default `5s`) |
-| `DASHBOARD_PORT` | No | Local dashboard port (default `9100`) |
+| Variable             | Required | Description                                                                          |
+| -------------------- | -------- | ------------------------------------------------------------------------------------ |
+| `ORCHESTRATOR_URL`   | Yes      | WebSocket URL of the orchestrator (e.g. `wss://lattice-api.appleby.cloud/ws/worker`) |
+| `WORKER_TOKEN`       | Yes      | API token generated from the Lattice dashboard                                       |
+| `WORKER_NAME`        | No       | Human-readable worker name (defaults to hostname)                                    |
+| `HEARTBEAT_INTERVAL` | No       | Metrics reporting interval (default `15s`)                                           |
+| `RECONNECT_INTERVAL` | No       | Reconnect backoff on disconnect (default `5s`)                                       |
+| `DASHBOARD_PORT`     | No       | Local dashboard port (default `9100`)                                                |
 
 ---
 
@@ -149,7 +149,7 @@ curl -fsSL https://lattice-api.appleby.cloud/install/update.sh | bash
 lattice-runner version
 ```
 
-Prints the current version string (e.g. `v0.0.1`). The version is hardcoded in the binary and can be overridden at build time:
+Prints the current version string (e.g. `v0.0.3`). The version is hardcoded in the binary and can be overridden at build time:
 
 ```bash
 go build -ldflags "-X main.Version=v1.2.3" -o lattice-runner .
@@ -166,6 +166,7 @@ http://<ip>:9100
 ```
 
 The dashboard shows:
+
 - System info (hostname, OS, arch, Docker version, runner version)
 - Real-time CPU, memory, disk, swap, and network metrics
 - Load average and process count
