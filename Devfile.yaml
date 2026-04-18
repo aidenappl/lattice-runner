@@ -1,0 +1,22 @@
+commands:
+    - name: build
+      description: Build the binary
+      run: go build -o bin/app .
+    - name: run
+      description: Run the application
+      run: go run .
+    - name: test
+      description: Run tests
+      run: go test ./...
+    - name: fmt
+      description: Format code
+      run: gofmt -w -s .
+    - name: vet
+      description: Run go vet
+      run: go vet ./...
+    - name: check
+      description: Run all checks
+      run: gofmt -w -s . && go vet ./... && go test ./...
+    - name: tidy
+      description: Tidy dependencies
+      run: go mod tidy

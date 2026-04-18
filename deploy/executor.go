@@ -1,0 +1,148 @@
+package deploy
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+
+	dockerclient "github.com/aidenappl/lattice-runner/docker"
+)
+
+// DeploymentSpec is the deployment specification received from the orchestrator.
+type DeploymentSpec struct {
+	DeploymentID int              `json:"deployment_id"`
+	StackName    string           `json:"stack_name"`
+	Strategy     string           `json:"strategy"`
+	Containers   []ContainerSpec  `json:"containers"`
+	Networks     []NetworkSpec    `json:"networks"`
+	Volumes      []VolumeSpec     `json:"volumes"`
+}
+
+type ContainerSpec struct {
+	ID            int               `json:"id"`
+	Name          string            `json:"name"`
+	Image         string            `json:"image"`
+	Tag           string            `json:"tag"`
+	PortMappings  []PortMapping     `json:"port_mappings"`
+	EnvVars       map[string]string `json:"env_vars"`
+	Volumes       map[string]string `json:"volumes"`
+	CPULimit      float64           `json:"cpu_limit"`
+	MemoryLimit   int64             `json:"memory_limit"`
+	Replicas      int               `json:"replicas"`
+	RestartPolicy string            `json:"restart_policy"`
+	Command       []string          `json:"command"`
+	Entrypoint    []string          `json:"entrypoint"`
+	Networks      []string          `json:"networks"`
+	RegistryAuth  *RegistryAuth     `json:"registry_auth,omitempty"`
+}
+
+type PortMapping struct {
+	HostPort      string `json:"host_port"`
+	ContainerPort string `json:"container_port"`
+	Protocol      string `json:"protocol"`
+}
+
+type NetworkSpec struct {
+	Name   string `json:"name"`
+	Driver string `json:"driver"`
+}
+
+type VolumeSpec struct {
+	Name   string `json:"name"`
+	Driver string `json:"driver"`
+}
+
+type RegistryAuth struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// ProgressCallback reports deployment progress back to the orchestrator.
+type ProgressCallback func(deploymentID int, status string, message string, payload map[string]any)
+
+// Executor handles deployment execution across strategies.
+type Executor struct {
+	Docker   *dockerclient.Client
+	Progress ProgressCallback
+}
+
+func NewExecutor(docker *dockerclient.Client, progress ProgressCallback) *Executor {
+	return &Executor{Docker: docker, Progress: progress}
+}
+
+// Execute runs a deployment according to the specified strategy.
+func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
+	log.Printf("deploy: starting deployment=%d strategy=%s stack=%s", spec.DeploymentID, spec.Strategy, spec.StackName)
+
+	e.reportProgress(spec.DeploymentID, "deploying", "starting deployment", nil)
+
+	// Create networks
+	for _, net := range spec.Networks {
+		driver := net.Driver
+		if driver == "" {
+			driver = "bridge"
+		}
+		if err := e.Docker.CreateNetwork(ctx, net.Name, driver); err != nil {
+			log.Printf("deploy: network %s may already exist: %v", net.Name, err)
+		}
+	}
+
+	// Create volumes
+	for _, vol := range spec.Volumes {
+		driver := vol.Driver
+		if driver == "" {
+			driver = "local"
+		}
+		if err := e.Docker.CreateVolume(ctx, vol.Name, driver); err != nil {
+			log.Printf("deploy: volume %s may already exist: %v", vol.Name, err)
+		}
+	}
+
+	var err error
+	switch spec.Strategy {
+	case "rolling":
+		err = e.executeRolling(ctx, spec)
+	case "blue-green":
+		err = e.executeBlueGreen(ctx, spec)
+	case "canary":
+		err = e.executeCanary(ctx, spec)
+	default:
+		err = e.executeRolling(ctx, spec) // default to rolling
+	}
+
+	if err != nil {
+		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("deployment failed: %v", err), nil)
+		return err
+	}
+
+	e.reportProgress(spec.DeploymentID, "deployed", "deployment completed successfully", nil)
+	return nil
+}
+
+func (e *Executor) reportProgress(deploymentID int, status, message string, extra map[string]any) {
+	if e.Progress != nil {
+		payload := map[string]any{
+			"deployment_id": deploymentID,
+			"status":        status,
+			"message":       message,
+		}
+		for k, v := range extra {
+			payload[k] = v
+		}
+		e.Progress(deploymentID, status, message, payload)
+	}
+}
+
+// ParseDeploymentSpec parses a JSON payload into a DeploymentSpec.
+func ParseDeploymentSpec(payload map[string]any) (*DeploymentSpec, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+	var spec DeploymentSpec
+	if err := json.Unmarshal(b, &spec); err != nil {
+		return nil, fmt.Errorf("unmarshal spec: %w", err)
+	}
+	return &spec, nil
+}
