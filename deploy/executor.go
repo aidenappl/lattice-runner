@@ -46,6 +46,38 @@ type HealthCheck struct {
 	StartPeriod string   `json:"start_period"`
 }
 
+func (h *HealthCheck) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion
+	type Alias HealthCheck
+	raw := struct {
+		Alias
+		Test json.RawMessage `json:"test"`
+	}{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*h = HealthCheck(raw.Alias)
+
+	if len(raw.Test) == 0 {
+		return nil
+	}
+
+	// Try []string first
+	var arr []string
+	if err := json.Unmarshal(raw.Test, &arr); err == nil {
+		h.Test = arr
+		return nil
+	}
+
+	// Fall back to bare string → ["CMD-SHELL", "command"]
+	var s string
+	if err := json.Unmarshal(raw.Test, &s); err == nil && s != "" {
+		h.Test = []string{"CMD-SHELL", s}
+	}
+
+	return nil
+}
+
 type PortMapping struct {
 	HostPort      string `json:"host_port"`
 	ContainerPort string `json:"container_port"`
