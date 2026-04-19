@@ -295,20 +295,24 @@ func (c *Client) ContainerLogs(ctx context.Context, containerID string, tail str
 
 // StreamContainerLogs follows the log stream for a container.
 // On the first connect (since.IsZero()) it tails the last 100 lines so
-// startup logs are captured. On reconnects, since is the time of the last
-// received line — Docker will only return lines after that point, which
-// prevents historical lines being re-inserted into the database.
+// startup logs are captured. On reconnects, since is the Docker-recorded
+// timestamp of the last received line, obtained by parsing the RFC3339Nano
+// prefix that Docker prepends when Timestamps=true. Using an exact Docker
+// timestamp (+ 1ns) instead of a wall-clock window eliminates duplicate
+// log entries on reconnect.
 func (c *Client) StreamContainerLogs(ctx context.Context, containerID string, since time.Time) (io.ReadCloser, error) {
 	opts := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
+		Timestamps: true, // prepend RFC3339Nano timestamp to each line
 	}
 	if since.IsZero() {
 		opts.Tail = "100"
 	} else {
-		// Add a 1-second overlap to avoid missing lines at the boundary.
-		opts.Since = since.Add(-time.Second).UTC().Format(time.RFC3339Nano)
+		// Advance by 1 ns so Docker's >= filter excludes the last-seen line,
+		// giving us zero duplicates on reconnect.
+		opts.Since = since.Add(time.Nanosecond).UTC().Format(time.RFC3339Nano)
 		opts.Tail = "all"
 	}
 	return c.cli.ContainerLogs(ctx, containerID, opts)

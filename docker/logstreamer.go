@@ -17,6 +17,7 @@ type LogLine struct {
 	ContainerName string
 	Stream        string // "stdout" or "stderr"
 	Message       string
+	RecordedAt    time.Time // Docker-recorded timestamp (nanosecond precision)
 }
 
 // LogCallback is called for each log line from a container.
@@ -199,17 +200,43 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 			return
 		}
 
-		message := strings.TrimRight(string(payload), "\n")
-		if message == "" {
+		// Each payload line is prefixed with a Docker RFC3339Nano timestamp and
+		// a space (because Timestamps=true in StreamContainerLogs). Parse the
+		// timestamp so we can use the exact Docker-recorded time as the `since`
+		// value on reconnect, eliminating duplicate log replays.
+		rawLine := strings.TrimRight(string(payload), "\n")
+		if rawLine == "" {
 			continue
 		}
 
-		lastSeen = time.Now()
+		// lineTime is the timestamp of this specific line; lastSeen tracks the
+		// running maximum for the reconnect `since` filter.
+		var lineTime time.Time
+		message := rawLine
+		if idx := strings.IndexByte(rawLine, ' '); idx > 0 {
+			if t, err := time.Parse(time.RFC3339Nano, rawLine[:idx]); err == nil {
+				lineTime = t
+				lastSeen = t
+				message = rawLine[idx+1:]
+			}
+		}
+		// Fallback to wall clock if the timestamp prefix is absent or unparseable.
+		if lineTime.IsZero() {
+			lineTime = time.Now()
+			if lastSeen.IsZero() {
+				lastSeen = lineTime
+			}
+		}
+
+		if message == "" {
+			continue
+		}
 		ls.callback(LogLine{
 			ContainerID:   containerID,
 			ContainerName: containerName,
 			Stream:        streamType,
 			Message:       message,
+			RecordedAt:    lineTime,
 		})
 	}
 }

@@ -24,7 +24,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.1.4"
+var Version = "v0.1.5"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -679,6 +679,7 @@ func main() {
 				"container_name": line.ContainerName,
 				"stream":         line.Stream,
 				"message":        line.Message,
+				"recorded_at":    line.RecordedAt.UTC().Format(time.RFC3339Nano),
 			},
 		})
 	}, 10*time.Second)
