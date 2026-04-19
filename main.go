@@ -829,6 +829,8 @@ func main() {
 						switch c.State {
 						case "running":
 							latticeStatus = "running"
+						case "paused":
+							latticeStatus = "paused"
 						case "exited", "dead":
 							latticeStatus = "stopped"
 						case "created", "restarting":
