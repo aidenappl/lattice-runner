@@ -58,6 +58,7 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 		Command:       canarySpec.Command,
 		Entrypoint:    canarySpec.Entrypoint,
 		Networks:      canarySpec.Networks,
+		HealthCheck:   convertHealthCheck(canarySpec.HealthCheck),
 	}
 
 	canaryID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)

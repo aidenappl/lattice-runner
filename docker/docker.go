@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -45,6 +46,15 @@ func (c *Client) ServerVersion(ctx context.Context) (string, error) {
 	return info.Version, nil
 }
 
+// HealthCheck defines a container health check configuration.
+type HealthCheck struct {
+	Test        []string
+	Interval    string
+	Timeout     string
+	Retries     int
+	StartPeriod string
+}
+
 // ContainerSpec defines a container to create.
 type ContainerSpec struct {
 	Name          string
@@ -59,6 +69,7 @@ type ContainerSpec struct {
 	Command       []string
 	Entrypoint    []string
 	Networks      []string
+	HealthCheck   *HealthCheck
 }
 
 type PortMapping struct {
@@ -161,6 +172,28 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 	}
 	if len(spec.Entrypoint) > 0 {
 		containerConfig.Entrypoint = spec.Entrypoint
+	}
+	if spec.HealthCheck != nil {
+		hc := &container.HealthConfig{
+			Test:    spec.HealthCheck.Test,
+			Retries: spec.HealthCheck.Retries,
+		}
+		if spec.HealthCheck.Interval != "" {
+			if d, err := time.ParseDuration(spec.HealthCheck.Interval); err == nil {
+				hc.Interval = d
+			}
+		}
+		if spec.HealthCheck.Timeout != "" {
+			if d, err := time.ParseDuration(spec.HealthCheck.Timeout); err == nil {
+				hc.Timeout = d
+			}
+		}
+		if spec.HealthCheck.StartPeriod != "" {
+			if d, err := time.ParseDuration(spec.HealthCheck.StartPeriod); err == nil {
+				hc.StartPeriod = d
+			}
+		}
+		containerConfig.Healthcheck = hc
 	}
 
 	hostConfig := &container.HostConfig{

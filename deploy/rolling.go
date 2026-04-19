@@ -82,6 +82,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			Command:       cSpec.Command,
 			Entrypoint:    cSpec.Entrypoint,
 			Networks:      cSpec.Networks,
+			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 		}
 
 		containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)

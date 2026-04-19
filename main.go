@@ -24,7 +24,7 @@ import (
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.0.5"
+var Version = "v0.0.6"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
@@ -504,8 +504,25 @@ func main() {
 				}
 				if err := docker.PullImage(ctx, imageRef, regAuth); err != nil {
 					log.Printf("failed to pull %s: %v", imageRef, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": imageRef,
+							"action":         "pull_image",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
 				} else {
 					log.Printf("pulled image %s", imageRef)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "container_status",
+						Payload: map[string]any{
+							"container_name": imageRef,
+							"action":         "pull_image",
+							"status":         "success",
+						},
+					})
 				}
 			}()
 

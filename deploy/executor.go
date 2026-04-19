@@ -34,7 +34,16 @@ type ContainerSpec struct {
 	Command       []string          `json:"command"`
 	Entrypoint    []string          `json:"entrypoint"`
 	Networks      []string          `json:"networks"`
+	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
 	RegistryAuth  *RegistryAuth     `json:"registry_auth,omitempty"`
+}
+
+type HealthCheck struct {
+	Test        []string `json:"test"`
+	Interval    string   `json:"interval"`
+	Timeout     string   `json:"timeout"`
+	Retries     int      `json:"retries"`
+	StartPeriod string   `json:"start_period"`
 }
 
 type PortMapping struct {
@@ -138,6 +147,20 @@ func (e *Executor) reportProgress(deploymentID int, status, message string, extr
 			payload[k] = v
 		}
 		e.Progress(deploymentID, status, message, payload)
+	}
+}
+
+// convertHealthCheck converts a deploy HealthCheck to a docker HealthCheck.
+func convertHealthCheck(hc *HealthCheck) *dockerclient.HealthCheck {
+	if hc == nil {
+		return nil
+	}
+	return &dockerclient.HealthCheck{
+		Test:        hc.Test,
+		Interval:    hc.Interval,
+		Timeout:     hc.Timeout,
+		Retries:     hc.Retries,
+		StartPeriod: hc.StartPeriod,
 	}
 }
 

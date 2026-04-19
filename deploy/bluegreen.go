@@ -63,6 +63,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			Command:       cSpec.Command,
 			Entrypoint:    cSpec.Entrypoint,
 			Networks:      cSpec.Networks,
+			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 		}
 
 		containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
@@ -125,6 +126,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			Command:       cSpec.Command,
 			Entrypoint:    cSpec.Entrypoint,
 			Networks:      cSpec.Networks,
+			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 		}
 
 		_, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
