@@ -123,8 +123,12 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName string, done chan struct{}) {
 	defer close(done)
 
+	var since time.Time // zero → use Tail:100 on first connect
 	for {
-		ls.doStream(ctx, containerID, containerName)
+		lastSeen := ls.doStream(ctx, containerID, containerName, since)
+		if !lastSeen.IsZero() {
+			since = lastSeen
+		}
 
 		// Context was cancelled — sync() stopped tracking this container.
 		if ctx.Err() != nil {
