@@ -9,8 +9,8 @@ RUN go mod download
 
 COPY . .
 
-RUN VERSION=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s -X main.Version=${VERSION}" \
     -o /lattice-runner .
 
