@@ -99,10 +99,37 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 	}
 }
 
+// stream is the outer reconnect loop for a single container. It retries the
+// Docker log stream whenever it disconnects unexpectedly (e.g. after a
+// container restart) as long as the context has not been cancelled.
 func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName string) {
+	for {
+		ls.doStream(ctx, containerID, containerName)
+
+		// Context was cancelled — sync() stopped tracking this container.
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Stream ended for another reason (container restart / flap).
+		// Wait briefly so the container has time to come back up, then reconnect.
+		log.Printf("logstreamer: stream ended for %s, reconnecting in 2s…", containerName)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// doStream opens the Docker log stream for one container and reads until it
+// closes or the context is cancelled.
+func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string) {
 	reader, err := ls.docker.StreamContainerLogs(ctx, containerID)
 	if err != nil {
-		log.Printf("logstreamer: failed to stream logs for %s: %v", containerName, err)
+		if ctx.Err() == nil {
+			log.Printf("logstreamer: failed to open log stream for %s: %v", containerName, err)
+		}
 		return
 	}
 	defer reader.Close()
