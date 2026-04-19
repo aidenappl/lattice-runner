@@ -130,9 +130,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "stop", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "stop", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -144,8 +146,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "stop", fmt.Sprintf("stopping container (timeout=30s, id=%s)…", id[:12]))
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
 					log.Printf("failed to stop %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "stop", fmt.Sprintf("failed to stop: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -174,9 +178,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "start", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "start", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -188,8 +194,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "start", fmt.Sprintf("starting container (id=%s)…", id[:12]))
 				if err := docker.StartContainer(ctx, id); err != nil {
 					log.Printf("failed to start %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "start", fmt.Sprintf("failed to start: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -218,9 +226,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "kill", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "kill", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -232,8 +242,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "kill", fmt.Sprintf("sending SIGKILL to container (id=%s)…", id[:12]))
 				if err := docker.KillContainer(ctx, id); err != nil {
 					log.Printf("failed to kill %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "kill", fmt.Sprintf("failed to kill: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -262,9 +274,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "pause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "pause", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -276,8 +290,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "pause", fmt.Sprintf("pausing container (id=%s)…", id[:12]))
 				if err := docker.PauseContainer(ctx, id); err != nil {
 					log.Printf("failed to pause %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "pause", fmt.Sprintf("failed to pause: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -306,9 +322,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "unpause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "unpause", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -320,8 +338,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "unpause", fmt.Sprintf("resuming container (id=%s)…", id[:12]))
 				if err := docker.UnpauseContainer(ctx, id); err != nil {
 					log.Printf("failed to unpause %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "unpause", fmt.Sprintf("failed to resume: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -350,9 +370,11 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "restart", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "restart", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -364,8 +386,10 @@ func main() {
 					})
 					return
 				}
+				sendLifecycleLog(ws, containerName, "restart", fmt.Sprintf("restarting container (timeout=30s, id=%s)… container will stop then start", id[:12]))
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
 					log.Printf("failed to restart %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "restart", fmt.Sprintf("failed to restart: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -394,8 +418,10 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				sendLifecycleLog(ws, containerName, "remove", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
+					sendLifecycleLog(ws, containerName, "remove", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -407,9 +433,15 @@ func main() {
 					})
 					return
 				}
-				_ = docker.StopContainer(ctx, id, 10)
+				sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("stopping container before removal (timeout=10s, id=%s)…", id[:12]))
+				if err := docker.StopContainer(ctx, id, 10); err != nil {
+					sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("stop returned: %v (proceeding with force remove)", err))
+				} else {
+					sendLifecycleLog(ws, containerName, "remove", "container stopped, removing…")
+				}
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
 					log.Printf("failed to remove %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("failed to remove: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -453,15 +485,26 @@ func main() {
 						regAuth = &dockerclient.RegistryAuth{}
 						_ = json.Unmarshal(b, regAuth)
 					}
-					log.Printf("pulling image %s before recreate of %s", fullRef, containerName)
+					authInfo := ""
+					if regAuth != nil && regAuth.Username != "" {
+						authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
+					}
+					sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("pulling image %s%s…", fullRef, authInfo))
 					if err := docker.PullImage(ctx, fullRef, regAuth); err != nil {
 						log.Printf("pull failed for %s: %v — proceeding with recreate anyway", fullRef, err)
+						sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("image pull failed: %v — proceeding with local image", err))
+					} else {
+						sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("image %s pulled successfully", fullRef))
 					}
+				} else {
+					sendLifecycleLog(ws, containerName, "recreate", "no image specified, recreating with current image")
 				}
 
+				sendLifecycleLog(ws, containerName, "recreate", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					log.Printf("container %s not found for recreate", containerName)
+					sendLifecycleLog(ws, containerName, "recreate", "container not found")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -474,9 +517,11 @@ func main() {
 					return
 				}
 
+				sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("recreating container (old id=%s)… stopping, removing, and creating new container", id[:12]))
 				newID, err := docker.RecreateContainer(ctx, id, containerName)
 				if err != nil {
 					log.Printf("failed to recreate %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("failed to recreate: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -511,8 +556,14 @@ func main() {
 					regAuth = &dockerclient.RegistryAuth{}
 					_ = json.Unmarshal(b, regAuth)
 				}
+				authInfo := ""
+				if regAuth != nil && regAuth.Username != "" {
+					authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
+				}
+				sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("pulling image %s%s…", imageRef, authInfo))
 				if err := docker.PullImage(ctx, imageRef, regAuth); err != nil {
 					log.Printf("failed to pull %s: %v", imageRef, err)
+					sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("pull failed: %v", err))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -524,6 +575,7 @@ func main() {
 					})
 				} else {
 					log.Printf("pulled image %s", imageRef)
+					sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("image %s pulled successfully", imageRef))
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -604,10 +656,28 @@ func main() {
 					})
 					return
 				}
+				running := 0
+				for _, c := range containers {
+					if c.State == "running" {
+						running++
+					}
+				}
+				log.Printf("stop_all: found %d running containers out of %d total", running, len(containers))
 				stopped := 0
 				failed := 0
 				for _, c := range containers {
 					if c.State == "running" {
+						name := ""
+						for _, n := range c.Names {
+							trimmed := strings.TrimPrefix(n, "/")
+							if trimmed != "" {
+								name = trimmed
+								break
+							}
+						}
+						if name != "" {
+							sendLifecycleLog(ws, name, "stop", fmt.Sprintf("stopping container as part of stop_all (%d/%d)…", stopped+failed+1, running))
+						}
 						if err := docker.StopContainer(ctx, c.ID, 30); err != nil {
 							log.Printf("failed to stop %s: %v", c.ID[:12], err)
 							failed++
@@ -643,10 +713,28 @@ func main() {
 					})
 					return
 				}
+				notRunning := 0
+				for _, c := range containers {
+					if c.State != "running" {
+						notRunning++
+					}
+				}
+				log.Printf("start_all: found %d stopped containers out of %d total", notRunning, len(containers))
 				started := 0
 				failed := 0
 				for _, c := range containers {
 					if c.State != "running" {
+						name := ""
+						for _, n := range c.Names {
+							trimmed := strings.TrimPrefix(n, "/")
+							if trimmed != "" {
+								name = trimmed
+								break
+							}
+						}
+						if name != "" {
+							sendLifecycleLog(ws, name, "start", fmt.Sprintf("starting container as part of start_all (%d/%d)…", started+failed+1, notRunning))
+						}
 						if err := docker.StartContainer(ctx, c.ID); err != nil {
 							log.Printf("failed to start %s: %v", c.ID[:12], err)
 							failed++
@@ -818,6 +906,20 @@ func main() {
 	cancel()
 	ws.Close()
 	log.Println("runner stopped")
+}
+
+// sendLifecycleLog sends a verbose lifecycle log entry to the orchestrator so
+// it gets persisted in the lifecycle_logs table and broadcast to the admin UI.
+func sendLifecycleLog(ws *client.WSClient, containerName, event, message string) {
+	log.Printf("[lifecycle] %s: %s — %s", containerName, event, message)
+	_ = ws.SendJSON(client.OutgoingMessage{
+		Type: "lifecycle_log",
+		Payload: map[string]any{
+			"container_name": containerName,
+			"event":          event,
+			"message":        message,
+		},
+	})
 }
 
 func hostname() string {
