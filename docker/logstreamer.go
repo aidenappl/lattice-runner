@@ -143,9 +143,10 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 }
 
 // doStream opens the Docker log stream for one container and reads until it
-// closes or the context is cancelled.
-func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string) {
-	reader, err := ls.docker.StreamContainerLogs(ctx, containerID)
+// closes or the context is cancelled. Returns the timestamp of the last line
+// received so the caller can avoid replaying historical lines on reconnect.
+func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string, since time.Time) (lastSeen time.Time) {
+	reader, err := ls.docker.StreamContainerLogs(ctx, containerID, since)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("logstreamer: failed to open log stream for %s: %v", containerName, err)
@@ -199,6 +200,7 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 			continue
 		}
 
+		lastSeen = time.Now()
 		ls.callback(LogLine{
 			ContainerID:   containerID,
 			ContainerName: containerName,

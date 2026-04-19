@@ -293,16 +293,25 @@ func (c *Client) ContainerLogs(ctx context.Context, containerID string, tail str
 	})
 }
 
-// StreamContainerLogs tails the last 100 lines of a container's logs then
-// follows new output. Starting from the tail ensures startup logs emitted
-// before the streamer first discovers the container are not lost.
-func (c *Client) StreamContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
-	return c.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+// StreamContainerLogs follows the log stream for a container.
+// On the first connect (since.IsZero()) it tails the last 100 lines so
+// startup logs are captured. On reconnects, since is the time of the last
+// received line — Docker will only return lines after that point, which
+// prevents historical lines being re-inserted into the database.
+func (c *Client) StreamContainerLogs(ctx context.Context, containerID string, since time.Time) (io.ReadCloser, error) {
+	opts := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Tail:       "100",
-	})
+	}
+	if since.IsZero() {
+		opts.Tail = "100"
+	} else {
+		// Add a 1-second overlap to avoid missing lines at the boundary.
+		opts.Since = since.Add(-time.Second).UTC().Format(time.RFC3339Nano)
+		opts.Tail = "all"
+	}
+	return c.cli.ContainerLogs(ctx, containerID, opts)
 }
 
 // CreateNetwork creates a Docker network.
