@@ -22,6 +22,11 @@ type LogLine struct {
 // LogCallback is called for each log line from a container.
 type LogCallback func(line LogLine)
 
+type streamEntry struct {
+	cancel context.CancelFunc
+	done   chan struct{} // closed when the stream goroutine exits
+}
+
 // LogStreamer watches running containers and streams their logs.
 type LogStreamer struct {
 	docker   *Client
@@ -29,7 +34,7 @@ type LogStreamer struct {
 	interval time.Duration
 
 	mu      sync.Mutex
-	tracked map[string]context.CancelFunc // containerID -> cancel
+	tracked map[string]*streamEntry // containerID -> entry
 }
 
 func NewLogStreamer(docker *Client, callback LogCallback, pollInterval time.Duration) *LogStreamer {
@@ -37,7 +42,7 @@ func NewLogStreamer(docker *Client, callback LogCallback, pollInterval time.Dura
 		docker:   docker,
 		callback: callback,
 		interval: pollInterval,
-		tracked:  make(map[string]context.CancelFunc),
+		tracked:  make(map[string]*streamEntry),
 	}
 }
 
@@ -81,19 +86,31 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
-	// Start streaming new containers
+	// Remove entries for goroutines that exited unexpectedly (e.g. before the
+	// reconnect loop was in place) so they are restarted below.
+	for id, entry := range ls.tracked {
+		select {
+		case <-entry.done:
+			log.Printf("logstreamer: detected dead stream for %s, will restart", id)
+			delete(ls.tracked, id)
+		default:
+		}
+	}
+
+	// Start streaming new (or recovered) containers
 	for id, name := range running {
 		if _, ok := ls.tracked[id]; !ok {
 			streamCtx, cancel := context.WithCancel(ctx)
-			ls.tracked[id] = cancel
-			go ls.stream(streamCtx, id, name)
+			entry := &streamEntry{cancel: cancel, done: make(chan struct{})}
+			ls.tracked[id] = entry
+			go ls.stream(streamCtx, id, name, entry.done)
 		}
 	}
 
 	// Stop streaming removed/stopped containers
-	for id, cancel := range ls.tracked {
+	for id, entry := range ls.tracked {
 		if _, ok := running[id]; !ok {
-			cancel()
+			entry.cancel()
 			delete(ls.tracked, id)
 		}
 	}
@@ -102,7 +119,10 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 // stream is the outer reconnect loop for a single container. It retries the
 // Docker log stream whenever it disconnects unexpectedly (e.g. after a
 // container restart) as long as the context has not been cancelled.
-func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName string) {
+// done is closed when this goroutine exits so sync() can detect it.
+func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName string, done chan struct{}) {
+	defer close(done)
+
 	for {
 		ls.doStream(ctx, containerID, containerName)
 
@@ -191,8 +211,8 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 func (ls *LogStreamer) stopAll() {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	for id, cancel := range ls.tracked {
-		cancel()
+	for id, entry := range ls.tracked {
+		entry.cancel()
 		delete(ls.tracked, id)
 	}
 }
