@@ -24,6 +24,11 @@ if [ ! -f "$INSTALL_DIR/lattice-runner" ]; then
     exit 1
 fi
 
+# Ensure Go is in PATH — curl|bash runs a non-login shell that may miss profile.d
+for p in /usr/local/go/bin /usr/lib/go/bin /snap/bin "$HOME/go/bin"; do
+    [ -d "$p" ] && export PATH="$p:$PATH"
+done
+
 # Check Go is installed
 command -v go >/dev/null 2>&1 || {
     echo "ERROR: Go is required to build the runner."
