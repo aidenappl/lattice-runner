@@ -235,3 +235,16 @@ func (c *WSClient) close() {
 func (c *WSClient) Close() {
 	c.close()
 }
+
+// Drain blocks until the outbound send queue is empty or timeout elapses.
+// Call this before Close() on a graceful shutdown so queued messages are
+// transmitted before the connection drops.
+func (c *WSClient) Drain(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(c.send) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

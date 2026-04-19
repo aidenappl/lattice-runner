@@ -76,6 +76,15 @@ func main() {
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
+		// Recover from any panic in a message handler so the WS read-pump stays
+		// alive rather than crashing the whole process.
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 8192)
+				n := runtime.Stack(buf, false)
+				log.Printf("[message-handler] PANIC for event %q: %v\n%s", env.Type, r, string(buf[:n]))
+			}
+		}()
 		switch env.Type {
 		case "connected":
 			log.Println("connected to orchestrator")
@@ -660,7 +669,7 @@ func main() {
 	})
 
 	// Start WebSocket connection in background
-	go ws.Connect(ctx)
+	safeGo(ws, "ws-connect", func() { ws.Connect(ctx) })
 
 	// Stream container logs to orchestrator
 	logStreamer := dockerclient.NewLogStreamer(docker, func(line dockerclient.LogLine) {
@@ -673,10 +682,10 @@ func main() {
 			},
 		})
 	}, 10*time.Second)
-	go logStreamer.Run(ctx)
+	safeGo(ws, "log-streamer", func() { logStreamer.Run(ctx) })
 
 	// Heartbeat ticker — also pushes live container states each tick
-	go func() {
+	safeGo(ws, "heartbeat", func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
 		defer ticker.Stop()
 
@@ -776,7 +785,7 @@ func main() {
 				}
 			}
 		}
-	}()
+	})
 
 	// Start local dashboard
 	dashboard := &web.Server{
@@ -797,6 +806,14 @@ func main() {
 	<-quit
 
 	log.Println("shutting down runner...")
+	_ = ws.SendJSON(client.OutgoingMessage{
+		Type: "worker_shutdown",
+		Payload: map[string]any{
+			"reason":  "graceful",
+			"message": "runner shutting down gracefully",
+		},
+	})
+	ws.Drain(3 * time.Second)
 	cancel()
 	ws.Close()
 	log.Println("runner stopped")
@@ -821,4 +838,32 @@ func localIP() string {
 		}
 	}
 	return ""
+}
+
+// safeGo runs fn in a new goroutine with panic recovery. If fn panics, the
+// full stack trace is logged and a worker_crash event is sent to the
+// orchestrator before the process exits.
+func safeGo(ws *client.WSClient, name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buf := make([]byte, 8192)
+				n := runtime.Stack(buf, false)
+				stackStr := string(buf[:n])
+				log.Printf("[%s] PANIC: %v\n%s", name, r, stackStr)
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_crash",
+					Payload: map[string]any{
+						"goroutine": name,
+						"panic":     fmt.Sprintf("%v", r),
+						"stack":     stackStr,
+					},
+				})
+				ws.Drain(2 * time.Second)
+				ws.Close()
+				os.Exit(2)
+			}
+		}()
+		fn()
+	}()
 }
