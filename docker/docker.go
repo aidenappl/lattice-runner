@@ -293,14 +293,15 @@ func (c *Client) ContainerLogs(ctx context.Context, containerID string, tail str
 	})
 }
 
-// StreamContainerLogs follows a container's logs from the current moment.
+// StreamContainerLogs tails the last 100 lines of a container's logs then
+// follows new output. Starting from the tail ensures startup logs emitted
+// before the streamer first discovers the container are not lost.
 func (c *Client) StreamContainerLogs(ctx context.Context, containerID string) (io.ReadCloser, error) {
 	return c.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
-		Since:      "0s",
-		Timestamps: true,
+		Tail:       "100",
 	})
 }
 

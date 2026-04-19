@@ -73,7 +73,7 @@ cd "$BUILD_DIR"
 
 echo "Building..."
 GIT_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-CGO_ENABLED=0 go build -ldflags="-w -s -X main.Version=v0.1.3-${GIT_HASH}" -o lattice-runner .
+CGO_ENABLED=0 go build -ldflags="-w -s -X main.Version=v0.1.4-${GIT_HASH}" -o lattice-runner .
 echo "  Built: $(ls -lh lattice-runner | awk '{print $5}')"
 echo ""
 
