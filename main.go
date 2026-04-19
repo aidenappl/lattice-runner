@@ -805,6 +805,7 @@ func main() {
 						"network_tx_bytes":        m.NetworkTxBytes,
 						"uptime_seconds":          m.UptimeSeconds,
 						"process_count":           m.ProcessCount,
+						"runner_version":          Version,
 					},
 				})
 
