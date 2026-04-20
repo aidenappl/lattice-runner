@@ -73,7 +73,8 @@ echo "Pulling source for ${LATEST_TAG}..."
 TMP_BUILD=$(mktemp -d)
 export GOPATH="${TMP_BUILD}/gopath"
 export GOMODCACHE="${TMP_BUILD}/gomodcache"
-mkdir -p "$GOPATH" "$GOMODCACHE"
+export GOCACHE="${TMP_BUILD}/gocache"
+mkdir -p "$GOPATH" "$GOMODCACHE" "$GOCACHE"
 git clone --depth=1 --branch "${LATEST_TAG}" "https://github.com/${REPO}.git" "${TMP_BUILD}/src" 2>&1 | tail -1
 cd "${TMP_BUILD}/src"
 
