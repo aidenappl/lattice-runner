@@ -91,6 +91,32 @@ sudo mv -f "$INSTALL_DIR/lattice-runner.new" "$INSTALL_DIR/lattice-runner"
 # Cleanup
 rm -rf "$TMP_BUILD"
 
+# Ensure systemd service exists
+SERVICE_FILE="/etc/systemd/system/lattice-runner.service"
+if [ ! -f "$SERVICE_FILE" ]; then
+    echo "Creating systemd service..."
+    sudo tee "$SERVICE_FILE" > /dev/null <<'EOF'
+[Unit]
+Description=Lattice Runner
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lattice-runner
+EnvironmentFile=/opt/lattice-runner/.env
+ExecStart=/opt/lattice-runner/lattice-runner
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable lattice-runner
+    echo "  Created and enabled lattice-runner.service"
+fi
+
 # Delay restart so the runner process that spawned this script can finish
 # reporting success before systemd kills it.
 echo "Scheduling lattice-runner restart in 3 seconds..."
