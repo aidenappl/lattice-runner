@@ -21,7 +21,7 @@ func Load() *Config {
 		OrchestratorURL:   getEnvOrPanic("ORCHESTRATOR_URL"),
 		WorkerToken:       getEnvOrPanic("WORKER_TOKEN"),
 		WorkerName:        getEnv("WORKER_NAME", hostname()),
-		HeartbeatInterval: parseDuration("HEARTBEAT_INTERVAL", 15*time.Second),
+		HeartbeatInterval: parseDuration("HEARTBEAT_INTERVAL", 10*time.Second),
 		ReconnectInterval: parseDuration("RECONNECT_INTERVAL", 5*time.Second),
 		DashboardPort:     getEnv("DASHBOARD_PORT", "9100"),
 		LatticeURL:        getEnv("LATTICE_URL", ""),
