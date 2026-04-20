@@ -616,7 +616,8 @@ func main() {
 						"message": "starting runner upgrade",
 					},
 				})
-				out, err := exec.Command("bash", "-c", "curl -fsSL https://lattice-api.appleby.cloud/install/runner | bash").CombinedOutput()
+				upgradeURL := fmt.Sprintf("https://lattice-api.appleby.cloud/install/runner?t=%d", time.Now().Unix())
+				out, err := exec.Command("bash", "-c", fmt.Sprintf("curl -fsSL '%s' | bash", upgradeURL)).CombinedOutput()
 				if err != nil {
 					log.Printf("upgrade failed: %v — %s", err, string(out))
 					_ = ws.SendJSON(client.OutgoingMessage{

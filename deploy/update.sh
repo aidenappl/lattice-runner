@@ -70,29 +70,31 @@ echo ""
 
 # Clone tag and build
 echo "Pulling source for ${LATEST_TAG}..."
-rm -rf "$BUILD_DIR"
-git clone --depth=1 --branch "${LATEST_TAG}" "https://github.com/${REPO}.git" "$BUILD_DIR" 2>&1 | tail -1
-cd "$BUILD_DIR"
+TMP_BUILD=$(mktemp -d)
+export GOPATH="${TMP_BUILD}/gopath"
+export GOMODCACHE="${TMP_BUILD}/gomodcache"
+mkdir -p "$GOPATH" "$GOMODCACHE"
+git clone --depth=1 --branch "${LATEST_TAG}" "https://github.com/${REPO}.git" "${TMP_BUILD}/src" 2>&1 | tail -1
+cd "${TMP_BUILD}/src"
 
 echo "Building..."
 CGO_ENABLED=0 go build -ldflags="-w -s -X main.Version=${LATEST_TAG}" -o lattice-runner .
 echo "  Built: $(ls -lh lattice-runner | awk '{print $5}')"
 echo ""
 
-# Replace binary and restart service
-# Copy to a temp path then rename atomically — avoids "Text file busy" when upgrading a running binary
+# Replace binary atomically — avoids "Text file busy" when upgrading a running binary
 sudo cp lattice-runner "$INSTALL_DIR/lattice-runner.new"
 sudo chmod +x "$INSTALL_DIR/lattice-runner.new"
 sudo mv -f "$INSTALL_DIR/lattice-runner.new" "$INSTALL_DIR/lattice-runner"
 
-echo "Restarting lattice-runner..."
-sudo systemctl restart lattice-runner
-
 # Cleanup
-rm -rf "$BUILD_DIR"
+rm -rf "$TMP_BUILD"
+
+# Delay restart so the runner process that spawned this script can finish
+# reporting success before systemd kills it.
+echo "Scheduling lattice-runner restart in 3 seconds..."
+(sleep 3 && sudo systemctl restart lattice-runner) &
 
 echo ""
 echo "Update complete - now running ${LATEST_TAG}."
-echo ""
-sudo systemctl status lattice-runner --no-pager -l | head -10
 echo ""
