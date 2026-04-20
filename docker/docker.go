@@ -343,6 +343,20 @@ func (c *Client) RemoveVolume(ctx context.Context, name string, force bool) erro
 	return c.cli.VolumeRemove(ctx, name, force)
 }
 
+// ListVolumes returns all Docker volumes.
+func (c *Client) ListVolumes(ctx context.Context) ([]*volume.Volume, error) {
+	resp, err := c.cli.VolumeList(ctx, volume.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Volumes, nil
+}
+
+// ListNetworks returns all Docker networks.
+func (c *Client) ListNetworks(ctx context.Context) ([]network.Summary, error) {
+	return c.cli.NetworkList(ctx, network.ListOptions{})
+}
+
 // RecreateContainer stops, removes, and recreates a container with the same config.
 func (c *Client) RecreateContainer(ctx context.Context, containerID string, name string) (string, error) {
 	info, err := c.cli.ContainerInspect(ctx, containerID)
@@ -363,6 +377,36 @@ func (c *Client) RecreateContainer(ctx context.Context, containerID string, name
 	}
 
 	return resp.ID, nil
+}
+
+// ContainerExecCreate creates an exec instance in a container.
+func (c *Client) ContainerExecCreate(ctx context.Context, containerID string, cmd []string) (string, error) {
+	resp, err := c.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          true,
+		Cmd:          cmd,
+	})
+	if err != nil {
+		return "", fmt.Errorf("exec create: %w", err)
+	}
+	return resp.ID, nil
+}
+
+// ContainerExecAttach attaches to an exec instance and returns the hijacked connection.
+func (c *Client) ContainerExecAttach(ctx context.Context, execID string) (types.HijackedResponse, error) {
+	return c.cli.ContainerExecAttach(ctx, execID, container.ExecAttachOptions{
+		Tty: true,
+	})
+}
+
+// ContainerExecResize resizes the TTY of an exec instance.
+func (c *Client) ContainerExecResize(ctx context.Context, execID string, height, width uint) error {
+	return c.cli.ContainerExecResize(ctx, execID, container.ResizeOptions{
+		Height: height,
+		Width:  width,
+	})
 }
 
 func (c *Client) Close() error {

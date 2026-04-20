@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 	"github.com/aidenappl/lattice-runner/metrics"
 	"github.com/aidenappl/lattice-runner/web"
+	"github.com/docker/docker/api/types"
 )
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=v1.0.1"
@@ -73,6 +77,15 @@ func main() {
 			Payload: payload,
 		})
 	})
+
+	// Active exec sessions: command_id -> cancel func
+	type execSession struct {
+		execID string
+		conn   types.HijackedResponse
+		cancel context.CancelFunc
+	}
+	execSessions := make(map[string]*execSession)
+	var execMu sync.Mutex
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
@@ -753,6 +766,391 @@ func main() {
 						"message": fmt.Sprintf("started %d containers, %d failed", started, failed),
 					},
 				})
+			}()
+
+		case "list_volumes":
+			go func() {
+				volumes, err := docker.ListVolumes(ctx)
+				if err != nil {
+					log.Printf("failed to list volumes: %v", err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "list_volumes_response",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"status":     "error",
+							"error":      err.Error(),
+						},
+					})
+					return
+				}
+				volumeList := make([]map[string]any, 0, len(volumes))
+				for _, v := range volumes {
+					volumeList = append(volumeList, map[string]any{
+						"name":       v.Name,
+						"driver":     v.Driver,
+						"mountpoint": v.Mountpoint,
+						"created_at": v.CreatedAt,
+						"scope":      v.Scope,
+						"labels":     v.Labels,
+					})
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "list_volumes_response",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"status":     "success",
+						"volumes":    volumeList,
+					},
+				})
+			}()
+
+		case "create_volume":
+			go func() {
+				name, _ := env.Payload["name"].(string)
+				driver, _ := env.Payload["driver"].(string)
+				if name == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "create_volume",
+							"status":     "failed",
+							"message":    "volume name is required",
+						},
+					})
+					return
+				}
+				if driver == "" {
+					driver = "local"
+				}
+				if err := docker.CreateVolume(ctx, name, driver); err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "create_volume",
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to create volume: %v", err),
+						},
+					})
+					return
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"action":     "create_volume",
+						"status":     "success",
+						"message":    fmt.Sprintf("volume %s created", name),
+					},
+				})
+			}()
+
+		case "remove_volume":
+			go func() {
+				name, _ := env.Payload["name"].(string)
+				if name == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "remove_volume",
+							"status":     "failed",
+							"message":    "volume name is required",
+						},
+					})
+					return
+				}
+				force, _ := env.Payload["force"].(bool)
+				if err := docker.RemoveVolume(ctx, name, force); err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "remove_volume",
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to remove volume: %v", err),
+						},
+					})
+					return
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"action":     "remove_volume",
+						"status":     "success",
+						"message":    fmt.Sprintf("volume %s removed", name),
+					},
+				})
+			}()
+
+		case "list_networks":
+			go func() {
+				networks, err := docker.ListNetworks(ctx)
+				if err != nil {
+					log.Printf("failed to list networks: %v", err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "list_networks_response",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"status":     "error",
+							"error":      err.Error(),
+						},
+					})
+					return
+				}
+				networkList := make([]map[string]any, 0, len(networks))
+				for _, n := range networks {
+					containers := make(map[string]string, len(n.Containers))
+					for id, ep := range n.Containers {
+						containers[id] = ep.Name
+					}
+					networkList = append(networkList, map[string]any{
+						"id":         n.ID,
+						"name":       n.Name,
+						"driver":     n.Driver,
+						"scope":      n.Scope,
+						"internal":   n.Internal,
+						"containers": containers,
+						"created":    n.Created,
+					})
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "list_networks_response",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"status":     "success",
+						"networks":   networkList,
+					},
+				})
+			}()
+
+		case "create_network":
+			go func() {
+				name, _ := env.Payload["name"].(string)
+				driver, _ := env.Payload["driver"].(string)
+				if name == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "create_network",
+							"status":     "failed",
+							"message":    "network name is required",
+						},
+					})
+					return
+				}
+				if driver == "" {
+					driver = "bridge"
+				}
+				if err := docker.CreateNetwork(ctx, name, driver); err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "create_network",
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to create network: %v", err),
+						},
+					})
+					return
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"action":     "create_network",
+						"status":     "success",
+						"message":    fmt.Sprintf("network %s created", name),
+					},
+				})
+			}()
+
+		case "remove_network":
+			go func() {
+				name, _ := env.Payload["name"].(string)
+				if name == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "remove_network",
+							"status":     "failed",
+							"message":    "network name is required",
+						},
+					})
+					return
+				}
+				if err := docker.RemoveNetwork(ctx, name); err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"action":     "remove_network",
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to remove network: %v", err),
+						},
+					})
+					return
+				}
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"action":     "remove_network",
+						"status":     "success",
+						"message":    fmt.Sprintf("network %s removed", name),
+					},
+				})
+			}()
+
+		case "exec_start":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				commandID := env.CommandID
+				if containerName == "" || commandID == "" {
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "exec_output",
+						Payload: map[string]any{
+							"command_id": commandID,
+							"error":      "container not found",
+						},
+					})
+					return
+				}
+				cmd := []string{"/bin/sh"}
+				if cmdPayload, ok := env.Payload["cmd"].(string); ok && cmdPayload != "" {
+					cmd = []string{cmdPayload}
+				}
+
+				execID, err := docker.ContainerExecCreate(ctx, id, cmd)
+				if err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "exec_output",
+						Payload: map[string]any{
+							"command_id": commandID,
+							"error":      fmt.Sprintf("exec create failed: %v", err),
+						},
+					})
+					return
+				}
+
+				conn, err := docker.ContainerExecAttach(ctx, execID)
+				if err != nil {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "exec_output",
+						Payload: map[string]any{
+							"command_id": commandID,
+							"error":      fmt.Sprintf("exec attach failed: %v", err),
+						},
+					})
+					return
+				}
+
+				execCtx, execCancel := context.WithCancel(ctx)
+				session := &execSession{execID: execID, conn: conn, cancel: execCancel}
+				execMu.Lock()
+				execSessions[commandID] = session
+				execMu.Unlock()
+
+				// Read output from exec and forward to orchestrator
+				go func() {
+					defer func() {
+						conn.Close()
+						execMu.Lock()
+						delete(execSessions, commandID)
+						execMu.Unlock()
+						_ = ws.SendJSON(client.OutgoingMessage{
+							Type: "exec_output",
+							Payload: map[string]any{
+								"command_id": commandID,
+								"closed":     true,
+							},
+						})
+					}()
+					buf := make([]byte, 4096)
+					for {
+						select {
+						case <-execCtx.Done():
+							return
+						default:
+						}
+						n, err := conn.Reader.Read(buf)
+						if n > 0 {
+							_ = ws.SendJSON(client.OutgoingMessage{
+								Type: "exec_output",
+								Payload: map[string]any{
+									"command_id": commandID,
+									"data":       base64.StdEncoding.EncodeToString(buf[:n]),
+								},
+							})
+						}
+						if err != nil {
+							if err != io.EOF {
+								log.Printf("exec read error for %s: %v", commandID, err)
+							}
+							return
+						}
+					}
+				}()
+			}()
+
+		case "exec_input":
+			go func() {
+				commandID := env.CommandID
+				dataB64, _ := env.Payload["data"].(string)
+				if commandID == "" || dataB64 == "" {
+					return
+				}
+				execMu.Lock()
+				session, ok := execSessions[commandID]
+				execMu.Unlock()
+				if !ok {
+					return
+				}
+				data, err := base64.StdEncoding.DecodeString(dataB64)
+				if err != nil {
+					return
+				}
+				_, _ = session.conn.Conn.Write(data)
+			}()
+
+		case "exec_resize":
+			go func() {
+				commandID := env.CommandID
+				heightF, _ := env.Payload["height"].(float64)
+				widthF, _ := env.Payload["width"].(float64)
+				if commandID == "" {
+					return
+				}
+				execMu.Lock()
+				session, ok := execSessions[commandID]
+				execMu.Unlock()
+				if !ok {
+					return
+				}
+				_ = docker.ContainerExecResize(ctx, session.execID, uint(heightF), uint(widthF))
+			}()
+
+		case "exec_close":
+			go func() {
+				commandID := env.CommandID
+				if commandID == "" {
+					return
+				}
+				execMu.Lock()
+				session, ok := execSessions[commandID]
+				execMu.Unlock()
+				if !ok {
+					return
+				}
+				session.cancel()
 			}()
 		}
 	})
