@@ -150,7 +150,9 @@ func (c *WSClient) run(ctx context.Context) {
 func (c *WSClient) readPump(ctx context.Context, cancel context.CancelFunc) {
 	defer cancel()
 
-	c.conn.SetReadLimit(64 * 1024)
+	// Deploy payloads can be large (many containers/env vars/networks/volumes).
+	// Keep this comfortably above expected command size.
+	c.conn.SetReadLimit(4 * 1024 * 1024)
 	_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
 		_ = c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))

@@ -30,6 +30,18 @@ import (
 // Set via -ldflags at build time: -ldflags "-X main.Version=v1.0.1"
 var Version = "dev"
 
+type deploymentRunState struct {
+	DeploymentID   int
+	Attempt        int
+	MaxRetries     int
+	Status         string
+	CurrentStep    string
+	LastMessage    string
+	LastProgressAt time.Time
+	StartedAt      time.Time
+	InProgress     bool
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		cmd.RunSetup()
@@ -70,11 +82,47 @@ func main() {
 	// Create WebSocket client
 	ws := client.NewWSClient(cfg.OrchestratorURL, cfg.WorkerToken, cfg.ReconnectInterval)
 
+	deploymentStates := make(map[int]*deploymentRunState)
+	var deploymentStatesMu sync.RWMutex
+
 	// Create deploy executor
 	executor := deploy.NewExecutor(docker, func(deploymentID int, status, message string, payload map[string]any) {
+		deploymentStatesMu.Lock()
+		st, ok := deploymentStates[deploymentID]
+		if !ok {
+			st = &deploymentRunState{
+				DeploymentID: deploymentID,
+				Attempt:      1,
+				MaxRetries:   3,
+				StartedAt:    time.Now().UTC(),
+				InProgress:   true,
+			}
+			deploymentStates[deploymentID] = st
+		}
+		st.Status = status
+		if step, ok := payload["step"].(string); ok && step != "" {
+			st.CurrentStep = step
+		}
+		st.LastMessage = message
+		st.LastProgressAt = time.Now().UTC()
+		if status == "deployed" || status == "failed" || status == "rolled_back" {
+			st.InProgress = false
+		}
+		attempt := st.Attempt
+		maxRetries := st.MaxRetries
+		deploymentStatesMu.Unlock()
+
+		out := make(map[string]any, len(payload)+3)
+		for k, v := range payload {
+			out[k] = v
+		}
+		out["attempt"] = attempt
+		out["max_retries"] = maxRetries
+		out["last_progress_at"] = time.Now().UTC().Format(time.RFC3339)
+
 		_ = ws.SendJSON(client.OutgoingMessage{
 			Type:    "deployment_progress",
-			Payload: payload,
+			Payload: out,
 		})
 	})
 
@@ -132,9 +180,98 @@ func main() {
 					})
 					return
 				}
+
+				attempt := 1
+				if v, ok := env.Payload["attempt"].(float64); ok && int(v) > 0 {
+					attempt = int(v)
+				}
+				maxRetries := 3
+				if v, ok := env.Payload["max_retries"].(float64); ok && int(v) > 0 {
+					maxRetries = int(v)
+				}
+
+				deploymentStatesMu.Lock()
+				deploymentStates[spec.DeploymentID] = &deploymentRunState{
+					DeploymentID:   spec.DeploymentID,
+					Attempt:        attempt,
+					MaxRetries:     maxRetries,
+					Status:         "deploying",
+					CurrentStep:    "starting",
+					LastMessage:    fmt.Sprintf("deploy attempt %d/%d started", attempt, maxRetries),
+					LastProgressAt: time.Now().UTC(),
+					StartedAt:      time.Now().UTC(),
+					InProgress:     true,
+				}
+				deploymentStatesMu.Unlock()
+
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "deployment_progress",
+					Payload: map[string]any{
+						"deployment_id": spec.DeploymentID,
+						"status":        "deploying",
+						"message":       fmt.Sprintf("deploy attempt %d/%d started", attempt, maxRetries),
+						"step":          "attempt_start",
+						"attempt":       attempt,
+						"max_retries":   maxRetries,
+					},
+				})
+
 				if err := executor.Execute(ctx, *spec); err != nil {
 					log.Printf("deployment failed: %v", err)
+					deploymentStatesMu.Lock()
+					if st, ok := deploymentStates[spec.DeploymentID]; ok {
+						st.Status = "failed"
+						st.InProgress = false
+						st.LastMessage = err.Error()
+						st.LastProgressAt = time.Now().UTC()
+					}
+					deploymentStatesMu.Unlock()
+				} else {
+					deploymentStatesMu.Lock()
+					if st, ok := deploymentStates[spec.DeploymentID]; ok {
+						st.Status = "deployed"
+						st.InProgress = false
+						st.LastProgressAt = time.Now().UTC()
+					}
+					deploymentStatesMu.Unlock()
 				}
+			}()
+
+		case "deployment_ping":
+			go func() {
+				depIDFloat, _ := env.Payload["deployment_id"].(float64)
+				depID := int(depIDFloat)
+
+				deploymentStatesMu.RLock()
+				st, ok := deploymentStates[depID]
+				deploymentStatesMu.RUnlock()
+
+				if !ok {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "deployment_status",
+						Payload: map[string]any{
+							"deployment_id": depID,
+							"status":        "idle",
+							"in_progress":   false,
+							"message":       "no active deployment state for this id",
+						},
+					})
+					return
+				}
+
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "deployment_status",
+					Payload: map[string]any{
+						"deployment_id":    st.DeploymentID,
+						"status":           st.Status,
+						"in_progress":      st.InProgress,
+						"step":             st.CurrentStep,
+						"message":          st.LastMessage,
+						"attempt":          st.Attempt,
+						"max_retries":      st.MaxRetries,
+						"last_progress_at": st.LastProgressAt.Format(time.RFC3339),
+					},
+				})
 			}()
 
 		case "stop":
