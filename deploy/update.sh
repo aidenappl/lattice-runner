@@ -80,8 +80,10 @@ echo "  Built: $(ls -lh lattice-runner | awk '{print $5}')"
 echo ""
 
 # Replace binary and restart service
-sudo cp lattice-runner "$INSTALL_DIR/lattice-runner"
-sudo chmod +x "$INSTALL_DIR/lattice-runner"
+# Copy to a temp path then rename atomically — avoids "Text file busy" when upgrading a running binary
+sudo cp lattice-runner "$INSTALL_DIR/lattice-runner.new"
+sudo chmod +x "$INSTALL_DIR/lattice-runner.new"
+sudo mv -f "$INSTALL_DIR/lattice-runner.new" "$INSTALL_DIR/lattice-runner"
 
 echo "Restarting lattice-runner..."
 sudo systemctl restart lattice-runner
