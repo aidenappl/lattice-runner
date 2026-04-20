@@ -23,6 +23,7 @@ type Server struct {
 	Version    string
 	StartedAt  time.Time
 	Port       string
+	LatticeURL string
 }
 
 func (s *Server) Start() {
@@ -144,7 +145,8 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, dashboardHTML)
+	html := strings.Replace(dashboardHTML, "{{LATTICE_URL}}", s.LatticeURL, 1)
+	fmt.Fprint(w, html)
 }
 
 func getHostname() string {

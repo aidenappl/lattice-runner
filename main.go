@@ -886,6 +886,7 @@ func main() {
 		WorkerName: cfg.WorkerName,
 		StartedAt:  time.Now(),
 		Port:       cfg.DashboardPort,
+		LatticeURL: cfg.LatticeURL,
 	}
 	go dashboard.Start()
 

@@ -7,12 +7,13 @@ import (
 )
 
 type Config struct {
-	OrchestratorURL    string
-	WorkerToken        string
-	WorkerName         string
-	HeartbeatInterval  time.Duration
-	ReconnectInterval  time.Duration
-	DashboardPort      string
+	OrchestratorURL   string
+	WorkerToken       string
+	WorkerName        string
+	HeartbeatInterval time.Duration
+	ReconnectInterval time.Duration
+	DashboardPort     string
+	LatticeURL        string
 }
 
 func Load() *Config {
@@ -23,6 +24,7 @@ func Load() *Config {
 		HeartbeatInterval: parseDuration("HEARTBEAT_INTERVAL", 15*time.Second),
 		ReconnectInterval: parseDuration("RECONNECT_INTERVAL", 5*time.Second),
 		DashboardPort:     getEnv("DASHBOARD_PORT", "9100"),
+		LatticeURL:        getEnv("LATTICE_URL", ""),
 	}
 	return cfg
 }
