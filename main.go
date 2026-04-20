@@ -23,8 +23,8 @@ import (
 	"github.com/aidenappl/lattice-runner/web"
 )
 
-// Set via -ldflags at build time: -ldflags "-X main.Version=abc1234"
-var Version = "v0.1.5"
+// Set via -ldflags at build time: -ldflags "-X main.Version=v1.0.1"
+var Version = "dev"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
