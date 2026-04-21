@@ -1451,35 +1451,46 @@ func main() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
 		defer ticker.Stop()
 
+		heartbeatCount := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				heartbeatCount++
 				m := metrics.Collect(ctx, docker)
+				payload := map[string]any{
+					"cpu_percent":             m.CPUPercent,
+					"cpu_cores":               m.CPUCores,
+					"load_avg_1":              m.LoadAvg1,
+					"load_avg_5":              m.LoadAvg5,
+					"load_avg_15":             m.LoadAvg15,
+					"memory_used_mb":          m.MemoryUsedMB,
+					"memory_total_mb":         m.MemoryTotalMB,
+					"memory_free_mb":          m.MemoryFreeMB,
+					"swap_used_mb":            m.SwapUsedMB,
+					"swap_total_mb":           m.SwapTotalMB,
+					"disk_used_mb":            m.DiskUsedMB,
+					"disk_total_mb":           m.DiskTotalMB,
+					"container_count":         m.ContainerCount,
+					"container_running_count": m.ContainerRunningCount,
+					"network_rx_bytes":        m.NetworkRxBytes,
+					"network_tx_bytes":        m.NetworkTxBytes,
+					"uptime_seconds":          m.UptimeSeconds,
+					"process_count":           m.ProcessCount,
+					"runner_version":          Version,
+				}
+
+				// Collect per-container resource stats every 3rd heartbeat (expensive)
+				if heartbeatCount%3 == 0 {
+					if containerStats, err := docker.ContainerStats(ctx); err == nil && len(containerStats) > 0 {
+						payload["container_stats"] = containerStats
+					}
+				}
+
 				_ = ws.SendJSON(client.OutgoingMessage{
-					Type: "heartbeat",
-					Payload: map[string]any{
-						"cpu_percent":             m.CPUPercent,
-						"cpu_cores":               m.CPUCores,
-						"load_avg_1":              m.LoadAvg1,
-						"load_avg_5":              m.LoadAvg5,
-						"load_avg_15":             m.LoadAvg15,
-						"memory_used_mb":          m.MemoryUsedMB,
-						"memory_total_mb":         m.MemoryTotalMB,
-						"memory_free_mb":          m.MemoryFreeMB,
-						"swap_used_mb":            m.SwapUsedMB,
-						"swap_total_mb":           m.SwapTotalMB,
-						"disk_used_mb":            m.DiskUsedMB,
-						"disk_total_mb":           m.DiskTotalMB,
-						"container_count":         m.ContainerCount,
-						"container_running_count": m.ContainerRunningCount,
-						"network_rx_bytes":        m.NetworkRxBytes,
-						"network_tx_bytes":        m.NetworkTxBytes,
-						"uptime_seconds":          m.UptimeSeconds,
-						"process_count":           m.ProcessCount,
-						"runner_version":          Version,
-					},
+					Type:    "heartbeat",
+					Payload: payload,
 				})
 
 				// Clean up old deployment states to prevent memory leak

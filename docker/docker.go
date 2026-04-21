@@ -424,6 +424,87 @@ func (c *Client) ContainerExecResize(ctx context.Context, execID string, height,
 	})
 }
 
+// ContainerResourceUsage holds per-container CPU/memory stats.
+type ContainerResourceUsage struct {
+	Name       string  `json:"name"`
+	ID         string  `json:"id"`
+	CPUPercent float64 `json:"cpu_percent"`
+	MemUsageMB float64 `json:"mem_usage_mb"`
+	MemLimitMB float64 `json:"mem_limit_mb"`
+	MemPercent float64 `json:"mem_percent"`
+}
+
+// ContainerStats collects one-shot CPU/memory stats for all running containers.
+func (c *Client) ContainerStats(ctx context.Context) ([]ContainerResourceUsage, error) {
+	containers, err := c.ListContainers(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+
+	var stats []ContainerResourceUsage
+	for _, ctr := range containers {
+		if ctr.State != "running" {
+			continue
+		}
+
+		resp, err := c.cli.ContainerStatsOneShot(ctx, ctr.ID)
+		if err != nil {
+			continue
+		}
+
+		var s container.StatsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+
+		// Calculate CPU percentage
+		cpuDelta := float64(s.CPUStats.CPUUsage.TotalUsage - s.PreCPUStats.CPUUsage.TotalUsage)
+		systemDelta := float64(s.CPUStats.SystemUsage - s.PreCPUStats.SystemUsage)
+		cpuPercent := 0.0
+		if systemDelta > 0 && cpuDelta > 0 {
+			cpuPercent = (cpuDelta / systemDelta) * float64(s.CPUStats.OnlineCPUs) * 100.0
+		}
+
+		// Memory usage (subtract cache for actual working set)
+		cache := uint64(0)
+		if v, ok := s.MemoryStats.Stats["cache"]; ok {
+			cache = v
+		}
+		memUsage := float64(s.MemoryStats.Usage - cache)
+		memLimit := float64(s.MemoryStats.Limit)
+		memPercent := 0.0
+		if memLimit > 0 {
+			memPercent = (memUsage / memLimit) * 100.0
+		}
+
+		name := ""
+		for _, n := range ctr.Names {
+			trimmed := strings.TrimPrefix(n, "/")
+			if trimmed != "" {
+				name = trimmed
+				break
+			}
+		}
+
+		idShort := ctr.ID
+		if len(idShort) > 12 {
+			idShort = idShort[:12]
+		}
+
+		stats = append(stats, ContainerResourceUsage{
+			Name:       name,
+			ID:         idShort,
+			CPUPercent: cpuPercent,
+			MemUsageMB: memUsage / 1024 / 1024,
+			MemLimitMB: memLimit / 1024 / 1024,
+			MemPercent: memPercent,
+		})
+	}
+	return stats, nil
+}
+
 func (c *Client) Close() error {
 	return c.cli.Close()
 }
