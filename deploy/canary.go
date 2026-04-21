@@ -3,7 +3,6 @@ package deploy
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -78,7 +77,7 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 	monitorCtx, monitorCancel := context.WithTimeout(ctx, canaryMonitorDuration)
 	defer monitorCancel()
 
-	healthy := e.monitorCanary(monitorCtx, canaryID)
+	healthy := e.monitorCanary(monitorCtx, canaryID, spec.DeploymentID)
 
 	// Clean up canary
 	_ = e.Docker.StopContainer(ctx, canaryID, 10)
@@ -95,25 +94,35 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 	return e.executeRolling(ctx, spec)
 }
 
-func (e *Executor) monitorCanary(ctx context.Context, containerID string) bool {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// Timeout reached — canary survived the monitoring period
-			return true
-		case <-ticker.C:
-			info, err := e.Docker.InspectContainer(ctx, containerID)
-			if err != nil {
-				log.Printf("deploy: canary inspect error: %v", err)
+func (e *Executor) monitorCanary(ctx context.Context, containerID string, deploymentID int) bool {
+	checks := 6 // 6 checks * 5s = 30s monitoring window
+	for i := 0; i < checks; i++ {
+		time.Sleep(5 * time.Second)
+		info, err := e.Docker.InspectContainer(ctx, containerID)
+		if err != nil {
+			e.reportProgress(deploymentID, "deploying",
+				fmt.Sprintf("canary check %d/%d: inspect failed: %v", i+1, checks, err), nil)
+			return false
+		}
+		if !info.State.Running {
+			e.reportProgress(deploymentID, "deploying",
+				fmt.Sprintf("canary check %d/%d: container stopped", i+1, checks), nil)
+			return false
+		}
+		// Check Docker health status if configured
+		if info.State.Health != nil {
+			status := info.State.Health.Status
+			if status == "unhealthy" {
+				e.reportProgress(deploymentID, "deploying",
+					fmt.Sprintf("canary check %d/%d: unhealthy", i+1, checks), nil)
 				return false
 			}
-			if !info.State.Running {
-				log.Printf("deploy: canary exited with code %d", info.State.ExitCode)
-				return false
-			}
+			e.reportProgress(deploymentID, "deploying",
+				fmt.Sprintf("canary check %d/%d: running (health=%s)", i+1, checks, status), nil)
+		} else {
+			e.reportProgress(deploymentID, "deploying",
+				fmt.Sprintf("canary check %d/%d: running", i+1, checks), nil)
 		}
 	}
+	return true
 }

@@ -166,6 +166,7 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		Image:        imageRef,
 		Env:          env,
 		ExposedPorts: exposedPorts,
+		Labels:       map[string]string{"managed-by": "lattice"},
 	}
 	if len(spec.Command) > 0 {
 		containerConfig.Cmd = spec.Command
@@ -260,12 +261,15 @@ func (c *Client) InspectContainer(ctx context.Context, containerID string) (*typ
 	return &resp, nil
 }
 
-// ListContainers returns containers matching the optional name filter.
+// ListContainers returns Lattice-managed containers matching the optional name filter.
 func (c *Client) ListContainers(ctx context.Context, nameFilter string) ([]types.Container, error) {
 	opts := container.ListOptions{All: true}
+	f := filters.NewArgs()
+	f.Add("label", "managed-by=lattice")
 	if nameFilter != "" {
-		opts.Filters = filters.NewArgs(filters.Arg("name", nameFilter))
+		f.Add("name", nameFilter)
 	}
+	opts.Filters = f
 	return c.cli.ContainerList(ctx, opts)
 }
 
