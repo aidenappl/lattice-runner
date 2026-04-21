@@ -287,10 +287,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "stop", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("stop: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "stop", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "stop", "looking up container…")
@@ -339,10 +351,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "start", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("start: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "start", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "start", "looking up container…")
@@ -391,10 +415,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "kill", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("kill: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "kill", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "kill", "looking up container…")
@@ -443,10 +479,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "pause", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("pause: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "pause", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "pause", "looking up container…")
@@ -495,10 +543,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "unpause", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("unpause: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "unpause", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "unpause", "looking up container…")
@@ -547,10 +607,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "restart", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("restart: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "restart", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "restart", "looking up container…")
@@ -599,10 +671,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "remove", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("remove: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "remove", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 				sendLifecycleLog(ws, containerName, "remove", "looking up container…")
@@ -655,10 +739,22 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "recreate", "status": "error", "message": "missing container_name",
+						},
+					})
 					return
 				}
 				if !validContainerName(containerName) {
 					log.Printf("recreate: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "recreate", "status": "error", "message": "invalid container_name",
+						},
+					})
 					return
 				}
 

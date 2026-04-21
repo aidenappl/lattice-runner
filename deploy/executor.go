@@ -83,6 +83,7 @@ type ContainerSpec struct {
 	Networks      []string          `json:"networks"`
 	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
 	RegistryAuth  *RegistryAuth     `json:"registry_auth,omitempty"`
+	DependsOn     []string          `json:"depends_on,omitempty"`
 }
 
 type HealthCheck struct {

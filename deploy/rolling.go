@@ -10,14 +10,16 @@ import (
 
 // containerSnapshot captures the pre-deployment state of a container for rollback.
 type containerSnapshot struct {
-	Name  string
-	Image string
+	Name     string
+	OldImage string // full image:tag before upgrade
+	SpecIdx  int    // index into spec.Containers
+	Replica  int    // which replica
 }
 
 func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) error {
 	// Capture current state before rolling update for rollback purposes
 	var snapshots []containerSnapshot
-	for _, cSpec := range spec.Containers {
+	for i, cSpec := range spec.Containers {
 		tag := cSpec.Tag
 		if tag == "" {
 			tag = "latest"
@@ -31,18 +33,20 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			if replicas > 1 {
 				name = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
+			oldImage := cSpec.Image + ":" + tag
 			// Try to find existing container to get its current image
 			if id, err := e.Docker.FindContainerByName(ctx, name); err == nil && id != "" {
 				info, err := e.Docker.InspectContainer(ctx, id)
 				if err == nil {
-					snapshots = append(snapshots, containerSnapshot{
-						Name:  name,
-						Image: info.Config.Image,
-					})
-					continue
+					oldImage = info.Config.Image
 				}
 			}
-			snapshots = append(snapshots, containerSnapshot{Name: name, Image: cSpec.Image + ":" + tag})
+			snapshots = append(snapshots, containerSnapshot{
+				Name:     name,
+				OldImage: oldImage,
+				SpecIdx:  i,
+				Replica:  replica,
+			})
 		}
 	}
 
@@ -172,28 +176,48 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 	for j := len(updatedContainers) - 1; j >= 0; j-- {
 		idx := updatedContainers[j]
 		snap := snapshots[idx]
+		cSpec := spec.Containers[snap.SpecIdx]
 
 		e.reportProgress(spec.DeploymentID, "deploying",
-			fmt.Sprintf("rollback: restoring %s to %s", snap.Name, snap.Image), nil)
+			fmt.Sprintf("rollback: restoring %s to %s", snap.Name, snap.OldImage), nil)
 
 		// Pull old image
-		if err := e.Docker.PullImage(ctx, snap.Image, nil); err != nil {
+		if err := e.Docker.PullImage(ctx, snap.OldImage, nil); err != nil {
 			log.Printf("deploy: rollback pull failed for %s: %v", snap.Name, err)
 		}
 
-		// Stop and remove the new container
+		// Stop and remove the new (broken) container
 		if oldID, findErr := e.Docker.FindContainerByName(ctx, snap.Name); findErr == nil && oldID != "" {
 			_ = e.Docker.StopContainer(ctx, oldID, 10)
 			_ = e.Docker.RemoveContainer(ctx, oldID, true)
 		}
 
-		// Recreate with old image
-		oldSpec := dockerclient.ContainerSpec{
-			Name:  snap.Name,
-			Image: snap.Image,
-			Tag:   "", // Image already contains tag
+		// Recreate with old image but full original spec (ports, env, volumes, etc.)
+		portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))
+		for k, pm := range cSpec.PortMappings {
+			portMappings[k] = dockerclient.PortMapping{
+				HostPort:      pm.HostPort,
+				ContainerPort: pm.ContainerPort,
+				Protocol:      pm.Protocol,
+			}
 		}
-		_, createErr := e.Docker.CreateAndStartContainer(ctx, oldSpec)
+
+		dockerSpec := dockerclient.ContainerSpec{
+			Name:          snap.Name,
+			Image:         snap.OldImage,
+			Tag:           "", // OldImage already contains tag
+			PortMappings:  portMappings,
+			EnvVars:       cSpec.EnvVars,
+			Volumes:       cSpec.Volumes,
+			CPULimit:      cSpec.CPULimit,
+			MemoryLimit:   cSpec.MemoryLimit,
+			RestartPolicy: cSpec.RestartPolicy,
+			Command:       cSpec.Command,
+			Entrypoint:    cSpec.Entrypoint,
+			Networks:      cSpec.Networks,
+			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
+		}
+		_, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 		if createErr != nil {
 			log.Printf("deploy: rollback failed for %s: %v", snap.Name, createErr)
 		}

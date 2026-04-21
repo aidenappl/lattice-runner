@@ -97,7 +97,11 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 func (e *Executor) monitorCanary(ctx context.Context, containerID string, deploymentID int) bool {
 	checks := 6 // 6 checks * 5s = 30s monitoring window
 	for i := 0; i < checks; i++ {
-		time.Sleep(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(5 * time.Second):
+		}
 		info, err := e.Docker.InspectContainer(ctx, containerID)
 		if err != nil {
 			e.reportProgress(deploymentID, "deploying",

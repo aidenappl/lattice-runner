@@ -261,15 +261,14 @@ func (c *Client) InspectContainer(ctx context.Context, containerID string) (*typ
 	return &resp, nil
 }
 
-// ListContainers returns Lattice-managed containers matching the optional name filter.
+// ListContainers returns all containers matching the optional name filter.
 func (c *Client) ListContainers(ctx context.Context, nameFilter string) ([]types.Container, error) {
 	opts := container.ListOptions{All: true}
-	f := filters.NewArgs()
-	f.Add("label", "managed-by=lattice")
 	if nameFilter != "" {
+		f := filters.NewArgs()
 		f.Add("name", nameFilter)
+		opts.Filters = f
 	}
-	opts.Filters = f
 	return c.cli.ContainerList(ctx, opts)
 }
 

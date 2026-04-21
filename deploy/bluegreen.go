@@ -98,12 +98,36 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			}
 			time.Sleep(2 * time.Second)
 		}
-		_ = cName // used for logging context if needed
+
+		// After the deadline, verify the container is actually healthy
+		info, err := e.Docker.InspectContainer(ctx, id)
+		if err != nil || !info.State.Running {
+			e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("health check failed: container %s not running", cName), nil)
+			e.cleanupGreen(ctx, greenIDs)
+			return fmt.Errorf("health check failed for %s: container not running", cName)
+		}
+		if info.State.Health != nil && info.State.Health.Status != "healthy" {
+			e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("health check failed: %s is %s", cName, info.State.Health.Status), nil)
+			e.cleanupGreen(ctx, greenIDs)
+			return fmt.Errorf("health check failed for %s: status %s", cName, info.State.Health.Status)
+		}
 	}
 
 	// Phase 3: Stop blue (old) and rename green to take over
 	e.reportProgress(spec.DeploymentID, "deploying", "health check passed, swapping blue→green", nil)
+
+	// Track blue containers before removing them so we can attempt restart on failure
+	type blueBackup struct {
+		name string
+		id   string
+	}
+	var blueBackups []blueBackup
+	var swapErr error
+
 	for _, cSpec := range spec.Containers {
+		if swapErr != nil {
+			break
+		}
 		replicas := cSpec.Replicas
 		if replicas <= 0 {
 			replicas = 1
@@ -115,11 +139,18 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				blueName = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
 
+			// Capture blue ID before stopping
+			var blueID string
+			if id, err := e.Docker.FindContainerByName(ctx, blueName); err == nil && id != "" {
+				blueID = id
+				blueBackups = append(blueBackups, blueBackup{name: blueName, id: blueID})
+			}
+
 			// Stop and remove blue
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("stopping blue (old) container: %s", blueName),
 				map[string]any{"container_name": blueName, "step": "stopping_blue"})
-			if blueID, err := e.Docker.FindContainerByName(ctx, blueName); err == nil && blueID != "" {
+			if blueID != "" {
 				_ = e.Docker.StopContainer(ctx, blueID, 30)
 				_ = e.Docker.RemoveContainer(ctx, blueID, true)
 			}
@@ -158,13 +189,23 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 
 			_, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			if err != nil {
-				return fmt.Errorf("recreate container %s: %w", blueName, err)
+				swapErr = fmt.Errorf("recreate container %s: %w", blueName, err)
+				break
 			}
 
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("swapped to new container: %s", blueName),
 				map[string]any{"container_name": blueName, "step": "swapped"})
 		}
+	}
+
+	// If swap failed, try to restart blue containers as rollback
+	if swapErr != nil {
+		log.Printf("deploy: blue-green swap failed, attempting to restart blue containers: %v", swapErr)
+		for _, bb := range blueBackups {
+			_ = e.Docker.StartContainer(ctx, bb.id) // may fail if already removed
+		}
+		return swapErr
 	}
 
 	return nil
