@@ -17,7 +17,11 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 
 	for i, cSpec := range spec.Containers {
 		greenName := cSpec.Name + "-green"
-		imageRef := cSpec.Image + ":" + cSpec.Tag
+		tag := cSpec.Tag
+		if tag == "" {
+			tag = "latest"
+		}
+		imageRef := cSpec.Image + ":" + tag
 
 		var regAuth *dockerclient.RegistryAuth
 		if cSpec.RegistryAuth != nil {
@@ -78,9 +82,22 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			map[string]any{"container_name": greenName, "step": "green_running"})
 	}
 
-	// Phase 2: Brief health check delay
-	e.reportProgress(spec.DeploymentID, "deploying", "all green containers running, performing 5s health check delay", nil)
-	time.Sleep(5 * time.Second)
+	// Phase 2: Wait for green containers to become healthy
+	e.reportProgress(spec.DeploymentID, "deploying", "all green containers running, performing health checks", nil)
+	for cName, id := range greenIDs {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			info, err := e.Docker.InspectContainer(ctx, id)
+			if err == nil && info.State.Running {
+				// If no healthcheck configured, running is good enough
+				if info.State.Health == nil || info.State.Health.Status == "healthy" {
+					break
+				}
+			}
+			time.Sleep(2 * time.Second)
+		}
+		_ = cName // used for logging context if needed
+	}
 
 	// Phase 3: Stop blue (old) and rename green to take over
 	e.reportProgress(spec.DeploymentID, "deploying", "health check passed, swapping blue→green", nil)

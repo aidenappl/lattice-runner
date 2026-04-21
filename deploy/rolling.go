@@ -10,7 +10,11 @@ import (
 
 func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) error {
 	for i, cSpec := range spec.Containers {
-		imageRef := cSpec.Image + ":" + cSpec.Tag
+		tag := cSpec.Tag
+		if tag == "" {
+			tag = "latest"
+		}
+		imageRef := cSpec.Image + ":" + tag
 
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("[%d/%d] pulling image %s for container %s", i+1, len(spec.Containers), imageRef, cSpec.Name),

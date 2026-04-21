@@ -181,6 +181,15 @@ func main() {
 					return
 				}
 
+				// Check if deployment is already in progress
+				deploymentStatesMu.Lock()
+				if existing, ok := deploymentStates[spec.DeploymentID]; ok && existing.Status == "deploying" {
+					deploymentStatesMu.Unlock()
+					log.Printf("deploy: deployment %d already in progress, ignoring duplicate", spec.DeploymentID)
+					return
+				}
+				deploymentStatesMu.Unlock()
+
 				attempt := 1
 				if v, ok := env.Payload["attempt"].(float64); ok && int(v) > 0 {
 					attempt = int(v)
@@ -1376,6 +1385,15 @@ func main() {
 						"runner_version":          Version,
 					},
 				})
+
+				// Clean up old deployment states to prevent memory leak
+				deploymentStatesMu.Lock()
+				for id, st := range deploymentStates {
+					if st.Status != "deploying" && time.Since(st.LastProgressAt) > time.Hour {
+						delete(deploymentStates, id)
+					}
+				}
+				deploymentStatesMu.Unlock()
 
 				// Push live container state snapshot so the orchestrator stays in sync
 				// even when containers are stopped/started outside of Lattice.

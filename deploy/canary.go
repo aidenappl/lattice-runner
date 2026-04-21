@@ -19,7 +19,11 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 	// Use the first container as the canary
 	canarySpec := spec.Containers[0]
 	canaryName := canarySpec.Name + "-canary"
-	imageRef := canarySpec.Image + ":" + canarySpec.Tag
+	tag := canarySpec.Tag
+	if tag == "" {
+		tag = "latest"
+	}
+	imageRef := canarySpec.Image + ":" + tag
 
 	e.reportProgress(spec.DeploymentID, "deploying",
 		fmt.Sprintf("starting canary deployment: %s (image=%s:%s)", canaryName, canarySpec.Image, canarySpec.Tag), nil)

@@ -110,7 +110,7 @@ func encodeAuthConfig(auth *RegistryAuth) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return base64.URLEncoding.EncodeToString(b), nil
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 // CreateAndStartContainer creates and starts a container from the given spec.
@@ -364,10 +364,22 @@ func (c *Client) RecreateContainer(ctx context.Context, containerID string, name
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
 
+	// Preserve network configuration from the original container
+	networkConfig := &network.NetworkingConfig{}
+	if info.NetworkSettings != nil && len(info.NetworkSettings.Networks) > 0 {
+		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
+		for netName, netSettings := range info.NetworkSettings.Networks {
+			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{
+				IPAMConfig: netSettings.IPAMConfig,
+				Aliases:    netSettings.Aliases,
+			}
+		}
+	}
+
 	_ = c.StopContainer(ctx, containerID, 10)
 	_ = c.RemoveContainer(ctx, containerID, true)
 
-	resp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, &network.NetworkingConfig{}, nil, name)
+	resp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, networkConfig, nil, name)
 	if err != nil {
 		return "", fmt.Errorf("recreate container: %w", err)
 	}
