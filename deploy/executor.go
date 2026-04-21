@@ -5,9 +5,56 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 )
+
+// shellMetaChars contains characters that could be used for shell injection.
+const shellMetaChars = ";$`|&"
+
+// validContainerName checks that a container name is safe to use.
+// Allows alphanumeric, hyphens, underscores, dots, and forward slashes (for compose prefixes).
+func validContainerName(name string) bool {
+	if name == "" || len(name) > 128 {
+		return false
+	}
+	for _, c := range name {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/') {
+			return false
+		}
+	}
+	return true
+}
+
+// Validate checks the deployment spec for safety and sanity limits.
+func (s *DeploymentSpec) Validate() error {
+	if len(s.Containers) > 100 {
+		return fmt.Errorf("too many containers: %d (max 100)", len(s.Containers))
+	}
+	if len(s.Networks) > 50 {
+		return fmt.Errorf("too many networks: %d (max 50)", len(s.Networks))
+	}
+	if len(s.Volumes) > 50 {
+		return fmt.Errorf("too many volumes: %d (max 50)", len(s.Volumes))
+	}
+	for i, c := range s.Containers {
+		if !validContainerName(c.Name) {
+			return fmt.Errorf("container[%d]: invalid name %q", i, c.Name)
+		}
+		if c.Image == "" {
+			return fmt.Errorf("container[%d] %q: image is required", i, c.Name)
+		}
+		imageRef := c.Image
+		if c.Tag != "" {
+			imageRef += ":" + c.Tag
+		}
+		if strings.ContainsAny(imageRef, shellMetaChars) {
+			return fmt.Errorf("container[%d] %q: image ref contains shell metacharacters", i, c.Name)
+		}
+	}
+	return nil
+}
 
 // DeploymentSpec is the deployment specification received from the orchestrator.
 type DeploymentSpec struct {
@@ -114,6 +161,10 @@ func NewExecutor(docker *dockerclient.Client, progress ProgressCallback) *Execut
 
 // Execute runs a deployment according to the specified strategy.
 func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
+	if err := spec.Validate(); err != nil {
+		return fmt.Errorf("spec validation failed: %w", err)
+	}
+
 	log.Printf("deploy: starting deployment=%d strategy=%s stack=%s", spec.DeploymentID, spec.Strategy, spec.StackName)
 
 	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting deployment: strategy=%s, containers=%d, networks=%d, volumes=%d",

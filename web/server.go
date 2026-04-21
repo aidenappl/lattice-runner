@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,8 +32,12 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/containers", s.handleContainers)
 	mux.HandleFunc("/api/containers/", s.handleContainerLogs)
 
-	addr := ":" + s.Port
-	log.Printf("dashboard: http://0.0.0.0%s", addr)
+	bind := os.Getenv("DASHBOARD_BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	addr := bind + ":" + s.Port
+	log.Printf("dashboard: http://%s", addr)
 
 	server := &http.Server{
 		Addr:         addr,
@@ -132,7 +135,7 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 		tail = "100"
 	}
 
-	reader, err := s.Docker.ContainerLogs(context.Background(), containerID, tail)
+	reader, err := s.Docker.ContainerLogs(r.Context(), containerID, tail)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

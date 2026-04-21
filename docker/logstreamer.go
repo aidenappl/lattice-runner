@@ -191,6 +191,15 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 			continue
 		}
 
+		const maxLogLineSize = 1 * 1024 * 1024 // 1MB
+		if size > maxLogLineSize {
+			// Skip oversized log line
+			if _, err := io.CopyN(io.Discard, bufReader, int64(size)); err != nil {
+				return lastSeen
+			}
+			continue
+		}
+
 		payload := make([]byte, size)
 		_, err = io.ReadFull(bufReader, payload)
 		if err != nil {

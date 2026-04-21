@@ -280,6 +280,10 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				if !validContainerName(containerName) {
+					log.Printf("stop: invalid container name rejected: %q", containerName)
+					return
+				}
 				sendLifecycleLog(ws, containerName, "stop", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -326,6 +330,10 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					return
+				}
+				if !validContainerName(containerName) {
+					log.Printf("start: invalid container name rejected: %q", containerName)
 					return
 				}
 				sendLifecycleLog(ws, containerName, "start", "looking up container…")
@@ -376,6 +384,10 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				if !validContainerName(containerName) {
+					log.Printf("kill: invalid container name rejected: %q", containerName)
+					return
+				}
 				sendLifecycleLog(ws, containerName, "kill", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -422,6 +434,10 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					return
+				}
+				if !validContainerName(containerName) {
+					log.Printf("pause: invalid container name rejected: %q", containerName)
 					return
 				}
 				sendLifecycleLog(ws, containerName, "pause", "looking up container…")
@@ -472,6 +488,10 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				if !validContainerName(containerName) {
+					log.Printf("unpause: invalid container name rejected: %q", containerName)
+					return
+				}
 				sendLifecycleLog(ws, containerName, "unpause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -520,6 +540,10 @@ func main() {
 				if containerName == "" {
 					return
 				}
+				if !validContainerName(containerName) {
+					log.Printf("restart: invalid container name rejected: %q", containerName)
+					return
+				}
 				sendLifecycleLog(ws, containerName, "restart", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -566,6 +590,10 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					return
+				}
+				if !validContainerName(containerName) {
+					log.Printf("remove: invalid container name rejected: %q", containerName)
 					return
 				}
 				sendLifecycleLog(ws, containerName, "remove", "looking up container…")
@@ -618,6 +646,10 @@ func main() {
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					return
+				}
+				if !validContainerName(containerName) {
+					log.Printf("recreate: invalid container name rejected: %q", containerName)
 					return
 				}
 

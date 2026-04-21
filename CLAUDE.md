@@ -55,6 +55,7 @@ Environment variables (loaded in `config/config.go`):
 | `HEARTBEAT_INTERVAL` | No | `15s` | Metrics reporting interval |
 | `RECONNECT_INTERVAL` | No | `5s` | WebSocket reconnect backoff |
 | `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port |
+| `DASHBOARD_BIND` | No | `127.0.0.1` | Dashboard bind address (default localhost-only) |
 | `LATTICE_URL` | No | — | Link to orchestrator UI (shown in dashboard) |
 
 ## WebSocket Protocol
@@ -114,10 +115,11 @@ DeploymentSpec includes containers, networks, and volumes. Progress reported to 
 - Extracts RFC3339Nano timestamps for deduplication
 - Tails 100 lines on first connect, resumes from last timestamp on reconnect
 - Auto-detects and restarts dead streams
+- Log line size limit: 1MB max per line to prevent memory DoS
 
 ## Local Dashboard
 
-HTTP server on port 9100 (`web/`):
+HTTP server on port 9100 (`web/`), binds to `127.0.0.1` by default (override with `DASHBOARD_BIND` env var):
 
 - `GET /` — HTML dashboard (terminal aesthetic, dark theme, auto-refresh 5s/10s)
 - `GET /api/status` — JSON system metrics
@@ -126,6 +128,8 @@ HTTP server on port 9100 (`web/`):
 
 ## Key Patterns
 
+- **Input validation**: Container name validation (`validate.go`) applied to all incoming commands before execution
+- **Deployment spec validation**: Enforces count limits on containers, networks, and volumes; validates all names in the spec
 - All incoming commands dispatched to goroutines via `safeGo()` wrapper with panic recovery
 - Panics captured and sent to orchestrator as `worker_crash` messages with goroutine name
 - `lifecycle_log` messages sent during operations for real-time progress in web UI
