@@ -1287,6 +1287,10 @@ func main() {
 				if containerName == "" || commandID == "" {
 					return
 				}
+				if !validContainerName(containerName) {
+					log.Printf("exec_start: invalid container name: %s", containerName)
+					return
+				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
