@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -100,30 +102,44 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			if err != nil {
 				log.Printf("deploy: error finding container %s: %v", name, err)
 			}
-			if existingID != "" {
-				// Clean up any leftover retired container from a previous deploy
-				retiredName := name + "-lattice-retired"
-				if retiredID, _ := e.Docker.FindContainerByName(ctx, retiredName); retiredID != "" {
-					_ = e.Docker.StopContainer(ctx, retiredID, 5)
-					_ = e.Docker.RemoveContainer(ctx, retiredID, true)
+
+			// Generate a unique retired name using timestamp
+			retiredName := name + "-retired-" + strconv.FormatInt(time.Now().Unix(), 10)
+
+			// Clean up any leftover retired containers from previous deploys
+			retiredPrefix := name + "-retired"
+			if orphans, err := e.Docker.FindContainersByPrefix(ctx, retiredPrefix); err == nil {
+				for _, orphan := range orphans {
+					orphanName := ""
+					for _, n := range orphan.Names {
+						orphanName = strings.TrimPrefix(n, "/")
+						if orphanName != "" {
+							break
+						}
+					}
+					log.Printf("deploy: cleaning up leftover retired container %s (id=%s)", orphanName, orphan.ID[:12])
+					_ = e.Docker.StopContainer(ctx, orphan.ID, 5)
+					_ = e.Docker.RemoveContainer(ctx, orphan.ID, true)
 				}
+			}
+
+			if existingID != "" {
+				e.reportProgress(spec.DeploymentID, "deploying",
+					fmt.Sprintf("[%d/%d] retiring old container: %s", i+1, len(spec.Containers), name),
+					map[string]any{"container_name": name, "step": "retiring"})
 
 				// Rename the old container so the name is immediately free
 				if renameErr := e.Docker.RenameContainer(ctx, existingID, retiredName); renameErr != nil {
-					log.Printf("deploy: rename failed for %s: %v — force removing instead", name, renameErr)
-					// Fallback: force remove by name directly
-					_ = e.Docker.RemoveContainer(ctx, existingID, true)
-					time.Sleep(2 * time.Second)
-				}
-
-				e.reportProgress(spec.DeploymentID, "deploying",
-					fmt.Sprintf("[%d/%d] stopping old container: %s", i+1, len(spec.Containers), name),
-					map[string]any{"container_name": name, "step": "stopping"})
-				if err := e.Docker.StopContainer(ctx, existingID, 30); err != nil {
-					log.Printf("deploy: error stopping container %s: %v", name, err)
-				}
-				if err := e.Docker.RemoveContainer(ctx, existingID, true); err != nil {
-					log.Printf("deploy: error removing container %s: %v", name, err)
+					log.Printf("deploy: rename failed for %s: %v — force removing by ID instead", name, renameErr)
+					// Fallback: force remove by ID with retries
+					for attempt := 0; attempt < 3; attempt++ {
+						if rmErr := e.Docker.RemoveContainer(ctx, existingID, true); rmErr == nil {
+							break
+						} else {
+							log.Printf("deploy: force remove attempt %d for %s failed: %v", attempt+1, name, rmErr)
+							time.Sleep(1 * time.Second)
+						}
+					}
 				}
 			} else {
 				e.reportProgress(spec.DeploymentID, "deploying",
@@ -169,8 +185,26 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				containerID, err = e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			}
 			if err != nil {
+				// Create failed — try to rollback the retired container name
+				if existingID != "" {
+					if renameBackErr := e.Docker.RenameContainer(ctx, existingID, name); renameBackErr != nil {
+						log.Printf("deploy: rollback rename for %s also failed: %v", name, renameBackErr)
+					} else {
+						log.Printf("deploy: rolled back retired container to original name %s", name)
+					}
+				}
 				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
 				return fmt.Errorf("create container %s, rolled back %d containers: %w", name, len(updatedContainers), err)
+			}
+
+			// Create succeeded — stop and remove the retired container in background (don't block)
+			if existingID != "" {
+				go func(retID, retName string) {
+					log.Printf("deploy: background cleanup of retired container %s (id=%s)", retName, retID[:12])
+					_ = e.Docker.StopContainer(context.Background(), retID, 30)
+					_ = e.Docker.RemoveContainer(context.Background(), retID, true)
+					log.Printf("deploy: retired container %s cleaned up", retName)
+				}(existingID, retiredName)
 			}
 
 			log.Printf("deploy: container %s started (id=%s)", name, containerID[:12])
@@ -244,4 +278,29 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			log.Printf("deploy: rollback failed for %s: %v", snap.Name, createErr)
 		}
 	}
+}
+
+// CleanupOrphanedContainers finds containers with -retired- or -lattice-updating
+// suffixes that are leftovers from failed deploys and returns their names.
+// It does NOT remove them — the caller decides what to do.
+func (e *Executor) CleanupOrphanedContainers(ctx context.Context) []string {
+	containers, err := e.Docker.ListContainers(ctx, "")
+	if err != nil {
+		log.Printf("deploy: failed to list containers for orphan check: %v", err)
+		return nil
+	}
+
+	var orphans []string
+	for _, ct := range containers {
+		for _, n := range ct.Names {
+			name := strings.TrimPrefix(n, "/")
+			if strings.Contains(name, "-retired-") ||
+				strings.HasSuffix(name, "-lattice-retired") ||
+				strings.HasSuffix(name, "-lattice-updating") {
+				orphans = append(orphans, name)
+				log.Printf("deploy: orphaned container detected: %s (state=%s)", name, ct.State)
+			}
+		}
+	}
+	return orphans
 }

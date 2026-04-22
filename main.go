@@ -1289,6 +1289,62 @@ func main() {
 				})
 			}()
 
+		case "force_remove":
+			go func() {
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "force_remove", "status": "error", "message": "missing container_name",
+						},
+					})
+					return
+				}
+				if !validContainerName(containerName) {
+					log.Printf("force_remove: invalid container name rejected: %q", containerName)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "force_remove", "status": "error", "message": "invalid container_name",
+						},
+					})
+					return
+				}
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "force_remove", "status": "error", "message": "container not found",
+						},
+					})
+					return
+				}
+				log.Printf("force_remove: stopping and removing %s (id=%s)", containerName, id[:12])
+				_ = docker.StopContainer(ctx, id, 5)
+				if err := docker.RemoveContainer(ctx, id, true); err != nil {
+					log.Printf("force_remove: failed to remove %s: %v", containerName, err)
+					_ = ws.SendJSON(client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action": "force_remove", "status": "failed", "message": fmt.Sprintf("failed to remove: %v", err),
+						},
+					})
+					return
+				}
+				log.Printf("force_remove: removed %s", containerName)
+				_ = ws.SendJSON(client.OutgoingMessage{
+					Type: "worker_action_status",
+					Payload: map[string]any{
+						"action":         "force_remove",
+						"status":         "success",
+						"message":        fmt.Sprintf("container %s removed", containerName),
+						"container_name": containerName,
+					},
+				})
+			}()
+
 		case "exec_start":
 			go func() {
 				containerName, _ := env.Payload["container_name"].(string)

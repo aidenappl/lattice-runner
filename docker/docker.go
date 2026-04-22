@@ -292,6 +292,24 @@ func (c *Client) FindContainerByName(ctx context.Context, name string) (string, 
 	return "", nil
 }
 
+// FindContainersByPrefix returns all containers whose name starts with the given prefix.
+func (c *Client) FindContainersByPrefix(ctx context.Context, prefix string) ([]types.Container, error) {
+	containers, err := c.ListContainers(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	var matches []types.Container
+	for _, ct := range containers {
+		for _, n := range ct.Names {
+			if strings.HasPrefix(strings.TrimPrefix(n, "/"), prefix) {
+				matches = append(matches, ct)
+				break
+			}
+		}
+	}
+	return matches, nil
+}
+
 func (c *Client) ContainerLogs(ctx context.Context, containerID string, tail string) (io.ReadCloser, error) {
 	return c.cli.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
@@ -414,6 +432,12 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 
 	originalName := strings.TrimPrefix(info.Name, "/")
 	tempName := originalName + "-lattice-updating"
+
+	// Clean up any leftover temp container from a previous attempt
+	if tempID, _ := c.FindContainerByName(ctx, tempName); tempID != "" {
+		_ = c.StopContainer(ctx, tempID, 5)
+		_ = c.RemoveContainer(ctx, tempID, true)
+	}
 
 	// Update image if provided
 	if newImage != "" {
