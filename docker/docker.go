@@ -266,9 +266,11 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 
 	// If there are multiple networks, the first was set via NetworkMode;
 	// connect to the remaining ones explicitly.
-	for _, netName := range spec.Networks[1:] {
-		if err := c.cli.NetworkConnect(ctx, netName, resp.ID, nil); err != nil {
-			log.Printf("docker: failed to connect container %s to network %s: %v", spec.Name, netName, err)
+	if len(spec.Networks) > 1 {
+		for _, netName := range spec.Networks[1:] {
+			if err := c.cli.NetworkConnect(ctx, netName, resp.ID, nil); err != nil {
+				log.Printf("docker: failed to connect container %s to network %s: %v", spec.Name, netName, err)
+			}
 		}
 	}
 
