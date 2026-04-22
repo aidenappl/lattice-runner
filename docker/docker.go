@@ -509,7 +509,7 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 	}
 
 	// Step 3: Rename old container to free the name, then stop and remove
-	retiredName := originalName + "-retired-" + fmt.Sprintf("%d", time.Now().Unix())
+	retiredName := originalName + "-retired-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	if renameErr := c.cli.ContainerRename(ctx, containerID, retiredName); renameErr != nil {
 		log.Printf("graceful-recreate: rename failed for %s: %v — falling back to stop+remove", originalName, renameErr)
 		_ = c.StopContainer(ctx, containerID, 10)

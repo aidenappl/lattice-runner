@@ -103,8 +103,8 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				log.Printf("deploy: error finding container %s: %v", name, err)
 			}
 
-			// Generate a unique retired name using timestamp
-			retiredName := name + "-retired-" + strconv.FormatInt(time.Now().Unix(), 10)
+			// Generate a unique retired name using nanosecond timestamp
+			retiredName := name + "-retired-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
 			// Clean up any leftover retired containers from previous deploys
 			retiredPrefix := name + "-retired"
