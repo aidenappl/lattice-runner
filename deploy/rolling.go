@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +16,7 @@ type containerSnapshot struct {
 	OldImage string // full image:tag before upgrade
 	SpecIdx  int    // index into spec.Containers
 	Replica  int    // which replica
+	OldID    string // Docker container ID of old container (for cleanup)
 }
 
 func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) error {
@@ -37,10 +37,11 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				name = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
 			oldImage := cSpec.Image + ":" + tag
-			// Try to find existing container to get its current image
-			if id, err := e.Docker.FindContainerByName(ctx, name); err == nil && id != "" {
-				info, err := e.Docker.InspectContainer(ctx, id)
-				if err == nil {
+			oldID := ""
+			// Find existing container — could be exact name or a suffixed variant
+			if id, _ := e.findCanonicalContainer(ctx, name); id != "" {
+				oldID = id
+				if info, err := e.Docker.InspectContainer(ctx, id); err == nil {
 					oldImage = info.Config.Image
 				}
 			}
@@ -49,6 +50,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				OldImage: oldImage,
 				SpecIdx:  i,
 				Replica:  replica,
+				OldID:    oldID,
 			})
 		}
 	}
@@ -97,84 +99,18 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				name = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
 
-			// Stop and remove old container if it exists
-			existingID, err := e.Docker.FindContainerByName(ctx, name)
-			if err != nil {
-				log.Printf("deploy: error finding container %s: %v", name, err)
-			}
+			// Find ALL existing containers matching this canonical name
+			oldContainers := e.findAllMatchingContainers(ctx, name)
 
-			// Generate a unique retired name using nanosecond timestamp
-			retiredName := name + "-retired-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+			// Generate a unique name for the new container
+			suffix := dockerclient.GenerateSuffix()
+			deployName := name + "-" + suffix
 
-			// Clean up any leftover retired containers from previous deploys
-			retiredPrefix := name + "-retired"
-			if orphans, err := e.Docker.FindContainersByPrefix(ctx, retiredPrefix); err == nil {
-				for _, orphan := range orphans {
-					orphanName := ""
-					for _, n := range orphan.Names {
-						orphanName = strings.TrimPrefix(n, "/")
-						if orphanName != "" {
-							break
-						}
-					}
-					log.Printf("deploy: cleaning up leftover retired container %s (id=%s)", orphanName, orphan.ID[:12])
-					_ = e.Docker.StopContainer(ctx, orphan.ID, 5)
-					_ = e.Docker.RemoveContainer(ctx, orphan.ID, true)
-				}
-			}
-
-			if existingID != "" {
-				e.reportProgress(spec.DeploymentID, "deploying",
-					fmt.Sprintf("[%d/%d] retiring old container: %s", i+1, len(spec.Containers), name),
-					map[string]any{"container_name": name, "step": "retiring"})
-
-				nameFreed := false
-
-				// Step 1: Try rename to free the name immediately
-				if renameErr := e.Docker.RenameContainer(ctx, existingID, retiredName); renameErr != nil {
-					log.Printf("deploy: rename failed for %s: %v — falling back to stop+remove", name, renameErr)
-					e.reportProgress(spec.DeploymentID, "deploying",
-						fmt.Sprintf("[%d/%d] rename failed for %s, stopping and removing instead", i+1, len(spec.Containers), name), nil)
-
-					// Step 2: Stop first, then remove
-					_ = e.Docker.StopContainer(ctx, existingID, 10)
-					for attempt := 0; attempt < 3; attempt++ {
-						if rmErr := e.Docker.RemoveContainer(ctx, existingID, true); rmErr == nil {
-							nameFreed = true
-							break
-						} else {
-							log.Printf("deploy: force remove attempt %d for %s failed: %v", attempt+1, name, rmErr)
-							time.Sleep(2 * time.Second)
-						}
-					}
-				} else {
-					nameFreed = true
-				}
-
-				// Step 3: Verify the name is actually free before creating
-				if !nameFreed {
-					if checkID, _ := e.Docker.FindContainerByName(ctx, name); checkID != "" {
-						// Last resort: try one more stop+remove
-						_ = e.Docker.StopContainer(ctx, checkID, 10)
-						_ = e.Docker.RemoveContainer(ctx, checkID, true)
-						time.Sleep(2 * time.Second)
-						if finalCheck, _ := e.Docker.FindContainerByName(ctx, name); finalCheck != "" {
-							e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
-							return fmt.Errorf("cannot free container name %s: name still in use after rename+remove attempts", name)
-						}
-					}
-				}
-			} else {
-				e.reportProgress(spec.DeploymentID, "deploying",
-					fmt.Sprintf("[%d/%d] no existing container found for %s, creating new", i+1, len(spec.Containers), name),
-					map[string]any{"container_name": name, "step": "new"})
-			}
-
-			// Create and start new container
 			e.reportProgress(spec.DeploymentID, "deploying",
-				fmt.Sprintf("[%d/%d] creating and starting container: %s", i+1, len(spec.Containers), name),
+				fmt.Sprintf("[%d/%d] creating container: %s (as %s)", i+1, len(spec.Containers), name, deployName),
 				map[string]any{"container_name": name, "step": "starting"})
 
+			// Build port mappings
 			portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))
 			for j, pm := range cSpec.PortMappings {
 				portMappings[j] = dockerclient.PortMapping{
@@ -184,8 +120,28 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				}
 			}
 
+			// If old containers hold host ports, stop them FIRST to free the ports
+			if len(portMappings) > 0 && len(oldContainers) > 0 {
+				e.reportProgress(spec.DeploymentID, "deploying",
+					fmt.Sprintf("[%d/%d] stopping old container(s) to free ports for %s", i+1, len(spec.Containers), name), nil)
+				for _, old := range oldContainers {
+					log.Printf("deploy: stopping old container %s (id=%s) to free ports", old.name, old.id[:12])
+					if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
+						log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
+						_ = e.Docker.KillContainer(ctx, old.id)
+					}
+					// Verify stopped
+					if info, err := e.Docker.InspectContainer(ctx, old.id); err == nil && info.State.Running {
+						log.Printf("deploy: container %s still running, killing", old.name)
+						_ = e.Docker.KillContainer(ctx, old.id)
+						time.Sleep(1 * time.Second)
+					}
+				}
+			}
+
+			// Create and start new container with unique name
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:          name,
+				Name:          deployName,
 				Image:         cSpec.Image,
 				Tag:           cSpec.Tag,
 				PortMappings:  portMappings,
@@ -200,39 +156,42 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 			}
 
-			// Try to create, with one retry after a delay (port release can be slow)
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			if err != nil {
-				log.Printf("deploy: first create attempt failed for %s: %v — retrying in 3s", name, err)
-				time.Sleep(3 * time.Second)
-				containerID, err = e.Docker.CreateAndStartContainer(ctx, dockerSpec)
-			}
-			if err != nil {
-				// Create failed — try to rollback the retired container name
-				if existingID != "" {
-					if renameBackErr := e.Docker.RenameContainer(ctx, existingID, name); renameBackErr != nil {
-						log.Printf("deploy: rollback rename for %s also failed: %v", name, renameBackErr)
-					} else {
-						log.Printf("deploy: rolled back retired container to original name %s", name)
-					}
-				}
+				e.reportProgress(spec.DeploymentID, "deploying",
+					fmt.Sprintf("[%d/%d] failed to create %s: %v", i+1, len(spec.Containers), deployName, err), nil)
 				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
-				return fmt.Errorf("create container %s, rolled back %d containers: %w", name, len(updatedContainers), err)
+				return fmt.Errorf("create container %s: %w", name, err)
 			}
 
-			// Create succeeded — stop and remove the retired container in background (don't block)
-			if existingID != "" {
-				go func(retID, retName string) {
-					log.Printf("deploy: background cleanup of retired container %s (id=%s)", retName, retID[:12])
-					_ = e.Docker.StopContainer(context.Background(), retID, 30)
-					_ = e.Docker.RemoveContainer(context.Background(), retID, true)
-					log.Printf("deploy: retired container %s cleaned up", retName)
-				}(existingID, retiredName)
+			// Verify new container is running
+			if info, err := e.Docker.InspectContainer(ctx, containerID); err != nil || !info.State.Running {
+				e.reportProgress(spec.DeploymentID, "deploying",
+					fmt.Sprintf("[%d/%d] container %s created but not running", i+1, len(spec.Containers), deployName), nil)
+				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+				return fmt.Errorf("container %s not running after create", name)
 			}
 
-			log.Printf("deploy: container %s started (id=%s)", name, containerID[:12])
+			log.Printf("deploy: container %s started (id=%s)", deployName, containerID[:12])
+
+			// Clean up ALL old containers (stop if needed, remove)
+			for _, old := range oldContainers {
+				log.Printf("deploy: removing old container %s (id=%s)", old.name, old.id[:12])
+				if err := e.Docker.StopAndRemoveContainer(ctx, old.id, 10); err != nil {
+					log.Printf("deploy: failed to remove old container %s: %v (will be orphaned)", old.name, err)
+				}
+			}
+
+			// Best-effort rename to canonical name for clean display
+			if renameErr := e.Docker.RenameContainer(ctx, containerID, name); renameErr != nil {
+				log.Printf("deploy: rename %s -> %s failed: %v (container running with suffixed name)", deployName, name, renameErr)
+				// Not fatal — container is running, just with the suffixed name
+			} else {
+				deployName = name
+			}
+
 			e.reportProgress(spec.DeploymentID, "deploying",
-				fmt.Sprintf("container %s started successfully", name),
+				fmt.Sprintf("container %s started successfully", deployName),
 				map[string]any{"container_name": name, "step": "running", "container_id": containerID})
 
 			updatedContainers = append(updatedContainers, snapshotIdx)
@@ -241,6 +200,70 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 	}
 
 	return nil
+}
+
+// oldContainer tracks an existing container found by canonical name matching.
+type oldContainer struct {
+	id   string
+	name string
+}
+
+// findCanonicalContainer finds a container by exact name or by canonical prefix with suffix.
+func (e *Executor) findCanonicalContainer(ctx context.Context, canonicalName string) (string, string) {
+	// Try exact name first
+	if id, err := e.Docker.FindContainerByName(ctx, canonicalName); err == nil && id != "" {
+		return id, canonicalName
+	}
+	// Try finding by prefix (canonical name + suffix pattern)
+	containers := e.findAllMatchingContainers(ctx, canonicalName)
+	if len(containers) > 0 {
+		return containers[0].id, containers[0].name
+	}
+	return "", ""
+}
+
+// findAllMatchingContainers finds all containers that match the canonical name.
+// This includes: exact match, suffixed variants (name-XXXXXX), and orphan variants (name-retired-*).
+func (e *Executor) findAllMatchingContainers(ctx context.Context, canonicalName string) []oldContainer {
+	all, err := e.Docker.ListContainers(ctx, "")
+	if err != nil {
+		return nil
+	}
+
+	var matches []oldContainer
+	for _, ct := range all {
+		for _, n := range ct.Names {
+			cName := strings.TrimPrefix(n, "/")
+			if cName == canonicalName || isCanonicalVariant(canonicalName, cName) {
+				matches = append(matches, oldContainer{id: ct.ID, name: cName})
+				break
+			}
+		}
+	}
+	return matches
+}
+
+// isCanonicalVariant checks if dockerName is a variant of canonicalName.
+// Matches: name-XXXXXX (suffix), name-retired-*, name-lattice-updating
+func isCanonicalVariant(canonicalName, dockerName string) bool {
+	if !strings.HasPrefix(dockerName, canonicalName+"-") {
+		return false
+	}
+	rest := dockerName[len(canonicalName)+1:]
+	// Retired/updating patterns
+	if strings.HasPrefix(rest, "retired") || rest == "lattice-updating" {
+		return true
+	}
+	// 6-char alphanumeric suffix (our deploy suffix)
+	if len(rest) == 6 {
+		for _, c := range rest {
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // rollbackContainers restores previously-updated containers to their original image.
@@ -265,13 +288,12 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			log.Printf("deploy: rollback pull failed for %s: %v", snap.Name, err)
 		}
 
-		// Stop and remove the new (broken) container
-		if oldID, findErr := e.Docker.FindContainerByName(ctx, snap.Name); findErr == nil && oldID != "" {
-			_ = e.Docker.StopContainer(ctx, oldID, 10)
-			_ = e.Docker.RemoveContainer(ctx, oldID, true)
+		// Stop and remove all current containers with this canonical name
+		for _, old := range e.findAllMatchingContainers(ctx, snap.Name) {
+			_ = e.Docker.StopAndRemoveContainer(ctx, old.id, 10)
 		}
 
-		// Recreate with old image but full original spec (ports, env, volumes, etc.)
+		// Recreate with old image and canonical name
 		portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))
 		for k, pm := range cSpec.PortMappings {
 			portMappings[k] = dockerclient.PortMapping{
@@ -281,8 +303,12 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			}
 		}
 
+		// Try with suffixed name first, then rename
+		rollbackSuffix := dockerclient.GenerateSuffix()
+		rollbackName := snap.Name + "-" + rollbackSuffix
+
 		dockerSpec := dockerclient.ContainerSpec{
-			Name:          snap.Name,
+			Name:          rollbackName,
 			Image:         snap.OldImage,
 			Tag:           "", // OldImage already contains tag
 			PortMappings:  portMappings,
@@ -296,15 +322,20 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			Networks:      cSpec.Networks,
 			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 		}
-		_, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+		containerID, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 		if createErr != nil {
-			log.Printf("deploy: rollback failed for %s: %v", snap.Name, createErr)
+			log.Printf("deploy: rollback create failed for %s: %v", snap.Name, createErr)
+			continue
+		}
+		// Best-effort rename to canonical
+		if renameErr := e.Docker.RenameContainer(ctx, containerID, snap.Name); renameErr != nil {
+			log.Printf("deploy: rollback rename %s -> %s failed: %v", rollbackName, snap.Name, renameErr)
 		}
 	}
 }
 
-// CleanupOrphanedContainers finds containers with -retired- or -lattice-updating
-// suffixes that are leftovers from failed deploys and returns their names.
+// CleanupOrphanedContainers finds containers with deploy suffixes, -retired-, or -lattice-updating
+// patterns that are leftovers from failed deploys and returns their names.
 // It does NOT remove them — the caller decides what to do.
 func (e *Executor) CleanupOrphanedContainers(ctx context.Context) []string {
 	containers, err := e.Docker.ListContainers(ctx, "")

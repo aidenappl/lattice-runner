@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -111,6 +112,47 @@ func encodeAuthConfig(auth *RegistryAuth) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// GenerateSuffix returns a 6-character lowercase alphanumeric string for unique container naming.
+func GenerateSuffix() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return string(b)
+}
+
+// StopAndRemoveContainer stops then removes a container, verifying each step.
+// Returns nil if the container is fully removed.
+func (c *Client) StopAndRemoveContainer(ctx context.Context, containerID string, timeout int) error {
+	// Stop
+	if err := c.StopContainer(ctx, containerID, timeout); err != nil {
+		log.Printf("docker: stop failed for %s: %v, trying kill", containerID[:12], err)
+		_ = c.KillContainer(ctx, containerID)
+		time.Sleep(1 * time.Second)
+	}
+
+	// Verify stopped
+	if info, err := c.InspectContainer(ctx, containerID); err == nil && info.State.Running {
+		log.Printf("docker: container %s still running after stop, killing", containerID[:12])
+		_ = c.KillContainer(ctx, containerID)
+		time.Sleep(2 * time.Second)
+	}
+
+	// Remove with retries
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := c.RemoveContainer(ctx, containerID, true); err == nil {
+			return nil
+		} else {
+			log.Printf("docker: remove attempt %d for %s failed: %v", attempt+1, containerID[:12], err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	return fmt.Errorf("failed to remove container %s after 3 attempts", containerID[:12])
 }
 
 // CreateAndStartContainer creates and starts a container from the given spec.
