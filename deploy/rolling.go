@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 )
@@ -109,6 +110,8 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				if err := e.Docker.RemoveContainer(ctx, existingID, true); err != nil {
 					log.Printf("deploy: error removing container %s: %v", name, err)
 				}
+				// Wait for Docker to fully release port bindings
+				time.Sleep(2 * time.Second)
 			} else {
 				e.reportProgress(spec.DeploymentID, "deploying",
 					fmt.Sprintf("[%d/%d] no existing container found for %s, creating new", i+1, len(spec.Containers), name),
@@ -145,7 +148,13 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 			}
 
+			// Try to create, with one retry after a delay (port release can be slow)
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+			if err != nil {
+				log.Printf("deploy: first create attempt failed for %s: %v — retrying in 3s", name, err)
+				time.Sleep(3 * time.Second)
+				containerID, err = e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+			}
 			if err != nil {
 				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
 				return fmt.Errorf("create container %s, rolled back %d containers: %w", name, len(updatedContainers), err)
