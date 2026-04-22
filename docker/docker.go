@@ -246,13 +246,27 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		Resources:     resources,
 	}
 
-	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, &network.NetworkingConfig{}, nil, spec.Name)
+	// Build networking config — attach to specified networks at creation time
+	// so the container uses Docker's internal DNS from the start.
+	// When custom networks are specified, we also set NetworkMode to the first
+	// network so Docker does NOT auto-attach the default bridge.
+	networkConfig := &network.NetworkingConfig{}
+	if len(spec.Networks) > 0 {
+		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
+		for _, netName := range spec.Networks {
+			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{}
+		}
+		hostConfig.NetworkMode = container.NetworkMode(spec.Networks[0])
+	}
+
+	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, networkConfig, nil, spec.Name)
 	if err != nil {
 		return "", fmt.Errorf("container create: %w", err)
 	}
 
-	// Connect to networks
-	for _, netName := range spec.Networks {
+	// If there are multiple networks, the first was set via NetworkMode;
+	// connect to the remaining ones explicitly.
+	for _, netName := range spec.Networks[1:] {
 		if err := c.cli.NetworkConnect(ctx, netName, resp.ID, nil); err != nil {
 			log.Printf("docker: failed to connect container %s to network %s: %v", spec.Name, netName, err)
 		}

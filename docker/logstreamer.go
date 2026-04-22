@@ -20,6 +20,37 @@ type LogLine struct {
 	RecordedAt    time.Time // Docker-recorded timestamp (nanosecond precision)
 }
 
+// CanonicalContainerName strips Lattice deploy suffixes (6-char alphanumeric,
+// "-retired-*", "-lattice-updating") so log lines are attributed to the
+// canonical container name that matches the DB entry. This prevents log gaps
+// when the logstreamer discovers a container before the rolling deploy renames it.
+func CanonicalContainerName(name string) string {
+	// Strip -retired-<timestamp> or -lattice-updating
+	if idx := strings.Index(name, "-retired-"); idx > 0 {
+		return name[:idx]
+	}
+	if strings.HasSuffix(name, "-lattice-updating") {
+		return strings.TrimSuffix(name, "-lattice-updating")
+	}
+	// Strip 6-char alphanumeric deploy suffix (e.g. "openbucket-zixn9i" -> "openbucket")
+	if dashIdx := strings.LastIndex(name, "-"); dashIdx > 0 {
+		suffix := name[dashIdx+1:]
+		if len(suffix) == 6 {
+			allValid := true
+			for _, c := range suffix {
+				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+					allValid = false
+					break
+				}
+			}
+			if allValid {
+				return name[:dashIdx]
+			}
+		}
+	}
+	return name
+}
+
 // LogCallback is called for each log line from a container.
 type LogCallback func(line LogLine)
 
@@ -78,7 +109,7 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 		if c.State == "running" {
 			name := ""
 			if len(c.Names) > 0 {
-				name = strings.TrimPrefix(c.Names[0], "/")
+				name = CanonicalContainerName(strings.TrimPrefix(c.Names[0], "/"))
 			}
 			running[c.ID] = name
 		}

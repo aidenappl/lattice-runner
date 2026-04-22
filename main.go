@@ -1579,7 +1579,7 @@ func main() {
 						for _, n := range c.Names {
 							trimmed := strings.TrimPrefix(n, "/")
 							if trimmed != "" {
-								name = trimmed
+								name = dockerclient.CanonicalContainerName(trimmed)
 								break
 							}
 						}
