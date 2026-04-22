@@ -1515,6 +1515,35 @@ func main() {
 	}, 10*time.Second)
 	safeGo(ws, "log-streamer", func() { logStreamer.Run(ctx) })
 
+	// Network health monitor — detects DNS failures, bridge-only containers,
+	// restart loops, and attempts auto-repair. Reports via lifecycle_log.
+	netMonitor := dockerclient.NewNetMonitor(docker, func(diag dockerclient.NetworkDiagnostic) {
+		msg := fmt.Sprintf("[network] %s: %s", diag.Issue, diag.Detail)
+		if diag.Repaired {
+			msg += fmt.Sprintf(" | auto-repaired: %s", diag.RepairDetail)
+		}
+		_ = ws.SendJSON(client.OutgoingMessage{
+			Type: "lifecycle_log",
+			Payload: map[string]any{
+				"container_name": diag.ContainerName,
+				"event":          "network_diagnostic",
+				"message":        msg,
+			},
+		})
+	}, 30*time.Second)
+	safeGo(ws, "net-monitor", func() {
+		netMonitor.Run(ctx, func(event dockerclient.RestartLoopEvent) {
+			_ = ws.SendJSON(client.OutgoingMessage{
+				Type: "lifecycle_log",
+				Payload: map[string]any{
+					"container_name": event.ContainerName,
+					"event":          "restart_loop",
+					"message":        event.Message,
+				},
+			})
+		})
+	})
+
 	// Heartbeat ticker — also pushes live container states each tick
 	safeGo(ws, "heartbeat", func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
@@ -1596,8 +1625,10 @@ func main() {
 							latticeStatus = "paused"
 						case "exited", "dead":
 							latticeStatus = "stopped"
-						case "created", "restarting":
+						case "created":
 							latticeStatus = "pending"
+						case "restarting":
+							latticeStatus = "restarting"
 						default:
 							latticeStatus = "error"
 						}

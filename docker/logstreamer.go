@@ -104,14 +104,20 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 		return
 	}
 
-	running := make(map[string]string) // id -> name
+	// Stream logs from running AND restarting containers so restart-loop
+	// output is captured. Containers in other states (exited, dead, created)
+	// are not streamable — Docker's follow mode requires the container to be
+	// alive. Their final logs are still reachable via the one-shot tail in
+	// doStream before the stream naturally ends.
+	streamable := make(map[string]string) // id -> name
 	for _, c := range containers {
-		if c.State == "running" {
+		switch c.State {
+		case "running", "restarting":
 			name := ""
 			if len(c.Names) > 0 {
 				name = CanonicalContainerName(strings.TrimPrefix(c.Names[0], "/"))
 			}
-			running[c.ID] = name
+			streamable[c.ID] = name
 		}
 	}
 
@@ -130,7 +136,7 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 	}
 
 	// Start streaming new (or recovered) containers
-	for id, name := range running {
+	for id, name := range streamable {
 		if _, ok := ls.tracked[id]; !ok {
 			streamCtx, cancel := context.WithCancel(ctx)
 			entry := &streamEntry{cancel: cancel, done: make(chan struct{})}
@@ -139,9 +145,9 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 		}
 	}
 
-	// Stop streaming removed/stopped containers
+	// Stop streaming removed containers (truly gone, not just restarting)
 	for id, entry := range ls.tracked {
-		if _, ok := running[id]; !ok {
+		if _, ok := streamable[id]; !ok {
 			entry.cancel()
 			delete(ls.tracked, id)
 		}

@@ -722,6 +722,52 @@ func (c *Client) ContainerStats(ctx context.Context) ([]ContainerResourceUsage, 
 	return stats, nil
 }
 
+// ConnectNetwork connects a container to a network.
+func (c *Client) ConnectNetwork(ctx context.Context, networkName, containerID string) error {
+	return c.cli.NetworkConnect(ctx, networkName, containerID, nil)
+}
+
+// DisconnectNetwork disconnects a container from a network.
+func (c *Client) DisconnectNetwork(ctx context.Context, networkName, containerID string, force bool) error {
+	return c.cli.NetworkDisconnect(ctx, networkName, containerID, force)
+}
+
+// ContainerNetworks returns the list of network names a container is attached to.
+func (c *Client) ContainerNetworks(ctx context.Context, containerID string) ([]string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return nil, err
+	}
+	var networks []string
+	if info.NetworkSettings != nil {
+		for name := range info.NetworkSettings.Networks {
+			networks = append(networks, name)
+		}
+	}
+	return networks, nil
+}
+
+// ExecInContainer runs a command inside a running container and returns combined output.
+func (c *Client) ExecInContainer(ctx context.Context, containerID string, cmd []string) (string, error) {
+	exec, err := c.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+		Cmd:          cmd,
+		AttachStdout: true,
+		AttachStderr: true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("exec create: %w", err)
+	}
+
+	resp, err := c.cli.ContainerExecAttach(ctx, exec.ID, container.ExecStartOptions{})
+	if err != nil {
+		return "", fmt.Errorf("exec attach: %w", err)
+	}
+	defer resp.Close()
+
+	out, _ := io.ReadAll(resp.Reader)
+	return string(out), nil
+}
+
 func (c *Client) Close() error {
 	return c.cli.Close()
 }
