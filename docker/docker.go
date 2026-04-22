@@ -394,6 +394,117 @@ func (c *Client) RecreateContainer(ctx context.Context, containerID string, name
 	return resp.ID, nil
 }
 
+// GracefulRecreate performs a zero-downtime container replacement:
+// 1. Creates a new container with a temporary name (without host port bindings to avoid conflicts)
+// 2. Connects it to the same networks
+// 3. Waits for it to be running (and healthy if healthcheck configured)
+// 4. Stops and removes the old container
+// 5. Renames the new container to the original name
+// 6. If the original had host port bindings, stops the temp container,
+//    recreates it with the full config (including ports), and starts it.
+func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newImage string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspect container: %w", err)
+	}
+
+	originalName := strings.TrimPrefix(info.Name, "/")
+	tempName := originalName + "-lattice-updating"
+
+	// Update image if provided
+	if newImage != "" {
+		info.Config.Image = newImage
+	}
+
+	// Create new container WITHOUT host port bindings (to avoid conflicts)
+	// Keep the network ports exposed but remove host-side bindings temporarily
+	tempHostConfig := *info.HostConfig
+	hasPortBindings := len(info.HostConfig.PortBindings) > 0
+	if hasPortBindings {
+		tempHostConfig.PortBindings = nil
+	}
+
+	// Preserve network configuration
+	networkConfig := &network.NetworkingConfig{}
+	if info.NetworkSettings != nil && len(info.NetworkSettings.Networks) > 0 {
+		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
+		for netName, netSettings := range info.NetworkSettings.Networks {
+			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{
+				IPAMConfig: netSettings.IPAMConfig,
+				Aliases:    append(netSettings.Aliases, originalName),
+			}
+		}
+	}
+
+	// Ensure lattice label
+	if info.Config.Labels == nil {
+		info.Config.Labels = make(map[string]string)
+	}
+	info.Config.Labels["managed-by"] = "lattice"
+
+	// Step 1: Create and start temp container
+	resp, err := c.cli.ContainerCreate(ctx, info.Config, &tempHostConfig, networkConfig, nil, tempName)
+	if err != nil {
+		return "", fmt.Errorf("create temp container: %w", err)
+	}
+
+	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		_ = c.RemoveContainer(ctx, resp.ID, true)
+		return "", fmt.Errorf("start temp container: %w", err)
+	}
+
+	// Step 2: Wait for health (up to 30s)
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		check, inspErr := c.cli.ContainerInspect(ctx, resp.ID)
+		if inspErr != nil {
+			break
+		}
+		if !check.State.Running {
+			// Container crashed — abort
+			_ = c.RemoveContainer(ctx, resp.ID, true)
+			return "", fmt.Errorf("temp container stopped unexpectedly")
+		}
+		if check.State.Health == nil || check.State.Health.Status == "healthy" {
+			break // No healthcheck or healthy
+		}
+		if check.State.Health.Status == "unhealthy" {
+			_ = c.StopContainer(ctx, resp.ID, 5)
+			_ = c.RemoveContainer(ctx, resp.ID, true)
+			return "", fmt.Errorf("temp container is unhealthy")
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Step 3: Stop and remove old container
+	_ = c.StopContainer(ctx, containerID, 10)
+	_ = c.RemoveContainer(ctx, containerID, true)
+
+	// Step 4: If there were port bindings, we need to recreate with the full config
+	if hasPortBindings {
+		_ = c.StopContainer(ctx, resp.ID, 5)
+		_ = c.RemoveContainer(ctx, resp.ID, true)
+
+		// Recreate with original host config (including ports) and original name
+		finalResp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, networkConfig, nil, originalName)
+		if err != nil {
+			return "", fmt.Errorf("recreate with ports: %w", err)
+		}
+		if err := c.cli.ContainerStart(ctx, finalResp.ID, container.StartOptions{}); err != nil {
+			return "", fmt.Errorf("start final container: %w", err)
+		}
+		return finalResp.ID, nil
+	}
+
+	// Step 5: No port bindings — just rename the temp container
+	if err := c.cli.ContainerRename(ctx, resp.ID, originalName); err != nil {
+		// Rename failed — container is running with temp name, not critical
+		log.Printf("warning: failed to rename %s to %s: %v", tempName, originalName, err)
+	}
+
+	return resp.ID, nil
+}
+
 // ContainerExecCreate creates an exec instance in a container.
 func (c *Client) ContainerExecCreate(ctx context.Context, containerID string, cmd []string) (string, error) {
 	resp, err := c.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{

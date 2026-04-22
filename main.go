@@ -804,8 +804,17 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("recreating container (old id=%s)… stopping, removing, and creating new container", id[:12]))
-				newID, err := docker.RecreateContainer(ctx, id, containerName)
+				// Build the full image reference for graceful recreate
+				newImageRef := ""
+				if imageRef != "" {
+					newImageRef = imageRef
+					if tag != "" {
+						newImageRef = imageRef + ":" + tag
+					}
+				}
+
+				sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("graceful recreate (old id=%s)… starting new container, health checking, then swapping", id[:12]))
+				newID, err := docker.GracefulRecreate(ctx, id, newImageRef)
 				if err != nil {
 					log.Printf("failed to recreate %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("failed to recreate: %v", err))
