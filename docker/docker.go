@@ -457,10 +457,14 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 	if info.NetworkSettings != nil && len(info.NetworkSettings.Networks) > 0 {
 		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
 		for netName, netSettings := range info.NetworkSettings.Networks {
-			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{
+			endpoint := &network.EndpointSettings{
 				IPAMConfig: netSettings.IPAMConfig,
-				Aliases:    append(netSettings.Aliases, originalName),
 			}
+			// Aliases are only supported on user-defined networks, not bridge/host/none
+			if netName != "bridge" && netName != "host" && netName != "none" {
+				endpoint.Aliases = append(netSettings.Aliases, originalName)
+			}
+			networkConfig.EndpointsConfig[netName] = endpoint
 		}
 	}
 
@@ -504,9 +508,21 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		time.Sleep(2 * time.Second)
 	}
 
-	// Step 3: Stop and remove old container
-	_ = c.StopContainer(ctx, containerID, 10)
-	_ = c.RemoveContainer(ctx, containerID, true)
+	// Step 3: Rename old container to free the name, then stop and remove
+	retiredName := originalName + "-retired-" + fmt.Sprintf("%d", time.Now().Unix())
+	if renameErr := c.cli.ContainerRename(ctx, containerID, retiredName); renameErr != nil {
+		log.Printf("graceful-recreate: rename failed for %s: %v — falling back to stop+remove", originalName, renameErr)
+		_ = c.StopContainer(ctx, containerID, 10)
+		_ = c.RemoveContainer(ctx, containerID, true)
+		// Wait briefly for name release
+		time.Sleep(2 * time.Second)
+	} else {
+		// Renamed — clean up in background
+		go func() {
+			_ = c.StopContainer(context.Background(), containerID, 10)
+			_ = c.RemoveContainer(context.Background(), containerID, true)
+		}()
+	}
 
 	// Step 4: If there were port bindings, we need to recreate with the full config
 	if hasPortBindings {

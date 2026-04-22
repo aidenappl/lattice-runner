@@ -128,16 +128,39 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 					fmt.Sprintf("[%d/%d] retiring old container: %s", i+1, len(spec.Containers), name),
 					map[string]any{"container_name": name, "step": "retiring"})
 
-				// Rename the old container so the name is immediately free
+				nameFreed := false
+
+				// Step 1: Try rename to free the name immediately
 				if renameErr := e.Docker.RenameContainer(ctx, existingID, retiredName); renameErr != nil {
-					log.Printf("deploy: rename failed for %s: %v — force removing by ID instead", name, renameErr)
-					// Fallback: force remove by ID with retries
+					log.Printf("deploy: rename failed for %s: %v — falling back to stop+remove", name, renameErr)
+					e.reportProgress(spec.DeploymentID, "deploying",
+						fmt.Sprintf("[%d/%d] rename failed for %s, stopping and removing instead", i+1, len(spec.Containers), name), nil)
+
+					// Step 2: Stop first, then remove
+					_ = e.Docker.StopContainer(ctx, existingID, 10)
 					for attempt := 0; attempt < 3; attempt++ {
 						if rmErr := e.Docker.RemoveContainer(ctx, existingID, true); rmErr == nil {
+							nameFreed = true
 							break
 						} else {
 							log.Printf("deploy: force remove attempt %d for %s failed: %v", attempt+1, name, rmErr)
-							time.Sleep(1 * time.Second)
+							time.Sleep(2 * time.Second)
+						}
+					}
+				} else {
+					nameFreed = true
+				}
+
+				// Step 3: Verify the name is actually free before creating
+				if !nameFreed {
+					if checkID, _ := e.Docker.FindContainerByName(ctx, name); checkID != "" {
+						// Last resort: try one more stop+remove
+						_ = e.Docker.StopContainer(ctx, checkID, 10)
+						_ = e.Docker.RemoveContainer(ctx, checkID, true)
+						time.Sleep(2 * time.Second)
+						if finalCheck, _ := e.Docker.FindContainerByName(ctx, name); finalCheck != "" {
+							e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+							return fmt.Errorf("cannot free container name %s: name still in use after rename+remove attempts", name)
 						}
 					}
 				}
