@@ -101,10 +101,19 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				log.Printf("deploy: error finding container %s: %v", name, err)
 			}
 			if existingID != "" {
-				// Rename the old container first so the name is immediately free
+				// Clean up any leftover retired container from a previous deploy
 				retiredName := name + "-lattice-retired"
+				if retiredID, _ := e.Docker.FindContainerByName(ctx, retiredName); retiredID != "" {
+					_ = e.Docker.StopContainer(ctx, retiredID, 5)
+					_ = e.Docker.RemoveContainer(ctx, retiredID, true)
+				}
+
+				// Rename the old container so the name is immediately free
 				if renameErr := e.Docker.RenameContainer(ctx, existingID, retiredName); renameErr != nil {
-					log.Printf("deploy: rename failed for %s: %v — will try force remove", name, renameErr)
+					log.Printf("deploy: rename failed for %s: %v — force removing instead", name, renameErr)
+					// Fallback: force remove by name directly
+					_ = e.Docker.RemoveContainer(ctx, existingID, true)
+					time.Sleep(2 * time.Second)
 				}
 
 				e.reportProgress(spec.DeploymentID, "deploying",
