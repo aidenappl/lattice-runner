@@ -488,6 +488,10 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		return "", fmt.Errorf("inspect container: %w", err)
 	}
 
+	if info.Config == nil || info.HostConfig == nil {
+		return "", fmt.Errorf("inspect returned incomplete container config")
+	}
+
 	originalName := strings.TrimPrefix(info.Name, "/")
 	tempName := originalName + "-lattice-updating"
 
