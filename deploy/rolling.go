@@ -148,6 +148,14 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
 			}
 
+			// Ensure no leftover container with the same name exists
+			if leftover, findErr := e.Docker.FindContainerByName(ctx, name); findErr == nil && leftover != "" {
+				log.Printf("deploy: found leftover container %s (id=%s), force removing", name, leftover)
+				_ = e.Docker.StopContainer(ctx, leftover, 5)
+				_ = e.Docker.RemoveContainer(ctx, leftover, true)
+				time.Sleep(2 * time.Second)
+			}
+
 			// Try to create, with one retry after a delay (port release can be slow)
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			if err != nil {
