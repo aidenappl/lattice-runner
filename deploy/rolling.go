@@ -101,6 +101,12 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				log.Printf("deploy: error finding container %s: %v", name, err)
 			}
 			if existingID != "" {
+				// Rename the old container first so the name is immediately free
+				retiredName := name + "-lattice-retired"
+				if renameErr := e.Docker.RenameContainer(ctx, existingID, retiredName); renameErr != nil {
+					log.Printf("deploy: rename failed for %s: %v — will try force remove", name, renameErr)
+				}
+
 				e.reportProgress(spec.DeploymentID, "deploying",
 					fmt.Sprintf("[%d/%d] stopping old container: %s", i+1, len(spec.Containers), name),
 					map[string]any{"container_name": name, "step": "stopping"})
@@ -110,8 +116,6 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				if err := e.Docker.RemoveContainer(ctx, existingID, true); err != nil {
 					log.Printf("deploy: error removing container %s: %v", name, err)
 				}
-				// Wait for Docker to fully release port bindings
-				time.Sleep(2 * time.Second)
 			} else {
 				e.reportProgress(spec.DeploymentID, "deploying",
 					fmt.Sprintf("[%d/%d] no existing container found for %s, creating new", i+1, len(spec.Containers), name),
@@ -146,14 +150,6 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				Entrypoint:    cSpec.Entrypoint,
 				Networks:      cSpec.Networks,
 				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
-			}
-
-			// Ensure no leftover container with the same name exists
-			if leftover, findErr := e.Docker.FindContainerByName(ctx, name); findErr == nil && leftover != "" {
-				log.Printf("deploy: found leftover container %s (id=%s), force removing", name, leftover)
-				_ = e.Docker.StopContainer(ctx, leftover, 5)
-				_ = e.Docker.RemoveContainer(ctx, leftover, true)
-				time.Sleep(2 * time.Second)
 			}
 
 			// Try to create, with one retry after a delay (port release can be slow)

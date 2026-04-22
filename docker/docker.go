@@ -248,6 +248,10 @@ func (c *Client) RemoveContainer(ctx context.Context, containerID string, force 
 	return c.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: force})
 }
 
+func (c *Client) RenameContainer(ctx context.Context, containerID, newName string) error {
+	return c.cli.ContainerRename(ctx, containerID, newName)
+}
+
 func (c *Client) RestartContainer(ctx context.Context, containerID string, timeout int) error {
 	t := timeout
 	return c.cli.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: &t})
