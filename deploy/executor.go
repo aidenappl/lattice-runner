@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 )
@@ -222,6 +223,13 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		return err
 	}
 
+	// Post-deploy verification: check containers at intervals to ensure they
+	// stabilize and don't immediately crash-loop.
+	if verifyErr := e.postDeployVerify(ctx, spec); verifyErr != nil {
+		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("post-deploy verification failed: %v", verifyErr), nil)
+		return verifyErr
+	}
+
 	e.reportProgress(spec.DeploymentID, "deployed", fmt.Sprintf("deployment completed successfully via %s strategy", strategyName), nil)
 	return nil
 }
@@ -308,6 +316,115 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 			}
 		}
 	}
+}
+
+// postDeployVerify checks that all deployed containers remain healthy over
+// a verification window. Runs 3 checks at 10-second intervals (30s total).
+// Detects containers that stopped, entered a restart loop, or failed health
+// checks shortly after deployment — the most common failure pattern.
+func (e *Executor) postDeployVerify(ctx context.Context, spec DeploymentSpec) error {
+	const (
+		verifyChecks   = 3
+		verifyInterval = 10 * time.Second
+	)
+
+	// Build expected container names (accounting for replicas)
+	expected := make(map[string]bool)
+	for _, c := range spec.Containers {
+		replicas := c.Replicas
+		if replicas <= 0 {
+			replicas = 1
+		}
+		if replicas == 1 {
+			expected[c.Name] = true
+		} else {
+			for r := 1; r <= replicas; r++ {
+				expected[fmt.Sprintf("%s-%d", c.Name, r)] = true
+			}
+		}
+	}
+
+	e.reportProgress(spec.DeploymentID, "deploying",
+		fmt.Sprintf("verifying deployment health (%d checks over %s)", verifyChecks, time.Duration(verifyChecks)*verifyInterval),
+		map[string]any{"step": "verify"})
+
+	for check := 1; check <= verifyChecks; check++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(verifyInterval):
+		}
+
+		containers, err := e.Docker.ListContainers(ctx, "")
+		if err != nil {
+			log.Printf("deploy: verify: failed to list containers: %v", err)
+			continue
+		}
+
+		// Build a map of running containers by canonical name
+		running := make(map[string]string) // canonical name -> state
+		for _, c := range containers {
+			name := ""
+			if len(c.Names) > 0 {
+				name = strings.TrimPrefix(c.Names[0], "/")
+			}
+			canonical := dockerclient.CanonicalContainerName(name)
+			running[canonical] = c.State
+		}
+
+		var issues []string
+
+		for name := range expected {
+			state, found := running[name]
+			if !found {
+				issues = append(issues, fmt.Sprintf("%s: not found (removed or crashed)", name))
+				continue
+			}
+			switch state {
+			case "running":
+				// Good — also check for restart loops via inspect
+				id := ""
+				for _, c := range containers {
+					for _, n := range c.Names {
+						cn := dockerclient.CanonicalContainerName(strings.TrimPrefix(n, "/"))
+						if cn == name {
+							id = c.ID
+						}
+					}
+				}
+				if id != "" {
+					if info, err := e.Docker.InspectContainer(ctx, id); err == nil {
+						if info.RestartCount > 0 {
+							issues = append(issues, fmt.Sprintf("%s: restarted %d times since deploy", name, info.RestartCount))
+						}
+						if info.State != nil && info.State.Health != nil && info.State.Health.Status == "unhealthy" {
+							issues = append(issues, fmt.Sprintf("%s: health check reports unhealthy", name))
+						}
+					}
+				}
+			case "restarting":
+				issues = append(issues, fmt.Sprintf("%s: stuck in restarting state", name))
+			case "exited", "dead":
+				issues = append(issues, fmt.Sprintf("%s: exited (state=%s)", name, state))
+			}
+		}
+
+		if len(issues) > 0 {
+			msg := fmt.Sprintf("verify check %d/%d: %s", check, verifyChecks, strings.Join(issues, "; "))
+			e.reportProgress(spec.DeploymentID, "deploying", msg, map[string]any{"step": "verify"})
+
+			// On the final check, if there are still issues, fail the deployment
+			if check == verifyChecks {
+				return fmt.Errorf("containers unhealthy after %d checks: %s", verifyChecks, strings.Join(issues, "; "))
+			}
+		} else {
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("verify check %d/%d: all containers healthy", check, verifyChecks),
+				map[string]any{"step": "verify"})
+		}
+	}
+
+	return nil
 }
 
 func (e *Executor) reportProgress(deploymentID int, status, message string, extra map[string]any) {
