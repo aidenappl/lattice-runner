@@ -71,6 +71,7 @@ type ContainerSpec struct {
 	Entrypoint    []string
 	Networks       []string
 	NetworkAliases []string
+	StackName      string // used for lattice-stack label
 	HealthCheck    *HealthCheck
 }
 
@@ -205,11 +206,16 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		resources.Memory = spec.MemoryLimit
 	}
 
+	labels := map[string]string{"managed-by": "lattice"}
+	if spec.StackName != "" {
+		labels["lattice-stack"] = spec.StackName
+	}
+
 	containerConfig := &container.Config{
 		Image:        imageRef,
 		Env:          env,
 		ExposedPorts: exposedPorts,
-		Labels:       map[string]string{"managed-by": "lattice"},
+		Labels:       labels,
 	}
 	if len(spec.Command) > 0 {
 		containerConfig.Cmd = spec.Command

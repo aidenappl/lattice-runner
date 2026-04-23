@@ -62,6 +62,7 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 		Entrypoint:     canarySpec.Entrypoint,
 		Networks:       canarySpec.Networks,
 		NetworkAliases: canarySpec.NetworkAliases,
+		StackName:      spec.StackName,
 		HealthCheck:    convertHealthCheck(canarySpec.HealthCheck),
 	}
 

@@ -56,7 +56,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			// In a real blue-green, you'd use a reverse proxy switch
 			// For simplicity, we create green, verify health, then swap names
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:          greenName,
+				Name:           greenName,
 				Image:          cSpec.Image,
 				Tag:            cSpec.Tag,
 				PortMappings:   nil, // Don't bind ports yet
@@ -69,6 +69,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				Entrypoint:     cSpec.Entrypoint,
 				Networks:       cSpec.Networks,
 				NetworkAliases: cSpec.NetworkAliases,
+				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
@@ -186,6 +187,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				Entrypoint:     cSpec.Entrypoint,
 				Networks:       cSpec.Networks,
 				NetworkAliases: cSpec.NetworkAliases,
+				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 

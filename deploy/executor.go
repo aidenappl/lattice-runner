@@ -198,6 +198,11 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		}
 	}
 
+	// Clean up stale containers from this stack that are no longer in the spec
+	// (e.g. renamed or removed from compose). This prevents port conflicts and
+	// orphaned containers when compose services are renamed.
+	e.cleanupStaleContainers(ctx, spec)
+
 	var err error
 	strategyName := spec.Strategy
 	switch spec.Strategy {
@@ -219,6 +224,90 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 
 	e.reportProgress(spec.DeploymentID, "deployed", fmt.Sprintf("deployment completed successfully via %s strategy", strategyName), nil)
 	return nil
+}
+
+// cleanupStaleContainers finds containers that belong to this stack (via the
+// lattice-stack label) but are NOT in the new deployment spec. These are
+// containers that were renamed or removed from the compose file. They must be
+// stopped before deploying to free ports and avoid orphans.
+//
+// For containers without the lattice-stack label (created before labels were
+// added), falls back to a port-conflict check: if a lattice-managed container
+// holds a host port needed by the new spec and isn't in the spec by name,
+// it is stopped.
+func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSpec) {
+	// Build set of canonical names in the new spec
+	specNames := make(map[string]bool)
+	for _, c := range spec.Containers {
+		specNames[c.Name] = true
+	}
+
+	// Build set of host ports needed by the new spec
+	neededPorts := make(map[string]bool)
+	for _, c := range spec.Containers {
+		for _, pm := range c.PortMappings {
+			if pm.HostPort != "" {
+				neededPorts[pm.HostPort] = true
+			}
+		}
+	}
+
+	containers, err := e.Docker.ListContainers(ctx, "")
+	if err != nil {
+		log.Printf("deploy: cleanup: failed to list containers: %v", err)
+		return
+	}
+
+	for _, c := range containers {
+		if c.Labels["managed-by"] != "lattice" {
+			continue
+		}
+
+		name := ""
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+		if name == "" {
+			continue
+		}
+
+		canonical := dockerclient.CanonicalContainerName(name)
+
+		// Skip containers that are part of the new spec
+		if specNames[canonical] || specNames[name] {
+			continue
+		}
+
+		shouldRemove := false
+		reason := ""
+
+		// Check 1: container has the lattice-stack label matching this stack
+		if c.Labels["lattice-stack"] == spec.StackName {
+			shouldRemove = true
+			reason = fmt.Sprintf("stale stack container (was in stack %q, not in new spec)", spec.StackName)
+		}
+
+		// Check 2: container holds a port we need (fallback for unlabeled containers)
+		if !shouldRemove && len(neededPorts) > 0 {
+			for _, p := range c.Ports {
+				if p.PublicPort > 0 && neededPorts[fmt.Sprintf("%d", p.PublicPort)] {
+					shouldRemove = true
+					reason = fmt.Sprintf("holds port %d needed by new spec", p.PublicPort)
+					break
+				}
+			}
+		}
+
+		if shouldRemove {
+			log.Printf("deploy: cleanup: removing %s (%s)", name, reason)
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("removing stale container %s (%s)", name, reason),
+				map[string]any{"step": "cleanup"})
+			if err := e.Docker.StopAndRemoveContainer(ctx, c.ID, 10); err != nil {
+				log.Printf("deploy: cleanup: failed to remove %s: %v", name, err)
+			}
+		}
+	}
 }
 
 func (e *Executor) reportProgress(deploymentID int, status, message string, extra map[string]any) {
