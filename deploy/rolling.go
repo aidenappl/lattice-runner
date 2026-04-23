@@ -141,19 +141,20 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 
 			// Create and start new container with unique name
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:          deployName,
-				Image:         cSpec.Image,
-				Tag:           cSpec.Tag,
-				PortMappings:  portMappings,
-				EnvVars:       cSpec.EnvVars,
-				Volumes:       cSpec.Volumes,
-				CPULimit:      cSpec.CPULimit,
-				MemoryLimit:   cSpec.MemoryLimit,
-				RestartPolicy: cSpec.RestartPolicy,
-				Command:       cSpec.Command,
-				Entrypoint:    cSpec.Entrypoint,
-				Networks:      cSpec.Networks,
-				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
+				Name:           deployName,
+				Image:          cSpec.Image,
+				Tag:            cSpec.Tag,
+				PortMappings:   portMappings,
+				EnvVars:        cSpec.EnvVars,
+				Volumes:        cSpec.Volumes,
+				CPULimit:       cSpec.CPULimit,
+				MemoryLimit:    cSpec.MemoryLimit,
+				RestartPolicy:  cSpec.RestartPolicy,
+				Command:        cSpec.Command,
+				Entrypoint:     cSpec.Entrypoint,
+				Networks:       cSpec.Networks,
+				NetworkAliases: cSpec.NetworkAliases,
+				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
@@ -308,19 +309,20 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 		rollbackName := snap.Name + "-" + rollbackSuffix
 
 		dockerSpec := dockerclient.ContainerSpec{
-			Name:          rollbackName,
-			Image:         snap.OldImage,
-			Tag:           "", // OldImage already contains tag
-			PortMappings:  portMappings,
-			EnvVars:       cSpec.EnvVars,
-			Volumes:       cSpec.Volumes,
-			CPULimit:      cSpec.CPULimit,
-			MemoryLimit:   cSpec.MemoryLimit,
-			RestartPolicy: cSpec.RestartPolicy,
-			Command:       cSpec.Command,
-			Entrypoint:    cSpec.Entrypoint,
-			Networks:      cSpec.Networks,
-			HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
+			Name:           rollbackName,
+			Image:          snap.OldImage,
+			Tag:            "", // OldImage already contains tag
+			PortMappings:   portMappings,
+			EnvVars:        cSpec.EnvVars,
+			Volumes:        cSpec.Volumes,
+			CPULimit:       cSpec.CPULimit,
+			MemoryLimit:    cSpec.MemoryLimit,
+			RestartPolicy:  cSpec.RestartPolicy,
+			Command:        cSpec.Command,
+			Entrypoint:     cSpec.Entrypoint,
+			Networks:       cSpec.Networks,
+			NetworkAliases: cSpec.NetworkAliases,
+			HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 		}
 		containerID, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 		if createErr != nil {

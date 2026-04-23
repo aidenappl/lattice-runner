@@ -50,18 +50,19 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 
 	// Start canary (no port bindings — runs alongside existing)
 	dockerSpec := dockerclient.ContainerSpec{
-		Name:          canaryName,
-		Image:         canarySpec.Image,
-		Tag:           canarySpec.Tag,
-		EnvVars:       canarySpec.EnvVars,
-		Volumes:       canarySpec.Volumes,
-		CPULimit:      canarySpec.CPULimit,
-		MemoryLimit:   canarySpec.MemoryLimit,
-		RestartPolicy: "no",
-		Command:       canarySpec.Command,
-		Entrypoint:    canarySpec.Entrypoint,
-		Networks:      canarySpec.Networks,
-		HealthCheck:   convertHealthCheck(canarySpec.HealthCheck),
+		Name:           canaryName,
+		Image:          canarySpec.Image,
+		Tag:            canarySpec.Tag,
+		EnvVars:        canarySpec.EnvVars,
+		Volumes:        canarySpec.Volumes,
+		CPULimit:       canarySpec.CPULimit,
+		MemoryLimit:    canarySpec.MemoryLimit,
+		RestartPolicy:  "no",
+		Command:        canarySpec.Command,
+		Entrypoint:     canarySpec.Entrypoint,
+		Networks:       canarySpec.Networks,
+		NetworkAliases: canarySpec.NetworkAliases,
+		HealthCheck:    convertHealthCheck(canarySpec.HealthCheck),
 	}
 
 	canaryID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)

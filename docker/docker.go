@@ -69,8 +69,9 @@ type ContainerSpec struct {
 	RestartPolicy string
 	Command       []string
 	Entrypoint    []string
-	Networks      []string
-	HealthCheck   *HealthCheck
+	Networks       []string
+	NetworkAliases []string
+	HealthCheck    *HealthCheck
 }
 
 type PortMapping struct {
@@ -250,11 +251,18 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 	// so the container uses Docker's internal DNS from the start.
 	// When custom networks are specified, we also set NetworkMode to the first
 	// network so Docker does NOT auto-attach the default bridge.
+	// Network aliases (e.g. compose service names) are applied to every
+	// user-defined network so other containers can resolve them by service name.
 	networkConfig := &network.NetworkingConfig{}
 	if len(spec.Networks) > 0 {
 		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
 		for _, netName := range spec.Networks {
-			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{}
+			endpoint := &network.EndpointSettings{}
+			// Apply network aliases to user-defined networks (not bridge/host/none)
+			if len(spec.NetworkAliases) > 0 && netName != "bridge" && netName != "host" && netName != "none" {
+				endpoint.Aliases = spec.NetworkAliases
+			}
+			networkConfig.EndpointsConfig[netName] = endpoint
 		}
 		hostConfig.NetworkMode = container.NetworkMode(spec.Networks[0])
 	}
@@ -265,10 +273,14 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 	}
 
 	// If there are multiple networks, the first was set via NetworkMode;
-	// connect to the remaining ones explicitly.
+	// connect to the remaining ones explicitly, with aliases on user-defined networks.
 	if len(spec.Networks) > 1 {
 		for _, netName := range spec.Networks[1:] {
-			if err := c.cli.NetworkConnect(ctx, netName, resp.ID, nil); err != nil {
+			var endpointConfig *network.EndpointSettings
+			if len(spec.NetworkAliases) > 0 && netName != "bridge" && netName != "host" && netName != "none" {
+				endpointConfig = &network.EndpointSettings{Aliases: spec.NetworkAliases}
+			}
+			if err := c.cli.NetworkConnect(ctx, netName, resp.ID, endpointConfig); err != nil {
 				log.Printf("docker: failed to connect container %s to network %s: %v", spec.Name, netName, err)
 			}
 		}

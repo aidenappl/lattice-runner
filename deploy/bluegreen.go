@@ -57,18 +57,19 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			// For simplicity, we create green, verify health, then swap names
 			dockerSpec := dockerclient.ContainerSpec{
 				Name:          greenName,
-				Image:         cSpec.Image,
-				Tag:           cSpec.Tag,
-				PortMappings:  nil, // Don't bind ports yet
-				EnvVars:       cSpec.EnvVars,
-				Volumes:       cSpec.Volumes,
-				CPULimit:      cSpec.CPULimit,
-				MemoryLimit:   cSpec.MemoryLimit,
-				RestartPolicy: cSpec.RestartPolicy,
-				Command:       cSpec.Command,
-				Entrypoint:    cSpec.Entrypoint,
-				Networks:      cSpec.Networks,
-				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
+				Image:          cSpec.Image,
+				Tag:            cSpec.Tag,
+				PortMappings:   nil, // Don't bind ports yet
+				EnvVars:        cSpec.EnvVars,
+				Volumes:        cSpec.Volumes,
+				CPULimit:       cSpec.CPULimit,
+				MemoryLimit:    cSpec.MemoryLimit,
+				RestartPolicy:  cSpec.RestartPolicy,
+				Command:        cSpec.Command,
+				Entrypoint:     cSpec.Entrypoint,
+				Networks:       cSpec.Networks,
+				NetworkAliases: cSpec.NetworkAliases,
+				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
@@ -172,19 +173,20 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			}
 
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:          blueName,
-				Image:         cSpec.Image,
-				Tag:           cSpec.Tag,
-				PortMappings:  portMappings,
-				EnvVars:       cSpec.EnvVars,
-				Volumes:       cSpec.Volumes,
-				CPULimit:      cSpec.CPULimit,
-				MemoryLimit:   cSpec.MemoryLimit,
-				RestartPolicy: cSpec.RestartPolicy,
-				Command:       cSpec.Command,
-				Entrypoint:    cSpec.Entrypoint,
-				Networks:      cSpec.Networks,
-				HealthCheck:   convertHealthCheck(cSpec.HealthCheck),
+				Name:           blueName,
+				Image:          cSpec.Image,
+				Tag:            cSpec.Tag,
+				PortMappings:   portMappings,
+				EnvVars:        cSpec.EnvVars,
+				Volumes:        cSpec.Volumes,
+				CPULimit:       cSpec.CPULimit,
+				MemoryLimit:    cSpec.MemoryLimit,
+				RestartPolicy:  cSpec.RestartPolicy,
+				Command:        cSpec.Command,
+				Entrypoint:     cSpec.Entrypoint,
+				Networks:       cSpec.Networks,
+				NetworkAliases: cSpec.NetworkAliases,
+				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
 			_, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)

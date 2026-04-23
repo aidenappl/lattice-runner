@@ -80,7 +80,8 @@ type ContainerSpec struct {
 	RestartPolicy string            `json:"restart_policy"`
 	Command       []string          `json:"command"`
 	Entrypoint    []string          `json:"entrypoint"`
-	Networks      []string          `json:"networks"`
+	Networks       []string          `json:"networks"`
+	NetworkAliases []string         `json:"network_aliases,omitempty"`
 	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
 	RegistryAuth  *RegistryAuth     `json:"registry_auth,omitempty"`
 	DependsOn     []string          `json:"depends_on,omitempty"`
