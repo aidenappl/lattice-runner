@@ -1090,12 +1090,21 @@ func main() {
 				out, err := exec.CommandContext(ctx, "bash", tmpFile).CombinedOutput()
 				if err != nil {
 					log.Printf("upgrade failed: %v — %s", err, string(out))
+					// Include truncated script output so the dashboard shows the real error
+					scriptOutput := string(out)
+					if len(scriptOutput) > 1000 {
+						scriptOutput = scriptOutput[len(scriptOutput)-1000:]
+					}
+					failMsg := fmt.Sprintf("upgrade failed: %v", err)
+					if scriptOutput != "" {
+						failMsg = fmt.Sprintf("upgrade failed: %v\n%s", err, scriptOutput)
+					}
 					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
 							"status":  "failed",
-							"message": fmt.Sprintf("upgrade failed: %v", err),
+							"message": failMsg,
 						},
 					})
 				} else {
