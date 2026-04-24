@@ -33,7 +33,7 @@ if [ ! -f "$INSTALL_DIR/lattice-runner" ]; then
 fi
 
 # Ensure common paths are available (curl|bash does not source profile.d)
-for p in /usr/local/go/bin /usr/lib/go/bin /snap/bin "$HOME/go/bin"; do
+for p in /usr/local/go/bin /usr/lib/go/bin /snap/bin "${HOME:-/root}/go/bin"; do
     [ -d "$p" ] && export PATH="$p:$PATH"
 done
 
