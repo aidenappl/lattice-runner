@@ -36,6 +36,13 @@ var Version = "dev"
 // handlerSem limits the number of concurrent message handler goroutines.
 var handlerSem = make(chan struct{}, 50)
 
+// lastRebootTime and lastRebootMu enforce a cooldown between reboot commands
+// to prevent repeated reboots from keeping the server permanently offline.
+var (
+	lastRebootTime time.Time
+	lastRebootMu   sync.Mutex
+)
+
 // wsSend sends a JSON message over the WebSocket and logs any failure.
 func wsSend(ws *client.WSClient, msgType string, payload interface{}) {
 	if err := ws.SendJSON(payload); err != nil {
@@ -954,6 +961,24 @@ func main() {
 
 		case "reboot_os":
 			go func() {
+				// Rate-limit reboots: reject if last reboot was within 5 minutes
+				lastRebootMu.Lock()
+				if time.Since(lastRebootTime) < 5*time.Minute {
+					lastRebootMu.Unlock()
+					log.Println("reboot rejected: cooldown period (5 minutes between reboots)")
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "reboot_os",
+							"status":  "failed",
+							"message": "reboot rejected: minimum 5 minutes between reboot commands",
+						},
+					})
+					return
+				}
+				lastRebootTime = time.Now()
+				lastRebootMu.Unlock()
+
 				log.Println("reboot command received, rebooting system...")
 				wsSend(ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
@@ -982,6 +1007,9 @@ func main() {
 					},
 				})
 
+				// Extract expected hash from the orchestrator payload for integrity verification
+				expectedHash, _ := env.Payload["expected_hash"].(string)
+
 				// Derive upgrade URL from the orchestrator connection URL
 				upgradeBase := cfg.OrchestratorURL
 				upgradeBase = strings.Replace(upgradeBase, "ws://", "http://", 1)
@@ -990,8 +1018,24 @@ func main() {
 				upgradeBase = strings.TrimSuffix(upgradeBase, "/ws")
 				upgradeURL := fmt.Sprintf("%s/install/runner?t=%d", upgradeBase, time.Now().Unix())
 
-				// Download to temp file first, then verify and execute
-				tmpFile := filepath.Join(os.TempDir(), "lattice-runner-upgrade.sh")
+				// Use a secure temp directory with unpredictable name
+				tmpDir, mkErr := os.MkdirTemp("", "lattice-upgrade-*")
+				if mkErr != nil {
+					log.Printf("upgrade: failed to create temp dir: %v", mkErr)
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": fmt.Sprintf("failed to create temp dir: %v", mkErr),
+						},
+					})
+					return
+				}
+				defer os.RemoveAll(tmpDir)
+				tmpFile := filepath.Join(tmpDir, "upgrade.sh")
+
+				// Download to temp file
 				dlCmd := exec.CommandContext(ctx, "curl", "-fsSL", "-o", tmpFile, upgradeURL)
 				if dlOut, dlErr := dlCmd.CombinedOutput(); dlErr != nil {
 					log.Printf("upgrade download failed: %v — %s", dlErr, string(dlOut))
@@ -1005,12 +1049,40 @@ func main() {
 					})
 					return
 				}
-				defer os.Remove(tmpFile)
 
-				// Log SHA256 hash of the downloaded script for audit
-				if scriptBytes, readErr := os.ReadFile(tmpFile); readErr == nil {
-					hash := sha256.Sum256(scriptBytes)
-					log.Printf("upgrade script hash: %s", hex.EncodeToString(hash[:]))
+				// Verify SHA256 hash of the downloaded script
+				scriptBytes, readErr := os.ReadFile(tmpFile)
+				if readErr != nil {
+					log.Printf("upgrade: failed to read downloaded script: %v", readErr)
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": "failed to read downloaded upgrade script",
+						},
+					})
+					return
+				}
+
+				actualHash := sha256.Sum256(scriptBytes)
+				actualHashHex := hex.EncodeToString(actualHash[:])
+				log.Printf("upgrade script hash: %s", actualHashHex)
+
+				if expectedHash != "" && actualHashHex != expectedHash {
+					log.Printf("upgrade ABORTED: hash mismatch — expected %s, got %s", expectedHash, actualHashHex)
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": "upgrade aborted: script integrity check failed (hash mismatch)",
+						},
+					})
+					return
+				}
+				if expectedHash == "" {
+					log.Println("upgrade WARNING: no expected_hash provided by orchestrator, skipping verification")
 				}
 
 				// Make executable and run

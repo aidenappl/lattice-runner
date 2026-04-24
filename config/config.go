@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -17,8 +18,18 @@ type Config struct {
 }
 
 func Load() *Config {
+	orchestratorURL := getEnvOrPanic("ORCHESTRATOR_URL")
+
+	// Enforce TLS for WebSocket connections unless explicitly opted out.
+	// Unencrypted connections expose the worker token and all messages (including
+	// deployment specs with registry passwords and env vars) in plaintext.
+	allowInsecure := strings.EqualFold(getEnv("ALLOW_INSECURE", "false"), "true")
+	if !allowInsecure && strings.HasPrefix(orchestratorURL, "ws://") {
+		panic("ORCHESTRATOR_URL uses unencrypted ws:// — use wss:// for production. Set ALLOW_INSECURE=true to override for local development.")
+	}
+
 	cfg := &Config{
-		OrchestratorURL:   getEnvOrPanic("ORCHESTRATOR_URL"),
+		OrchestratorURL:   orchestratorURL,
 		WorkerToken:       getEnvOrPanic("WORKER_TOKEN"),
 		WorkerName:        getEnv("WORKER_NAME", hostname()),
 		HeartbeatInterval: parseDuration("HEARTBEAT_INTERVAL", 10*time.Second),

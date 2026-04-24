@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -20,6 +21,56 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 )
+
+// blockedHostPaths are host filesystem paths that must never be bind-mounted
+// into containers. Prevents container escape via Docker socket or access to
+// host credentials and system configuration.
+var blockedHostPaths = []string{
+	"/etc",
+	"/root",
+	"/home",
+	"/var/run/docker.sock",
+	"/run/docker.sock",
+	"/proc",
+	"/sys",
+	"/dev",
+	"/boot",
+}
+
+// validateEnvKey checks that an environment variable key contains only safe
+// characters (letters, digits, underscores) and does not start with a digit.
+func validateEnvKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("empty key")
+	}
+	for i, c := range key {
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' {
+			continue
+		}
+		if i > 0 && c >= '0' && c <= '9' {
+			continue
+		}
+		return fmt.Errorf("invalid character %q at position %d", c, i)
+	}
+	return nil
+}
+
+// validateHostPath checks that a bind-mount host path does not point to a
+// sensitive location. Named Docker volumes (no leading /) are always allowed.
+func validateHostPath(hostPath string) error {
+	// Named volumes (no path separator) are fine
+	if !strings.HasPrefix(hostPath, "/") {
+		return nil
+	}
+
+	cleaned := filepath.Clean(hostPath)
+	for _, blocked := range blockedHostPaths {
+		if cleaned == blocked || strings.HasPrefix(cleaned, blocked+"/") {
+			return fmt.Errorf("mount of %q is blocked for security", blocked)
+		}
+	}
+	return nil
+}
 
 // Client wraps the Docker Engine API client.
 type Client struct {
@@ -170,9 +221,16 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		imageRef = spec.Image + ":" + spec.Tag
 	}
 
-	// Environment variables
+	// Environment variables — validate keys to prevent injection
 	env := make([]string, 0, len(spec.EnvVars))
 	for k, v := range spec.EnvVars {
+		if err := validateEnvKey(k); err != nil {
+			return "", fmt.Errorf("invalid env var key %q: %w", k, err)
+		}
+		// Reject null bytes in values (can confuse Docker's env parsing)
+		if strings.ContainsRune(v, 0) {
+			return "", fmt.Errorf("env var %q value contains null byte", k)
+		}
 		env = append(env, k+"="+v)
 	}
 
@@ -191,9 +249,12 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		}
 	}
 
-	// Volume binds
+	// Volume binds — validate host paths to prevent mounting sensitive locations
 	binds := make([]string, 0, len(spec.Volumes))
 	for hostPath, containerPath := range spec.Volumes {
+		if err := validateHostPath(hostPath); err != nil {
+			return "", fmt.Errorf("blocked volume mount %q: %w", hostPath, err)
+		}
 		binds = append(binds, hostPath+":"+containerPath)
 	}
 
@@ -257,6 +318,7 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 		Binds:         binds,
 		RestartPolicy: restartPolicy,
 		Resources:     resources,
+		Privileged:    false, // Explicitly prevent privileged containers
 	}
 
 	// Build networking config — attach to specified networks at creation time
@@ -267,6 +329,16 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 	// user-defined network so other containers can resolve them by service name.
 	networkConfig := &network.NetworkingConfig{}
 	if len(spec.Networks) > 0 {
+		// Block dangerous network modes that bypass container isolation
+		for _, netName := range spec.Networks {
+			lower := strings.ToLower(netName)
+			if lower == "host" {
+				return "", fmt.Errorf("network mode 'host' is not allowed (bypasses container network isolation)")
+			}
+			if strings.HasPrefix(lower, "container:") {
+				return "", fmt.Errorf("network mode 'container:*' is not allowed")
+			}
+		}
 		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
 		for _, netName := range spec.Networks {
 			endpoint := &network.EndpointSettings{}
