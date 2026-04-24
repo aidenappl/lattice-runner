@@ -115,10 +115,10 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 		}
 	}
 
-	// Phase 3: Stop blue (old) and rename green to take over
+	// Phase 3: Swap — stop blue, remove green, recreate with ports + canonical name
+	// Order: stop blue (frees ports) → remove blue (frees name) → remove green → create final
 	e.reportProgress(spec.DeploymentID, "deploying", "health check passed, swapping blue→green", nil)
 
-	// Track blue containers before removing them so we can attempt restart on failure
 	type blueBackup struct {
 		name string
 		id   string
@@ -136,34 +136,34 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 		}
 
 		for replica := 0; replica < replicas; replica++ {
-			blueName := cSpec.Name
+			canonicalName := cSpec.Name
 			if replicas > 1 {
-				blueName = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
+				canonicalName = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
 
 			// Capture blue ID before stopping
 			var blueID string
-			if id, err := e.Docker.FindContainerByName(ctx, blueName); err == nil && id != "" {
+			if id, err := e.Docker.FindContainerByName(ctx, canonicalName); err == nil && id != "" {
 				blueID = id
-				blueBackups = append(blueBackups, blueBackup{name: blueName, id: blueID})
+				blueBackups = append(blueBackups, blueBackup{name: canonicalName, id: blueID})
 			}
 
-			// Stop and remove blue
+			// Step 1: Stop and remove blue (frees ports and canonical name)
 			e.reportProgress(spec.DeploymentID, "deploying",
-				fmt.Sprintf("stopping blue (old) container: %s", blueName),
-				map[string]any{"container_name": blueName, "step": "stopping_blue"})
+				fmt.Sprintf("stopping blue (old) container: %s", canonicalName),
+				map[string]any{"container_name": canonicalName, "step": "stopping_blue"})
 			if blueID != "" {
 				_ = e.Docker.StopContainer(ctx, blueID, 30)
 				_ = e.Docker.RemoveContainer(ctx, blueID, true)
 			}
 
-			// Stop green, remove it, recreate with correct name and ports
-			if greenID, ok := greenIDs[blueName]; ok {
+			// Step 2: Remove green container (frees its name, image layers are cached)
+			if greenID, ok := greenIDs[canonicalName]; ok {
 				_ = e.Docker.StopContainer(ctx, greenID, 10)
 				_ = e.Docker.RemoveContainer(ctx, greenID, true)
 			}
 
-			// Recreate with the proper name and port bindings
+			// Step 3: Create final container with canonical name + port bindings
 			portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))
 			for j, pm := range cSpec.PortMappings {
 				portMappings[j] = dockerclient.PortMapping{
@@ -174,7 +174,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			}
 
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:           blueName,
+				Name:           canonicalName,
 				Image:          cSpec.Image,
 				Tag:            cSpec.Tag,
 				PortMappings:   portMappings,
@@ -193,13 +193,13 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 
 			_, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			if err != nil {
-				swapErr = fmt.Errorf("recreate container %s: %w", blueName, err)
+				swapErr = fmt.Errorf("recreate container %s: %w", canonicalName, err)
 				break
 			}
 
 			e.reportProgress(spec.DeploymentID, "deploying",
-				fmt.Sprintf("swapped to new container: %s", blueName),
-				map[string]any{"container_name": blueName, "step": "swapped"})
+				fmt.Sprintf("swapped to new container: %s", canonicalName),
+				map[string]any{"container_name": canonicalName, "step": "swapped"})
 		}
 	}
 
@@ -207,7 +207,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 	if swapErr != nil {
 		log.Printf("deploy: blue-green swap failed, attempting to restart blue containers: %v", swapErr)
 		for _, bb := range blueBackups {
-			_ = e.Docker.StartContainer(ctx, bb.id) // may fail if already removed
+			_ = e.Docker.StartContainer(ctx, bb.id)
 		}
 		return swapErr
 	}

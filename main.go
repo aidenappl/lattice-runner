@@ -1881,6 +1881,26 @@ func main() {
 	<-quit
 
 	log.Println("shutting down gracefully...")
+
+	// Wait for in-flight deployments to finish (up to 60s)
+	shutdownDeadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(shutdownDeadline) {
+		deploymentStatesMu.RLock()
+		hasActive := false
+		for _, st := range deploymentStates {
+			if st.InProgress {
+				hasActive = true
+				break
+			}
+		}
+		deploymentStatesMu.RUnlock()
+		if !hasActive {
+			break
+		}
+		log.Println("waiting for in-flight deployment to complete...")
+		time.Sleep(2 * time.Second)
+	}
+
 	wsSend(ws, "worker_shutdown", client.OutgoingMessage{
 		Type: "worker_shutdown",
 		Payload: map[string]any{

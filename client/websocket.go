@@ -45,7 +45,7 @@ func NewWSClient(orchestratorURL, token string, reconnectInterval time.Duration)
 	return &WSClient{
 		url:               orchestratorURL,
 		token:             token,
-		send:              make(chan []byte, 64),
+		send:              make(chan []byte, 256),
 		reconnectInterval: reconnectInterval,
 	}
 }
@@ -63,6 +63,7 @@ func (c *WSClient) SendJSON(v any) error {
 	case c.send <- b:
 		return nil
 	default:
+		log.Printf("ws: send queue full (%d/%d), dropping message", len(c.send), cap(c.send))
 		return fmt.Errorf("send queue full")
 	}
 }

@@ -120,26 +120,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				}
 			}
 
-			// If old containers hold host ports, stop them FIRST to free the ports
-			if len(portMappings) > 0 && len(oldContainers) > 0 {
-				e.reportProgress(spec.DeploymentID, "deploying",
-					fmt.Sprintf("[%d/%d] stopping old container(s) to free ports for %s", i+1, len(spec.Containers), name), nil)
-				for _, old := range oldContainers {
-					log.Printf("deploy: stopping old container %s (id=%s) to free ports", old.name, old.id[:12])
-					if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
-						log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
-						_ = e.Docker.KillContainer(ctx, old.id)
-					}
-					// Verify stopped
-					if info, err := e.Docker.InspectContainer(ctx, old.id); err == nil && info.State.Running {
-						log.Printf("deploy: container %s still running, killing", old.name)
-						_ = e.Docker.KillContainer(ctx, old.id)
-						time.Sleep(1 * time.Second)
-					}
-				}
-			}
-
-			// Create and start new container with unique name
+			// Build the full container spec
 			dockerSpec := dockerclient.ContainerSpec{
 				Name:           deployName,
 				Image:          cSpec.Image,
@@ -158,12 +139,83 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
-			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
-			if err != nil {
+			var containerID string
+
+			// When host ports are involved, use a probe-first strategy:
+			// 1. Start a probe container WITHOUT ports to verify the image works
+			// 2. Only then stop the old container and recreate with ports
+			// This prevents leaving nothing running if the new image fails.
+			if len(portMappings) > 0 && len(oldContainers) > 0 {
+				probeName := deployName + "-probe"
+				probeSpec := dockerSpec
+				probeSpec.Name = probeName
+				probeSpec.PortMappings = nil
+				probeSpec.RestartPolicy = "no"
+
 				e.reportProgress(spec.DeploymentID, "deploying",
-					fmt.Sprintf("[%d/%d] failed to create %s: %v", i+1, len(spec.Containers), deployName, err), nil)
-				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
-				return fmt.Errorf("create container %s: %w", name, err)
+					fmt.Sprintf("[%d/%d] verifying new image starts for %s", i+1, len(spec.Containers), name), nil)
+
+				probeID, probeErr := e.Docker.CreateAndStartContainer(ctx, probeSpec)
+				if probeErr != nil {
+					e.reportProgress(spec.DeploymentID, "deploying",
+						fmt.Sprintf("[%d/%d] probe failed for %s: %v", i+1, len(spec.Containers), name, probeErr), nil)
+					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					return fmt.Errorf("probe container %s failed to start: %w", name, probeErr)
+				}
+
+				// Give it a moment to crash if it's going to
+				time.Sleep(2 * time.Second)
+				if info, inspErr := e.Docker.InspectContainer(ctx, probeID); inspErr != nil || !info.State.Running {
+					_ = e.Docker.StopAndRemoveContainer(ctx, probeID, 5)
+					e.reportProgress(spec.DeploymentID, "deploying",
+						fmt.Sprintf("[%d/%d] probe container exited immediately for %s", i+1, len(spec.Containers), name), nil)
+					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					return fmt.Errorf("probe container %s not running after 2s", name)
+				}
+
+				// Probe passed — remove it and do the swap
+				_ = e.Docker.StopAndRemoveContainer(ctx, probeID, 5)
+
+				// Stop old containers to free ports
+				e.reportProgress(spec.DeploymentID, "deploying",
+					fmt.Sprintf("[%d/%d] swapping ports for %s", i+1, len(spec.Containers), name), nil)
+				for _, old := range oldContainers {
+					log.Printf("deploy: stopping old container %s (id=%s) to free ports", old.name, old.id[:12])
+					if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
+						log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
+						_ = e.Docker.KillContainer(ctx, old.id)
+					}
+				}
+
+				// Create the real container with ports
+				var createErr error
+				containerID, createErr = e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+				if createErr != nil {
+					e.reportProgress(spec.DeploymentID, "deploying",
+						fmt.Sprintf("[%d/%d] failed to create %s after port swap: %v", i+1, len(spec.Containers), deployName, createErr), nil)
+					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					return fmt.Errorf("create container %s: %w", name, createErr)
+				}
+			} else {
+				// No port conflict — stop old containers first if needed, then create
+				if len(oldContainers) > 0 {
+					for _, old := range oldContainers {
+						log.Printf("deploy: stopping old container %s (id=%s)", old.name, old.id[:12])
+						if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
+							log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
+							_ = e.Docker.KillContainer(ctx, old.id)
+						}
+					}
+				}
+
+				var createErr error
+				containerID, createErr = e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+				if createErr != nil {
+					e.reportProgress(spec.DeploymentID, "deploying",
+						fmt.Sprintf("[%d/%d] failed to create %s: %v", i+1, len(spec.Containers), deployName, createErr), nil)
+					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					return fmt.Errorf("create container %s: %w", name, createErr)
+				}
 			}
 
 			// Verify new container is running
