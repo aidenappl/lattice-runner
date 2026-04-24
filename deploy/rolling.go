@@ -72,7 +72,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("[%d/%d] pulling image %s for container %s", i+1, len(spec.Containers), imageRef, cSpec.Name),
-			map[string]any{"container_name": cSpec.Name, "step": "pulling"})
+			map[string]any{"container_name": cSpec.Name, "step": "pulling", "container_index": i + 1, "container_total": len(spec.Containers)})
 
 		// Pull the image
 		var regAuth *dockerclient.RegistryAuth
@@ -91,7 +91,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("[%d/%d] image %s pulled successfully", i+1, len(spec.Containers), imageRef),
-			map[string]any{"container_name": cSpec.Name, "step": "pulled"})
+			map[string]any{"container_name": cSpec.Name, "step": "pulled", "container_index": i + 1, "container_total": len(spec.Containers)})
 
 		for replica := 0; replica < replicas; replica++ {
 			name := cSpec.Name
@@ -108,7 +108,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("[%d/%d] creating container: %s (as %s)", i+1, len(spec.Containers), name, deployName),
-				map[string]any{"container_name": name, "step": "starting"})
+				map[string]any{"container_name": name, "step": "starting", "container_index": i + 1, "container_total": len(spec.Containers)})
 
 			// Build port mappings
 			portMappings := make([]dockerclient.PortMapping, len(cSpec.PortMappings))
@@ -194,7 +194,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("container %s started successfully", deployName),
-				map[string]any{"container_name": name, "step": "running", "container_id": containerID})
+				map[string]any{"container_name": name, "step": "running", "container_index": i + 1, "container_total": len(spec.Containers), "container_id": containerID})
 
 			updatedContainers = append(updatedContainers, snapshotIdx)
 			snapshotIdx++

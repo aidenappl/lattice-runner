@@ -81,8 +81,11 @@ type PortMapping struct {
 	Protocol      string // tcp or udp
 }
 
-// PullImage pulls an image from a registry.
+// PullImage pulls an image from a registry (10 minute timeout).
 func (c *Client) PullImage(ctx context.Context, imageRef string, authConfig *RegistryAuth) error {
+	pullCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
 	opts := image.PullOptions{}
 	if authConfig != nil {
 		encoded, err := encodeAuthConfig(authConfig)
@@ -92,7 +95,7 @@ func (c *Client) PullImage(ctx context.Context, imageRef string, authConfig *Reg
 		opts.RegistryAuth = encoded
 	}
 
-	reader, err := c.cli.ImagePull(ctx, imageRef, opts)
+	reader, err := c.cli.ImagePull(pullCtx, imageRef, opts)
 	if err != nil {
 		return fmt.Errorf("image pull: %w", err)
 	}
@@ -157,8 +160,11 @@ func (c *Client) StopAndRemoveContainer(ctx context.Context, containerID string,
 	return fmt.Errorf("failed to remove container %s after 3 attempts", containerID[:12])
 }
 
-// CreateAndStartContainer creates and starts a container from the given spec.
+// CreateAndStartContainer creates and starts a container from the given spec (2 minute timeout).
 func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
 	imageRef := spec.Image
 	if spec.Tag != "" {
 		imageRef = spec.Image + ":" + spec.Tag
@@ -300,8 +306,10 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 }
 
 func (c *Client) StopContainer(ctx context.Context, containerID string, timeout int) error {
+	stopCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second+10*time.Second)
+	defer cancel()
 	t := timeout
-	return c.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &t})
+	return c.cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &t})
 }
 
 func (c *Client) StartContainer(ctx context.Context, containerID string) error {
@@ -321,7 +329,9 @@ func (c *Client) UnpauseContainer(ctx context.Context, containerID string) error
 }
 
 func (c *Client) RemoveContainer(ctx context.Context, containerID string, force bool) error {
-	return c.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: force})
+	removeCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+	return c.cli.ContainerRemove(removeCtx, containerID, container.RemoveOptions{Force: force})
 }
 
 func (c *Client) RenameContainer(ctx context.Context, containerID, newName string) error {

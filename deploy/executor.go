@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"syscall"
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -168,6 +169,15 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		return fmt.Errorf("spec validation failed: %w", err)
 	}
 
+	// Pre-flight check: ensure sufficient disk space
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs("/", &stat); err == nil {
+		availGB := float64(stat.Bavail*uint64(stat.Bsize)) / (1024 * 1024 * 1024)
+		if availGB < 1.0 {
+			return fmt.Errorf("insufficient disk space: %.1fGB available, need at least 1GB", availGB)
+		}
+	}
+
 	log.Printf("deploy: starting deployment=%d strategy=%s stack=%s", spec.DeploymentID, spec.Strategy, spec.StackName)
 
 	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting deployment: strategy=%s, containers=%d, networks=%d, volumes=%d",
@@ -319,12 +329,12 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 }
 
 // postDeployVerify checks that all deployed containers remain healthy over
-// a verification window. Runs 3 checks at 10-second intervals (30s total).
+// a verification window. Runs 6 checks at 10-second intervals (60s total).
 // Detects containers that stopped, entered a restart loop, or failed health
 // checks shortly after deployment — the most common failure pattern.
 func (e *Executor) postDeployVerify(ctx context.Context, spec DeploymentSpec) error {
 	const (
-		verifyChecks   = 3
+		verifyChecks   = 6
 		verifyInterval = 10 * time.Second
 	)
 
@@ -344,9 +354,9 @@ func (e *Executor) postDeployVerify(ctx context.Context, spec DeploymentSpec) er
 		}
 	}
 
-	e.reportProgress(spec.DeploymentID, "deploying",
+	e.reportProgress(spec.DeploymentID, "validating",
 		fmt.Sprintf("verifying deployment health (%d checks over %s)", verifyChecks, time.Duration(verifyChecks)*verifyInterval),
-		map[string]any{"step": "verify"})
+		map[string]any{"step": "verify-0", "verify_check": 0, "verify_total": verifyChecks, "container_count": len(expected)})
 
 	for check := 1; check <= verifyChecks; check++ {
 		select {
@@ -409,18 +419,25 @@ func (e *Executor) postDeployVerify(ctx context.Context, spec DeploymentSpec) er
 			}
 		}
 
+		verifyPayload := map[string]any{
+			"step":            fmt.Sprintf("verify-%d", check),
+			"verify_check":    check,
+			"verify_total":    verifyChecks,
+			"container_count": len(expected),
+		}
+
 		if len(issues) > 0 {
 			msg := fmt.Sprintf("verify check %d/%d: %s", check, verifyChecks, strings.Join(issues, "; "))
-			e.reportProgress(spec.DeploymentID, "deploying", msg, map[string]any{"step": "verify"})
+			e.reportProgress(spec.DeploymentID, "validating", msg, verifyPayload)
 
 			// On the final check, if there are still issues, fail the deployment
 			if check == verifyChecks {
 				return fmt.Errorf("containers unhealthy after %d checks: %s", verifyChecks, strings.Join(issues, "; "))
 			}
 		} else {
-			e.reportProgress(spec.DeploymentID, "deploying",
+			e.reportProgress(spec.DeploymentID, "validating",
 				fmt.Sprintf("verify check %d/%d: all containers healthy", check, verifyChecks),
-				map[string]any{"step": "verify"})
+				verifyPayload)
 		}
 	}
 

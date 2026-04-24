@@ -253,6 +253,17 @@ func parseNetDev(data string) (rx, tx int64) {
 	return
 }
 
+// CollectRunnerMetrics returns metrics about the runner process itself.
+func CollectRunnerMetrics() map[string]interface{} {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return map[string]interface{}{
+		"runner_goroutines": runtime.NumGoroutine(),
+		"runner_heap_mb":    round1(float64(m.HeapAlloc) / 1024 / 1024),
+		"runner_sys_mb":     round1(float64(m.Sys) / 1024 / 1024),
+	}
+}
+
 func round1(v float64) float64 {
 	return math.Round(v*10) / 10
 }

@@ -162,10 +162,15 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 	defer close(done)
 
 	var since time.Time // zero → use Tail:100 on first connect
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
 	for {
 		lastSeen := ls.doStream(ctx, containerID, containerName, since)
 		if !lastSeen.IsZero() {
 			since = lastSeen
+			// Reset backoff on successful stream that produced data
+			backoff = time.Second
 		}
 
 		// Context was cancelled — sync() stopped tracking this container.
@@ -174,12 +179,18 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 		}
 
 		// Stream ended for another reason (container restart / flap).
-		// Wait briefly so the container has time to come back up, then reconnect.
-		log.Printf("logstreamer: stream ended for %s, reconnecting in 2s…", containerName)
+		// Wait with exponential backoff so the container has time to come back up.
+		log.Printf("logstreamer: stream ended for %s, reconnecting in %v…", containerName, backoff)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
 	}
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,6 +32,16 @@ import (
 
 // Set via -ldflags at build time: -ldflags "-X main.Version=v1.0.1"
 var Version = "dev"
+
+// handlerSem limits the number of concurrent message handler goroutines.
+var handlerSem = make(chan struct{}, 50)
+
+// wsSend sends a JSON message over the WebSocket and logs any failure.
+func wsSend(ws *client.WSClient, msgType string, payload interface{}) {
+	if err := ws.SendJSON(payload); err != nil {
+		log.Printf("ws send [%s] failed: %v", msgType, err)
+	}
+}
 
 type deploymentRunState struct {
 	DeploymentID   int
@@ -61,20 +74,33 @@ func main() {
 	fmt.Printf("  Heartbeat:    %v\n", cfg.HeartbeatInterval)
 	fmt.Println()
 
-	// Initialize Docker client
+	// Initialize Docker client with retry
 	fmt.Print("Connecting to Docker...")
-	docker, err := dockerclient.NewClient()
-	if err != nil {
-		log.Fatal("failed to create docker client: ", err)
-	}
-	defer docker.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := docker.Ping(ctx); err != nil {
-		log.Fatal("docker not reachable: ", err)
+	var docker *dockerclient.Client
+	for i := 0; i < 30; i++ {
+		var err error
+		docker, err = dockerclient.NewClient()
+		if err == nil {
+			if pingErr := docker.Ping(ctx); pingErr == nil {
+				break
+			} else {
+				docker.Close()
+				docker = nil
+				log.Printf("docker connect attempt %d/30 failed: %v", i+1, pingErr)
+			}
+		} else {
+			log.Printf("docker connect attempt %d/30 failed: %v", i+1, err)
+		}
+		time.Sleep(2 * time.Second)
 	}
+	if docker == nil {
+		log.Fatal("failed to connect to Docker after 30 attempts")
+	}
+	defer docker.Close()
 
 	dockerVersion, _ := docker.ServerVersion(ctx)
 	fmt.Printf(" ✅ Done (Docker %s)\n", dockerVersion)
@@ -120,7 +146,7 @@ func main() {
 		out["max_retries"] = maxRetries
 		out["last_progress_at"] = time.Now().UTC().Format(time.RFC3339)
 
-		_ = ws.SendJSON(client.OutgoingMessage{
+		wsSend(ws, "deployment_progress", client.OutgoingMessage{
 			Type:    "deployment_progress",
 			Payload: out,
 		})
@@ -128,12 +154,35 @@ func main() {
 
 	// Active exec sessions: command_id -> cancel func
 	type execSession struct {
-		execID string
-		conn   types.HijackedResponse
-		cancel context.CancelFunc
+		execID    string
+		conn      types.HijackedResponse
+		cancel    context.CancelFunc
+		createdAt time.Time
 	}
 	execSessions := make(map[string]*execSession)
 	var execMu sync.Mutex
+
+	// Periodic exec session cleanup — remove orphaned sessions older than 30 minutes
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				execMu.Lock()
+				for id, s := range execSessions {
+					if time.Since(s.createdAt) > 30*time.Minute {
+						log.Printf("exec session cleanup: removing orphaned session %s (age=%v)", id, time.Since(s.createdAt))
+						s.cancel()
+						delete(execSessions, id)
+					}
+				}
+				execMu.Unlock()
+			}
+		}
+	}()
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
@@ -150,7 +199,7 @@ func main() {
 		case "connected":
 			log.Println("connected to orchestrator")
 			// Send registration info
-			_ = ws.SendJSON(client.OutgoingMessage{
+			wsSend(ws, "registration", client.OutgoingMessage{
 				Type: "registration",
 				Payload: map[string]any{
 					"name":           cfg.WorkerName,
@@ -164,11 +213,13 @@ func main() {
 			})
 
 		case "deploy":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				spec, err := deploy.ParseDeploymentSpec(env.Payload)
 				if err != nil {
 					log.Printf("invalid deploy spec: %v", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "deployment_progress", client.OutgoingMessage{
 						Type:      "deployment_progress",
 						CommandID: env.CommandID,
 						Status:    "failed",
@@ -213,7 +264,7 @@ func main() {
 				}
 				deploymentStatesMu.Unlock()
 
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ws, "deployment_progress", client.OutgoingMessage{
 					Type: "deployment_progress",
 					Payload: map[string]any{
 						"deployment_id": spec.DeploymentID,
@@ -256,7 +307,7 @@ func main() {
 				deploymentStatesMu.RUnlock()
 
 				if !ok {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "deployment_status", client.OutgoingMessage{
 						Type: "deployment_status",
 						Payload: map[string]any{
 							"deployment_id": depID,
@@ -268,7 +319,7 @@ func main() {
 					return
 				}
 
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ws, "deployment_status", client.OutgoingMessage{
 					Type: "deployment_status",
 					Payload: map[string]any{
 						"deployment_id":    st.DeploymentID,
@@ -284,10 +335,12 @@ func main() {
 			}()
 
 		case "stop":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "stop", "status": "error", "message": "missing container_name",
@@ -297,7 +350,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					log.Printf("stop: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "stop", "status": "error", "message": "invalid container_name",
@@ -310,7 +363,7 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "stop", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -325,7 +378,7 @@ func main() {
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
 					log.Printf("failed to stop %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "stop", fmt.Sprintf("failed to stop: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -336,7 +389,7 @@ func main() {
 					})
 				} else {
 					log.Printf("stopped container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -348,10 +401,12 @@ func main() {
 			}()
 
 		case "start":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "start", "status": "error", "message": "missing container_name",
@@ -361,7 +416,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					log.Printf("start: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "start", "status": "error", "message": "invalid container_name",
@@ -374,7 +429,7 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "start", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -389,7 +444,7 @@ func main() {
 				if err := docker.StartContainer(ctx, id); err != nil {
 					log.Printf("failed to start %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "start", fmt.Sprintf("failed to start: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -400,7 +455,7 @@ func main() {
 					})
 				} else {
 					log.Printf("started container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -412,7 +467,9 @@ func main() {
 			}()
 
 		case "kill":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -476,7 +533,9 @@ func main() {
 			}()
 
 		case "pause":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -540,7 +599,9 @@ func main() {
 			}()
 
 		case "unpause":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -604,7 +665,9 @@ func main() {
 			}()
 
 		case "restart":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -668,7 +731,9 @@ func main() {
 			}()
 
 		case "remove":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -736,7 +801,9 @@ func main() {
 			}()
 
 		case "recreate":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -841,7 +908,9 @@ func main() {
 			}()
 
 		case "pull_image":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				imageRef, _ := env.Payload["image"].(string)
 				if imageRef == "" {
 					return
@@ -886,7 +955,7 @@ func main() {
 		case "reboot_os":
 			go func() {
 				log.Println("reboot command received, rebooting system...")
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "reboot_os",
@@ -904,7 +973,7 @@ func main() {
 		case "upgrade_runner":
 			go func() {
 				log.Println("upgrade runner command received")
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "upgrade_runner",
@@ -912,11 +981,44 @@ func main() {
 						"message": "starting runner upgrade",
 					},
 				})
-				upgradeURL := fmt.Sprintf("https://lattice-api.appleby.cloud/install/runner?t=%d", time.Now().Unix())
-				out, err := exec.Command("bash", "-c", fmt.Sprintf("curl -fsSL '%s' | bash", upgradeURL)).CombinedOutput()
+
+				// Derive upgrade URL from the orchestrator connection URL
+				upgradeBase := cfg.OrchestratorURL
+				upgradeBase = strings.Replace(upgradeBase, "ws://", "http://", 1)
+				upgradeBase = strings.Replace(upgradeBase, "wss://", "https://", 1)
+				upgradeBase = strings.TrimSuffix(upgradeBase, "/ws/worker")
+				upgradeBase = strings.TrimSuffix(upgradeBase, "/ws")
+				upgradeURL := fmt.Sprintf("%s/install/runner?t=%d", upgradeBase, time.Now().Unix())
+
+				// Download to temp file first, then verify and execute
+				tmpFile := filepath.Join(os.TempDir(), "lattice-runner-upgrade.sh")
+				dlCmd := exec.CommandContext(ctx, "curl", "-fsSL", "-o", tmpFile, upgradeURL)
+				if dlOut, dlErr := dlCmd.CombinedOutput(); dlErr != nil {
+					log.Printf("upgrade download failed: %v — %s", dlErr, string(dlOut))
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": fmt.Sprintf("upgrade download failed: %v", dlErr),
+						},
+					})
+					return
+				}
+				defer os.Remove(tmpFile)
+
+				// Log SHA256 hash of the downloaded script for audit
+				if scriptBytes, readErr := os.ReadFile(tmpFile); readErr == nil {
+					hash := sha256.Sum256(scriptBytes)
+					log.Printf("upgrade script hash: %s", hex.EncodeToString(hash[:]))
+				}
+
+				// Make executable and run
+				_ = os.Chmod(tmpFile, 0755)
+				out, err := exec.CommandContext(ctx, "bash", tmpFile).CombinedOutput()
 				if err != nil {
 					log.Printf("upgrade failed: %v — %s", err, string(out))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -926,7 +1028,7 @@ func main() {
 					})
 				} else {
 					log.Printf("upgrade completed: %s", string(out))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1290,7 +1392,9 @@ func main() {
 			}()
 
 		case "force_remove":
+			handlerSem <- struct{}{}
 			go func() {
+				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -1397,7 +1501,7 @@ func main() {
 				}
 
 				execCtx, execCancel := context.WithCancel(ctx)
-				session := &execSession{execID: execID, conn: conn, cancel: execCancel}
+				session := &execSession{execID: execID, conn: conn, cancel: execCancel, createdAt: time.Now()}
 				execMu.Lock()
 				execSessions[commandID] = session
 				execMu.Unlock()
@@ -1557,6 +1661,7 @@ func main() {
 			case <-ticker.C:
 				heartbeatCount++
 				m := metrics.Collect(ctx, docker)
+				runnerMetrics := metrics.CollectRunnerMetrics()
 				payload := map[string]any{
 					"cpu_percent":             m.CPUPercent,
 					"cpu_cores":               m.CPUCores,
@@ -1577,6 +1682,9 @@ func main() {
 					"uptime_seconds":          m.UptimeSeconds,
 					"process_count":           m.ProcessCount,
 					"runner_version":          Version,
+					"runner_goroutines":       runnerMetrics["runner_goroutines"],
+					"runner_heap_mb":          runnerMetrics["runner_heap_mb"],
+					"runner_sys_mb":           runnerMetrics["runner_sys_mb"],
 				}
 
 				// Collect per-container resource stats every 3rd heartbeat (expensive)
@@ -1586,7 +1694,7 @@ func main() {
 					}
 				}
 
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ws, "heartbeat", client.OutgoingMessage{
 					Type:    "heartbeat",
 					Payload: payload,
 				})
@@ -1594,7 +1702,7 @@ func main() {
 				// Clean up old deployment states to prevent memory leak
 				deploymentStatesMu.Lock()
 				for id, st := range deploymentStates {
-					if st.Status != "deploying" && time.Since(st.LastProgressAt) > time.Hour {
+					if st.Status != "deploying" && time.Since(st.LastProgressAt) > 15*time.Minute {
 						delete(deploymentStates, id)
 					}
 				}
@@ -1691,16 +1799,17 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("shutting down runner...")
-	_ = ws.SendJSON(client.OutgoingMessage{
+	log.Println("shutting down gracefully...")
+	wsSend(ws, "worker_shutdown", client.OutgoingMessage{
 		Type: "worker_shutdown",
 		Payload: map[string]any{
 			"reason":  "graceful",
 			"message": "runner shutting down gracefully",
 		},
 	})
-	ws.Drain(3 * time.Second)
-	cancel()
+	cancel() // signal all goroutines to stop
+	time.Sleep(2 * time.Second) // let in-flight work finish
+	ws.Drain(5 * time.Second)   // drain remaining messages
 	ws.Close()
 	log.Println("runner stopped")
 }
@@ -1709,7 +1818,7 @@ func main() {
 // it gets persisted in the lifecycle_logs table and broadcast to the admin UI.
 func sendLifecycleLog(ws *client.WSClient, containerName, event, message string) {
 	log.Printf("[lifecycle] %s: %s — %s", containerName, event, message)
-	_ = ws.SendJSON(client.OutgoingMessage{
+	wsSend(ws, "lifecycle_log", client.OutgoingMessage{
 		Type: "lifecycle_log",
 		Payload: map[string]any{
 			"container_name": containerName,
