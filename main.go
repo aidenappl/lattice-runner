@@ -20,12 +20,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aidenappl/lattice-runner/backup"
 	"github.com/aidenappl/lattice-runner/client"
 	"github.com/aidenappl/lattice-runner/cmd"
 	"github.com/aidenappl/lattice-runner/config"
 	"github.com/aidenappl/lattice-runner/deploy"
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 	"github.com/aidenappl/lattice-runner/metrics"
+	"github.com/aidenappl/lattice-runner/scheduler"
 	"github.com/aidenappl/lattice-runner/web"
 	"github.com/docker/docker/api/types"
 )
@@ -190,6 +192,12 @@ func main() {
 			}
 		}
 	}()
+
+	// Create snapshot scheduler
+	snapshotScheduler := scheduler.New(func(job scheduler.Job) {
+		handleScheduledSnapshot(ws, docker, job)
+	})
+	go snapshotScheduler.Run(ctx)
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
@@ -1680,6 +1688,808 @@ func main() {
 				}
 				session.cancel()
 			}()
+
+		case "db_create":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_create: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"action": "db_create", "status": "error", "message": "invalid or missing container_name",
+						},
+					})
+					return
+				}
+
+				engine, _ := env.Payload["engine"].(string)
+				engineVersion, _ := env.Payload["engine_version"].(string)
+				portF, _ := env.Payload["port"].(float64)
+				rootPassword, _ := env.Payload["root_password"].(string)
+				databaseName, _ := env.Payload["database_name"].(string)
+				username, _ := env.Payload["username"].(string)
+				password, _ := env.Payload["password"].(string)
+				volumeName, _ := env.Payload["volume_name"].(string)
+				cpuLimitF, _ := env.Payload["cpu_limit"].(float64)
+				memoryLimitF, _ := env.Payload["memory_limit"].(float64)
+
+				if volumeName == "" {
+					volumeName = containerName + "-data"
+				}
+
+				spec := dockerclient.DatabaseSpec{
+					ContainerName: containerName,
+					VolumeName:    volumeName,
+					Engine:        engine,
+					EngineVersion: engineVersion,
+					Port:          int(portF),
+					RootPassword:  rootPassword,
+					DatabaseName:  databaseName,
+					Username:      username,
+					Password:      password,
+					CPULimit:      cpuLimitF,
+					MemoryLimit:   int64(memoryLimitF),
+				}
+
+				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
+				containerID, err := docker.CreateDatabaseContainer(ctx, spec)
+				if err != nil {
+					log.Printf("db_create: failed to create %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("failed to create: %v", err))
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_create",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+					return
+				}
+
+				log.Printf("db_create: created database container %s (id=%s)", containerName, containerID[:12])
+				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("database container created and started (id=%s)", containerID[:12]))
+				wsSend(ws, "db_status", client.OutgoingMessage{
+					Type: "db_status",
+					Payload: map[string]any{
+						"container_name": containerName,
+						"action":         "db_create",
+						"status":         "success",
+						"container_id":   containerID,
+					},
+				})
+			}()
+
+		case "db_start":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_start: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"action": "db_start", "status": "error", "message": "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_start", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_start: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_start", "container not found")
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_start",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("starting database container (id=%s)…", id[:12]))
+				if err := docker.StartContainer(ctx, id); err != nil {
+					log.Printf("db_start: failed to start %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("failed to start: %v", err))
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_start",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("db_start: started database container %s", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_start",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "db_stop":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_stop: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"action": "db_stop", "status": "error", "message": "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_stop", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_stop: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_stop", "container not found")
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_stop",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("stopping database container (timeout=30s, id=%s)…", id[:12]))
+				if err := docker.StopContainer(ctx, id, 30); err != nil {
+					log.Printf("db_stop: failed to stop %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("failed to stop: %v", err))
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_stop",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("db_stop: stopped database container %s", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_stop",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "db_restart":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_restart: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"action": "db_restart", "status": "error", "message": "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_restart", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_restart: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_restart", "container not found")
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_restart",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("restarting database container (timeout=30s, id=%s)…", id[:12]))
+				if err := docker.RestartContainer(ctx, id, 30); err != nil {
+					log.Printf("db_restart: failed to restart %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("failed to restart: %v", err))
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_restart",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("db_restart: restarted database container %s", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_restart",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "db_remove":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_remove: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"action": "db_remove", "status": "error", "message": "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_remove", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_remove: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_remove", "container not found")
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_remove",
+							"status":         "failed",
+							"message":        "container not found",
+						},
+					})
+					return
+				}
+				sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stopping database container before removal (timeout=10s, id=%s)…", id[:12]))
+				if err := docker.StopContainer(ctx, id, 10); err != nil {
+					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stop returned: %v (proceeding with remove)", err))
+				} else {
+					sendLifecycleLog(ws, containerName, "db_remove", "container stopped, removing…")
+				}
+				if err := docker.RemoveContainer(ctx, id, true); err != nil {
+					log.Printf("db_remove: failed to remove %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_remove",
+							"status":         "failed",
+							"message":        err.Error(),
+						},
+					})
+				} else {
+					log.Printf("db_remove: removed database container %s (volume preserved)", containerName)
+					sendLifecycleLog(ws, containerName, "db_remove", "database container removed (volume preserved)")
+					wsSend(ws, "db_status", client.OutgoingMessage{
+						Type: "db_status",
+						Payload: map[string]any{
+							"container_name": containerName,
+							"action":         "db_remove",
+							"status":         "success",
+						},
+					})
+				}
+			}()
+
+		case "db_snapshot":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				engine, _ := env.Payload["engine"].(string)
+				databaseName, _ := env.Payload["database_name"].(string)
+				username, _ := env.Payload["username"].(string)
+				password, _ := env.Payload["password"].(string)
+				snapshotID, _ := env.Payload["snapshot_id"].(string)
+				remotePath, _ := env.Payload["remote_path"].(string)
+				destType, _ := env.Payload["dest_type"].(string)
+				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_snapshot: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				if engine == "" || databaseName == "" {
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "missing required fields (engine, database_name)",
+						},
+					})
+					return
+				}
+
+				// Send uploading status
+				wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+					Type: "db_snapshot_status",
+					Payload: map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "uploading",
+					},
+				})
+
+				sendLifecycleLog(ws, containerName, "db_snapshot", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_snapshot: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_snapshot", "container not found")
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "container not found",
+						},
+					})
+					return
+				}
+
+				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("executing %s dump…", engine))
+				dumpReader, err := docker.ExecDatabaseDump(ctx, id, engine, databaseName, username, password)
+				if err != nil {
+					log.Printf("db_snapshot: dump failed for %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("dump failed: %v", err))
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("dump failed: %v", err),
+						},
+					})
+					return
+				}
+
+				// Write dump to temp file
+				tmpDir, err := os.MkdirTemp("", "lattice-snapshot-*")
+				if err != nil {
+					log.Printf("db_snapshot: failed to create temp dir: %v", err)
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
+						},
+					})
+					return
+				}
+				defer os.RemoveAll(tmpDir)
+
+				tmpFile := filepath.Join(tmpDir, "dump.sql")
+				f, err := os.Create(tmpFile)
+				if err != nil {
+					log.Printf("db_snapshot: failed to create temp file: %v", err)
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
+						},
+					})
+					return
+				}
+				if _, err := io.Copy(f, dumpReader); err != nil {
+					f.Close()
+					log.Printf("db_snapshot: failed to write dump: %v", err)
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to write dump: %v", err),
+						},
+					})
+					return
+				}
+				f.Close()
+
+				// Create backup destination and upload
+				sendLifecycleLog(ws, containerName, "db_snapshot", "uploading snapshot to backup destination…")
+				dest, err := backup.NewDestination(destType, destConfig)
+				if err != nil {
+					log.Printf("db_snapshot: failed to create backup destination: %v", err)
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
+						},
+					})
+					return
+				}
+
+				size, err := dest.Upload(ctx, tmpFile, remotePath)
+				if err != nil {
+					log.Printf("db_snapshot: upload failed for %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("upload failed: %v", err))
+					wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+						Type: "db_snapshot_status",
+						Payload: map[string]any{
+							"snapshot_id":    snapshotID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("upload failed: %v", err),
+						},
+					})
+					return
+				}
+
+				log.Printf("db_snapshot: snapshot completed for %s (size=%d bytes)", containerName, size)
+				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("snapshot completed (size=%d bytes)", size))
+				wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+					Type: "db_snapshot_status",
+					Payload: map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "completed",
+						"size_bytes":     size,
+					},
+				})
+			}()
+
+		case "db_restore":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				containerName, _ := env.Payload["container_name"].(string)
+				engine, _ := env.Payload["engine"].(string)
+				databaseName, _ := env.Payload["database_name"].(string)
+				username, _ := env.Payload["username"].(string)
+				password, _ := env.Payload["password"].(string)
+				restoreID, _ := env.Payload["restore_id"].(string)
+				remotePath, _ := env.Payload["remote_path"].(string)
+				destType, _ := env.Payload["dest_type"].(string)
+				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+
+				if containerName == "" || !validContainerName(containerName) {
+					log.Printf("db_restore: invalid or empty container name: %q", containerName)
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "invalid or missing container_name",
+						},
+					})
+					return
+				}
+				if engine == "" || databaseName == "" {
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "missing required fields (engine, database_name)",
+						},
+					})
+					return
+				}
+
+				// Send downloading status
+				wsSend(ws, "db_restore_status", client.OutgoingMessage{
+					Type: "db_restore_status",
+					Payload: map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "downloading",
+					},
+				})
+
+				sendLifecycleLog(ws, containerName, "db_restore", "downloading snapshot from backup destination…")
+				dest, err := backup.NewDestination(destType, destConfig)
+				if err != nil {
+					log.Printf("db_restore: failed to create backup destination: %v", err)
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
+						},
+					})
+					return
+				}
+
+				tmpDir, err := os.MkdirTemp("", "lattice-restore-*")
+				if err != nil {
+					log.Printf("db_restore: failed to create temp dir: %v", err)
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
+						},
+					})
+					return
+				}
+				defer os.RemoveAll(tmpDir)
+
+				tmpFile := filepath.Join(tmpDir, "restore.sql")
+				if err := dest.Download(ctx, remotePath, tmpFile); err != nil {
+					log.Printf("db_restore: download failed: %v", err)
+					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("download failed: %v", err))
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("download failed: %v", err),
+						},
+					})
+					return
+				}
+
+				sendLifecycleLog(ws, containerName, "db_restore", "looking up database container…")
+				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil || id == "" {
+					log.Printf("db_restore: container %s not found", containerName)
+					sendLifecycleLog(ws, containerName, "db_restore", "container not found")
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  "container not found",
+						},
+					})
+					return
+				}
+
+				sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restoring %s database…", engine))
+				restoreFile, err := os.Open(tmpFile)
+				if err != nil {
+					log.Printf("db_restore: failed to open temp file: %v", err)
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("failed to open restore file: %v", err),
+						},
+					})
+					return
+				}
+				defer restoreFile.Close()
+
+				if err := docker.ExecDatabaseRestore(ctx, id, engine, databaseName, username, password, restoreFile); err != nil {
+					log.Printf("db_restore: restore failed for %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restore failed: %v", err))
+					wsSend(ws, "db_restore_status", client.OutgoingMessage{
+						Type: "db_restore_status",
+						Payload: map[string]any{
+							"restore_id":     restoreID,
+							"container_name": containerName,
+							"status":         "failed",
+							"error_message":  fmt.Sprintf("restore failed: %v", err),
+						},
+					})
+					return
+				}
+
+				log.Printf("db_restore: restore completed for %s", containerName)
+				sendLifecycleLog(ws, containerName, "db_restore", "database restore completed")
+				wsSend(ws, "db_restore_status", client.OutgoingMessage{
+					Type: "db_restore_status",
+					Payload: map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "completed",
+					},
+				})
+			}()
+
+		case "db_update_schedule":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				instanceIDFloat, _ := env.Payload["instance_id"].(float64)
+				instanceID := int(instanceIDFloat)
+				enabled, _ := env.Payload["enabled"].(bool)
+
+				if !enabled {
+					snapshotScheduler.RemoveSchedule(instanceID)
+					log.Printf("db_update_schedule: removed schedule for instance %d", instanceID)
+					wsSend(ws, "db_schedule_status", client.OutgoingMessage{
+						Type: "db_schedule_status",
+						Payload: map[string]any{
+							"instance_id": instanceID,
+							"status":      "removed",
+						},
+					})
+					return
+				}
+
+				containerName, _ := env.Payload["container_name"].(string)
+				engine, _ := env.Payload["engine"].(string)
+				databaseName, _ := env.Payload["database_name"].(string)
+				username, _ := env.Payload["username"].(string)
+				password, _ := env.Payload["password"].(string)
+				cron, _ := env.Payload["cron"].(string)
+				retentionF, _ := env.Payload["retention_count"].(float64)
+				backupDest, _ := env.Payload["backup_dest"].(map[string]any)
+
+				snapshotScheduler.UpdateSchedule(scheduler.Job{
+					InstanceID:     instanceID,
+					ContainerName:  containerName,
+					Engine:         engine,
+					DatabaseName:   databaseName,
+					Username:       username,
+					Password:       password,
+					Cron:           cron,
+					RetentionCount: int(retentionF),
+					BackupDest:     backupDest,
+				})
+
+				log.Printf("db_update_schedule: updated schedule for instance %d (cron=%s)", instanceID, cron)
+				wsSend(ws, "db_schedule_status", client.OutgoingMessage{
+					Type: "db_schedule_status",
+					Payload: map[string]any{
+						"instance_id": instanceID,
+						"status":      "updated",
+						"cron":        cron,
+					},
+				})
+			}()
+
+		case "backup_dest_test":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				destType, _ := env.Payload["dest_type"].(string)
+				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+
+				dest, err := backup.NewDestination(destType, destConfig)
+				if err != nil {
+					log.Printf("backup_dest_test: failed to create destination: %v", err)
+					wsSend(ws, "backup_dest_test_result", client.OutgoingMessage{
+						Type: "backup_dest_test_result",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to create destination: %v", err),
+						},
+					})
+					return
+				}
+
+				if err := dest.Test(ctx); err != nil {
+					log.Printf("backup_dest_test: test failed: %v", err)
+					wsSend(ws, "backup_dest_test_result", client.OutgoingMessage{
+						Type: "backup_dest_test_result",
+						Payload: map[string]any{
+							"command_id": env.CommandID,
+							"status":     "failed",
+							"message":    fmt.Sprintf("connection test failed: %v", err),
+						},
+					})
+					return
+				}
+
+				log.Printf("backup_dest_test: test passed for %s destination", destType)
+				wsSend(ws, "backup_dest_test_result", client.OutgoingMessage{
+					Type: "backup_dest_test_result",
+					Payload: map[string]any{
+						"command_id": env.CommandID,
+						"status":     "success",
+						"message":    "connection test passed",
+					},
+				})
+			}()
+
+		case "db_delete_snapshot_file":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				destType, _ := env.Payload["dest_type"].(string)
+				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+				remotePath, _ := env.Payload["remote_path"].(string)
+				snapshotID, _ := env.Payload["snapshot_id"].(string)
+
+				if remotePath == "" {
+					wsSend(ws, "db_delete_snapshot_result", client.OutgoingMessage{
+						Type: "db_delete_snapshot_result",
+						Payload: map[string]any{
+							"snapshot_id": snapshotID,
+							"status":     "failed",
+							"message":    "missing remote_path",
+						},
+					})
+					return
+				}
+
+				dest, err := backup.NewDestination(destType, destConfig)
+				if err != nil {
+					log.Printf("db_delete_snapshot_file: failed to create destination: %v", err)
+					wsSend(ws, "db_delete_snapshot_result", client.OutgoingMessage{
+						Type: "db_delete_snapshot_result",
+						Payload: map[string]any{
+							"snapshot_id": snapshotID,
+							"status":     "failed",
+							"message":    fmt.Sprintf("failed to create destination: %v", err),
+						},
+					})
+					return
+				}
+
+				if err := dest.Delete(ctx, remotePath); err != nil {
+					log.Printf("db_delete_snapshot_file: delete failed: %v", err)
+					wsSend(ws, "db_delete_snapshot_result", client.OutgoingMessage{
+						Type: "db_delete_snapshot_result",
+						Payload: map[string]any{
+							"snapshot_id": snapshotID,
+							"status":     "failed",
+							"message":    fmt.Sprintf("delete failed: %v", err),
+						},
+					})
+					return
+				}
+
+				log.Printf("db_delete_snapshot_file: deleted %s", remotePath)
+				wsSend(ws, "db_delete_snapshot_result", client.OutgoingMessage{
+					Type: "db_delete_snapshot_result",
+					Payload: map[string]any{
+						"snapshot_id": snapshotID,
+						"status":     "success",
+					},
+				})
+			}()
 		}
 	})
 
@@ -1925,6 +2735,190 @@ func sendLifecycleLog(ws *client.WSClient, containerName, event, message string)
 			"container_name": containerName,
 			"event":          event,
 			"message":        message,
+		},
+	})
+}
+
+// handleScheduledSnapshot executes a database snapshot triggered by the scheduler.
+// It follows the same logic as the db_snapshot message handler.
+func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, job scheduler.Job) {
+	if job.BackupDest == nil {
+		log.Printf("scheduled snapshot for instance %d: no backup destination configured", job.InstanceID)
+		return
+	}
+
+	destType, ok := job.BackupDest["type"].(string)
+	if !ok || destType == "" {
+		log.Printf("scheduled snapshot for instance %d: missing backup destination type", job.InstanceID)
+		return
+	}
+	destConfig, _ := job.BackupDest["config"].(map[string]any)
+	if destConfig == nil {
+		log.Printf("scheduled snapshot for instance %d: missing backup destination config", job.InstanceID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	containerName := job.ContainerName
+	snapshotID := fmt.Sprintf("scheduled-%d-%d", job.InstanceID, time.Now().Unix())
+
+	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot triggered (instance=%d)", job.InstanceID))
+
+	wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+		Type: "db_snapshot_status",
+		Payload: map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "uploading",
+		},
+	})
+
+	id, err := docker.FindContainerByName(ctx, containerName)
+	if err != nil || id == "" {
+		log.Printf("scheduled snapshot: container %s not found", containerName)
+		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot failed: container not found")
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  "container not found",
+			},
+		})
+		return
+	}
+
+	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("executing %s dump (scheduled)…", job.Engine))
+	dumpReader, err := docker.ExecDatabaseDump(ctx, id, job.Engine, job.DatabaseName, job.Username, job.Password)
+	if err != nil {
+		log.Printf("scheduled snapshot: dump failed for %s: %v", containerName, err)
+		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled dump failed: %v", err))
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("dump failed: %v", err),
+			},
+		})
+		return
+	}
+
+	// Write dump to temp file
+	tmpDir, err := os.MkdirTemp("", "lattice-scheduled-snapshot-*")
+	if err != nil {
+		log.Printf("scheduled snapshot: failed to create temp dir: %v", err)
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
+			},
+		})
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpFile := filepath.Join(tmpDir, "dump.sql")
+	f, err := os.Create(tmpFile)
+	if err != nil {
+		log.Printf("scheduled snapshot: failed to create temp file: %v", err)
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
+			},
+		})
+		return
+	}
+	if _, err := io.Copy(f, dumpReader); err != nil {
+		f.Close()
+		log.Printf("scheduled snapshot: failed to write dump: %v", err)
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("failed to write dump: %v", err),
+			},
+		})
+		return
+	}
+	f.Close()
+
+	// Determine remote path
+	remotePath := fmt.Sprintf("%s/%s-%s.sql", containerName, job.DatabaseName, time.Now().UTC().Format("20060102-150405"))
+
+	sendLifecycleLog(ws, containerName, "db_snapshot", "uploading scheduled snapshot to backup destination…")
+	dest, err := backup.NewDestination(destType, destConfig)
+	if err != nil {
+		log.Printf("scheduled snapshot: failed to create backup destination: %v", err)
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
+			},
+		})
+		return
+	}
+
+	size, err := dest.Upload(ctx, tmpFile, remotePath)
+	if err != nil {
+		log.Printf("scheduled snapshot: upload failed for %s: %v", containerName, err)
+		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled upload failed: %v", err))
+		wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+			Type: "db_snapshot_status",
+			Payload: map[string]any{
+				"snapshot_id":    snapshotID,
+				"container_name": containerName,
+				"instance_id":    job.InstanceID,
+				"scheduled":      true,
+				"status":         "failed",
+				"error_message":  fmt.Sprintf("upload failed: %v", err),
+			},
+		})
+		return
+	}
+
+	log.Printf("scheduled snapshot: completed for %s (size=%d bytes)", containerName, size)
+	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot completed (size=%d bytes)", size))
+	wsSend(ws, "db_snapshot_status", client.OutgoingMessage{
+		Type: "db_snapshot_status",
+		Payload: map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "completed",
+			"size_bytes":     size,
+			"remote_path":    remotePath,
 		},
 	})
 }
