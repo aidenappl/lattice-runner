@@ -63,6 +63,8 @@ type DeploymentSpec struct {
 	DeploymentID int             `json:"deployment_id"`
 	StackName    string          `json:"stack_name"`
 	Strategy     string          `json:"strategy"`
+	Targeted     bool            `json:"targeted"`
+	Force        bool            `json:"force"`
 	Containers   []ContainerSpec `json:"containers"`
 	Networks     []NetworkSpec   `json:"networks"`
 	Volumes      []VolumeSpec    `json:"volumes"`
@@ -212,7 +214,18 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 	// Clean up stale containers from this stack that are no longer in the spec
 	// (e.g. renamed or removed from compose). This prevents port conflicts and
 	// orphaned containers when compose services are renamed.
-	e.cleanupStaleContainers(ctx, spec)
+	// Skip cleanup for targeted deploys — the spec only contains a subset of
+	// the stack's containers, so non-targeted containers must not be removed.
+	if !spec.Targeted {
+		e.cleanupStaleContainers(ctx, spec)
+	}
+
+	// Force deploy: remove ALL existing stack containers (including ones in the
+	// spec) so every container is recreated from scratch. This is used after
+	// failed deployments to guarantee a clean slate.
+	if spec.Force {
+		e.forceRemoveAllStackContainers(ctx, spec)
+	}
 
 	var err error
 	strategyName := spec.Strategy
@@ -324,6 +337,39 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 			if err := e.Docker.StopAndRemoveContainer(ctx, c.ID, 10); err != nil {
 				log.Printf("deploy: cleanup: failed to remove %s: %v", name, err)
 			}
+		}
+	}
+}
+
+// forceRemoveAllStackContainers stops and removes every container belonging to
+// this stack, including containers that ARE in the new spec. This guarantees a
+// clean slate so the deployment strategy recreates everything from scratch.
+func (e *Executor) forceRemoveAllStackContainers(ctx context.Context, spec DeploymentSpec) {
+	containers, err := e.Docker.ListContainers(ctx, "")
+	if err != nil {
+		log.Printf("deploy: force cleanup: failed to list containers: %v", err)
+		return
+	}
+
+	for _, c := range containers {
+		if c.Labels["managed-by"] != "lattice" {
+			continue
+		}
+		if c.Labels["lattice-stack"] != spec.StackName {
+			continue
+		}
+
+		name := ""
+		if len(c.Names) > 0 {
+			name = strings.TrimPrefix(c.Names[0], "/")
+		}
+
+		log.Printf("deploy: force cleanup: removing %s", name)
+		e.reportProgress(spec.DeploymentID, "deploying",
+			fmt.Sprintf("force removing container %s", name),
+			map[string]any{"step": "force_cleanup"})
+		if err := e.Docker.StopAndRemoveContainer(ctx, c.ID, 10); err != nil {
+			log.Printf("deploy: force cleanup: failed to remove %s: %v", name, err)
 		}
 	}
 }
