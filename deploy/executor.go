@@ -363,6 +363,9 @@ func (e *Executor) forceRemoveAllStackContainers(ctx context.Context, spec Deplo
 		if len(c.Names) > 0 {
 			name = strings.TrimPrefix(c.Names[0], "/")
 		}
+		if name == "" {
+			name = c.ID[:12]
+		}
 
 		log.Printf("deploy: force cleanup: removing %s", name)
 		e.reportProgress(spec.DeploymentID, "deploying",
