@@ -872,15 +872,19 @@ func main() {
 				sendLifecycleLog(ws, containerName, "recreate", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
+					// Try canonical variants (suffixed names from deploys)
+					id, _ = executor.FindCanonicalContainer(ctx, containerName)
+				}
+				if id == "" {
 					log.Printf("container %s not found for recreate", containerName)
-					sendLifecycleLog(ws, containerName, "recreate", "container not found")
+					sendLifecycleLog(ws, containerName, "recreate", "container not found — run a stack deploy to create it")
 					_ = ws.SendJSON(client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
 							"action":         "recreate",
 							"status":         "failed",
-							"message":        "container not found",
+							"message":        "container not found — deploy the stack to create it",
 						},
 					})
 					return

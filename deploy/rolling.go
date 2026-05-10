@@ -39,7 +39,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			oldImage := cSpec.Image + ":" + tag
 			oldID := ""
 			// Find existing container — could be exact name or a suffixed variant
-			if id, _ := e.findCanonicalContainer(ctx, name); id != "" {
+			if id, _ := e.FindCanonicalContainer(ctx, name); id != "" {
 				oldID = id
 				if info, err := e.Docker.InspectContainer(ctx, id); err == nil {
 					oldImage = info.Config.Image
@@ -262,8 +262,8 @@ type oldContainer struct {
 	name string
 }
 
-// findCanonicalContainer finds a container by exact name or by canonical prefix with suffix.
-func (e *Executor) findCanonicalContainer(ctx context.Context, canonicalName string) (string, string) {
+// FindCanonicalContainer finds a container by exact name or by canonical prefix with suffix.
+func (e *Executor) FindCanonicalContainer(ctx context.Context, canonicalName string) (string, string) {
 	// Try exact name first
 	if id, err := e.Docker.FindContainerByName(ctx, canonicalName); err == nil && id != "" {
 		return id, canonicalName
