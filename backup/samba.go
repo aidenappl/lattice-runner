@@ -13,6 +13,18 @@ func smbEscape(s string) string {
 	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
+// validateSMBPath hard-rejects characters that could break out of a quoted
+// smbclient -c argument or chain additional smbclient/shell commands. smbclient
+// separates commands in a -c script with ';' and newlines; backticks, '$' and
+// backslash escapes are rejected defensively. Callers pass orchestrator-supplied
+// remote paths, so this is the injection guard for the Samba backend.
+func validateSMBPath(p string) error {
+	if strings.ContainsAny(p, ";`$\"\\\n\r") {
+		return fmt.Errorf("samba: remote path contains disallowed characters")
+	}
+	return nil
+}
+
 type sambaDestination struct {
 	server   string
 	share    string
@@ -33,6 +45,9 @@ func newSambaDestination(config map[string]any) (*sambaDestination, error) {
 	}
 	if strings.Contains(username, "%") {
 		return nil, fmt.Errorf("samba: username must not contain '%%'")
+	}
+	if err := validateSMBPath(path); err != nil {
+		return nil, err
 	}
 
 	return &sambaDestination{
@@ -56,6 +71,9 @@ func (d *sambaDestination) remoteDir() string {
 }
 
 func (d *sambaDestination) Upload(ctx context.Context, localPath, remotePath string) (int64, error) {
+	if err := validateSMBPath(remotePath); err != nil {
+		return 0, err
+	}
 	remote := remotePath
 	if d.remoteDir() != "" {
 		remote = d.remoteDir() + "/" + remotePath
@@ -94,6 +112,9 @@ func (d *sambaDestination) Upload(ctx context.Context, localPath, remotePath str
 }
 
 func (d *sambaDestination) Download(ctx context.Context, remotePath, localPath string) error {
+	if err := validateSMBPath(remotePath); err != nil {
+		return err
+	}
 	remote := remotePath
 	if d.remoteDir() != "" {
 		remote = d.remoteDir() + "/" + remotePath
@@ -129,6 +150,9 @@ func (d *sambaDestination) Test(ctx context.Context) error {
 }
 
 func (d *sambaDestination) Delete(ctx context.Context, remotePath string) error {
+	if err := validateSMBPath(remotePath); err != nil {
+		return err
+	}
 	remote := remotePath
 	if d.remoteDir() != "" {
 		remote = d.remoteDir() + "/" + remotePath

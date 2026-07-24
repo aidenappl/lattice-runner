@@ -1022,6 +1022,22 @@ func main() {
 				// Extract expected hash from the orchestrator payload for integrity verification
 				expectedHash, _ := env.Payload["expected_hash"].(string)
 
+				// Fail closed: without an expected hash we cannot verify the script's
+				// integrity, so we refuse to download or execute it. Running an unverified
+				// script here is a fleet-wide remote-code-execution risk.
+				if expectedHash == "" {
+					log.Println("upgrade ABORTED: no expected_hash provided by orchestrator — refusing to run unverified script")
+					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+						Type: "worker_action_status",
+						Payload: map[string]any{
+							"action":  "upgrade_runner",
+							"status":  "failed",
+							"message": "upgrade aborted: no expected_hash provided; refusing to run an unverified upgrade script",
+						},
+					})
+					return
+				}
+
 				// Derive upgrade URL from the orchestrator connection URL
 				upgradeBase := cfg.OrchestratorURL
 				upgradeBase = strings.Replace(upgradeBase, "ws://", "http://", 1)
@@ -1081,7 +1097,7 @@ func main() {
 				actualHashHex := hex.EncodeToString(actualHash[:])
 				log.Printf("upgrade script hash: %s", actualHashHex)
 
-				if expectedHash != "" && actualHashHex != expectedHash {
+				if actualHashHex != expectedHash {
 					log.Printf("upgrade ABORTED: hash mismatch — expected %s, got %s", expectedHash, actualHashHex)
 					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
@@ -1092,9 +1108,6 @@ func main() {
 						},
 					})
 					return
-				}
-				if expectedHash == "" {
-					log.Println("upgrade WARNING: no expected_hash provided by orchestrator, skipping verification")
 				}
 
 				// Make executable and run
@@ -2451,8 +2464,8 @@ func main() {
 						Type: "db_delete_snapshot_result",
 						Payload: map[string]any{
 							"snapshot_id": snapshotID,
-							"status":     "failed",
-							"message":    "missing remote_path",
+							"status":      "failed",
+							"message":     "missing remote_path",
 						},
 					})
 					return
@@ -2465,8 +2478,8 @@ func main() {
 						Type: "db_delete_snapshot_result",
 						Payload: map[string]any{
 							"snapshot_id": snapshotID,
-							"status":     "failed",
-							"message":    fmt.Sprintf("failed to create destination: %v", err),
+							"status":      "failed",
+							"message":     fmt.Sprintf("failed to create destination: %v", err),
 						},
 					})
 					return
@@ -2478,8 +2491,8 @@ func main() {
 						Type: "db_delete_snapshot_result",
 						Payload: map[string]any{
 							"snapshot_id": snapshotID,
-							"status":     "failed",
-							"message":    fmt.Sprintf("delete failed: %v", err),
+							"status":      "failed",
+							"message":     fmt.Sprintf("delete failed: %v", err),
 						},
 					})
 					return
@@ -2490,7 +2503,7 @@ func main() {
 					Type: "db_delete_snapshot_result",
 					Payload: map[string]any{
 						"snapshot_id": snapshotID,
-						"status":     "success",
+						"status":      "success",
 					},
 				})
 			}()
@@ -2722,7 +2735,7 @@ func main() {
 			"message": "runner shutting down gracefully",
 		},
 	})
-	cancel() // signal all goroutines to stop
+	cancel()                    // signal all goroutines to stop
 	time.Sleep(2 * time.Second) // let in-flight work finish
 	ws.Drain(5 * time.Second)   // drain remaining messages
 	ws.Close()

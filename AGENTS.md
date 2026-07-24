@@ -242,7 +242,7 @@ silently ignored.
 | `pull_image` | `image`, `auth?` | Pull image with optional registry auth | `container_status`, `lifecycle_log` |
 | `force_remove` | `container_name` | Stop (5s) + force-remove | `worker_action_status` |
 | `reboot_os` | — | `sudo reboot` (5-min cooldown enforced) | `worker_action_status` |
-| `upgrade_runner` | `expected_hash?` | Download install script from derived URL, **verify SHA-256**, run it | `worker_action_status` |
+| `upgrade_runner` | `expected_hash` (**required**) | Download install script from derived URL, **verify SHA-256** against `expected_hash`, run it. **Fails closed:** an empty/missing `expected_hash` aborts the upgrade before any download/execute (no unverified script is ever run) | `worker_action_status` |
 | `stop_all` | — | Stop every running container | `worker_action_status`, `lifecycle_log` |
 | `start_all` | — | Start every non-running container | `worker_action_status`, `lifecycle_log` |
 | `list_volumes` | — | List Docker volumes | `list_volumes_response` |
@@ -460,7 +460,11 @@ or `go-monitor`.
 - **Respect the global guardrails:** never push/deploy without explicit instruction, never modify
   `Dockerfile`/CI/compose unless asked, never create/modify `.env`.
 - **`upgrade_runner` must keep verifying the script hash** — dropping the SHA-256 check turns a
-  worker into a remote-code-execution target.
+  worker into a remote-code-execution target. It **fails closed**: a missing/empty `expected_hash`
+  aborts the upgrade (never runs an unverified script). Don't reintroduce a "warn and run anyway" path.
+- **Validate orchestrator-supplied Samba `remote_path`** (`backup/samba.go` `validateSMBPath`) before
+  building any `smbclient -c` command — `;`, newlines, backticks, `$`, `"`, and backslashes are
+  rejected to prevent smbclient/command injection.
 
 ## Verification — always before "done"
 
