@@ -325,8 +325,11 @@ carries a `DeploymentSpec`. `Executor.Execute` (in `deploy/executor.go`):
    - **rolling** (`rolling.go`, default): per container, pull the new image, create it under a
      `<name>-<6charsuffix>` temp name, health-gate it, then stop/remove the old and rename the new
      to the canonical name. Keeps snapshots to `rollbackContainers` on failure; cleans up orphans.
-   - **blue-green** (`bluegreen.go`): start all "green" containers *without* host port bindings,
-     health-check, then swap ports over to green and retire the old ("blue").
+   - **blue-green** (`bluegreen.go`): start all "green" containers *without* host port bindings
+     **and without the canonical `NetworkAliases`** (blue is still live under those aliases — sharing
+     them would make Docker's embedded DNS round-robin the service name onto the not-yet-ready green),
+     health-check by container ID, then swap ports + canonical aliases over to green and retire the
+     old ("blue").
    - **canary** (`canary.go`): start one `<name>-canary`, monitor for ~30s; if healthy, proceed as
      a rolling deploy; otherwise abort.
 7. `postDeployVerify` — 6 checks at 10s intervals (60s). Flags containers that vanished, are stuck

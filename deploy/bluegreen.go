@@ -56,19 +56,27 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			// In a real blue-green, you'd use a reverse proxy switch
 			// For simplicity, we create green, verify health, then swap names
 			dockerSpec := dockerclient.ContainerSpec{
-				Name:           greenName,
-				Image:          cSpec.Image,
-				Tag:            cSpec.Tag,
-				PortMappings:   nil, // Don't bind ports yet
-				EnvVars:        cSpec.EnvVars,
-				Volumes:        cSpec.Volumes,
-				CPULimit:       cSpec.CPULimit,
-				MemoryLimit:    cSpec.MemoryLimit,
-				RestartPolicy:  cSpec.RestartPolicy,
-				Command:        cSpec.Command,
-				Entrypoint:     cSpec.Entrypoint,
-				Networks:       cSpec.Networks,
-				NetworkAliases: cSpec.NetworkAliases,
+				Name:          greenName,
+				Image:         cSpec.Image,
+				Tag:           cSpec.Tag,
+				PortMappings:  nil, // Don't bind ports yet
+				EnvVars:       cSpec.EnvVars,
+				Volumes:       cSpec.Volumes,
+				CPULimit:      cSpec.CPULimit,
+				MemoryLimit:   cSpec.MemoryLimit,
+				RestartPolicy: cSpec.RestartPolicy,
+				Command:       cSpec.Command,
+				Entrypoint:    cSpec.Entrypoint,
+				Networks:      cSpec.Networks,
+				// Deliberately omit the canonical NetworkAliases on green. Blue is
+				// still live and serving under those aliases; if green joined the
+				// network with the same service-name aliases, Docker's embedded DNS
+				// would round-robin the service name across BOTH blue and the
+				// not-yet-ready green, sending live traffic to an unhealthy container.
+				// Green is reachable by its own container name for diagnostics, and
+				// health checks (phase 2) inspect by container ID, not DNS. The
+				// canonical aliases are attached only to the final container at swap.
+				NetworkAliases: nil,
 				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
