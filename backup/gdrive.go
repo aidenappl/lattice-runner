@@ -60,19 +60,74 @@ func (d *gdriveDestination) Upload(ctx context.Context, localPath, remotePath st
 		return 0, fmt.Errorf("stat file: %w", err)
 	}
 
-	driveFile := &drive.File{
-		Name: remotePath,
-	}
-	if d.folderID != "" {
-		driveFile.Parents = []string{d.folderID}
+	// Google Drive permits multiple files with the same name in a folder. If a
+	// prior upload (or a retried snapshot) already created a file with this name,
+	// a plain Create would leave duplicates behind — and Download/Delete resolve
+	// a name to the *first* match, so retention could then act on the wrong copy.
+	// Keep the name a stable, single object: update the existing file in place if
+	// there is one, and trash any extra same-named duplicates.
+	existing, err := d.findByName(ctx, remotePath)
+	if err != nil {
+		return 0, fmt.Errorf("gdrive lookup: %w", err)
 	}
 
-	_, err = d.service.Files.Create(driveFile).Media(file).Context(ctx).Do()
-	if err != nil {
-		return 0, fmt.Errorf("gdrive upload: %w", err)
+	if len(existing) == 0 {
+		driveFile := &drive.File{Name: remotePath}
+		if d.folderID != "" {
+			driveFile.Parents = []string{d.folderID}
+		}
+		if _, err := d.service.Files.Create(driveFile).Media(file).Context(ctx).Do(); err != nil {
+			return 0, fmt.Errorf("gdrive upload: %w", err)
+		}
+		return stat.Size(), nil
+	}
+
+	// Update the first existing file's content (do NOT set Parents on update —
+	// changing parents requires addParents/removeParents and would error here).
+	if _, err := d.service.Files.Update(existing[0], &drive.File{}).Media(file).Context(ctx).Do(); err != nil {
+		return 0, fmt.Errorf("gdrive upload (update): %w", err)
+	}
+	// Trash any leftover duplicates so the name resolves to exactly one object.
+	for _, dupID := range existing[1:] {
+		if err := d.service.Files.Delete(dupID).Context(ctx).Do(); err != nil {
+			// Best-effort: a failed dedupe doesn't invalidate the upload itself.
+			continue
+		}
 	}
 
 	return stat.Size(), nil
+}
+
+// findByName returns the ids of all non-trashed files matching name in the
+// destination folder (or across the drive when no folder is configured).
+func (d *gdriveDestination) findByName(ctx context.Context, name string) ([]string, error) {
+	escapedName := strings.ReplaceAll(name, "\\", "\\\\")
+	escapedName = strings.ReplaceAll(escapedName, "'", "\\'")
+	query := fmt.Sprintf("name = '%s' and trashed = false", escapedName)
+	if d.folderID != "" {
+		query += fmt.Sprintf(" and '%s' in parents", d.folderID)
+	}
+
+	var ids []string
+	pageToken := ""
+	for {
+		call := d.service.Files.List().Q(query).PageSize(100).Fields("nextPageToken, files(id)").Context(ctx)
+		if pageToken != "" {
+			call = call.PageToken(pageToken)
+		}
+		fileList, err := call.Do()
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range fileList.Files {
+			ids = append(ids, f.Id)
+		}
+		if fileList.NextPageToken == "" {
+			break
+		}
+		pageToken = fileList.NextPageToken
+	}
+	return ids, nil
 }
 
 func (d *gdriveDestination) Download(ctx context.Context, remotePath, localPath string) error {
