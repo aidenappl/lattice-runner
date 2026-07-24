@@ -38,7 +38,7 @@ func TestCronMatches(t *testing.T) {
 		{"midnight-1st-wrong-day", "0 0 1 * *", time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC), false},
 
 		// Day of week (0 = Sunday)
-		{"sunday-midnight-match", "0 0 * * 0", time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC), true},   // 2025-06-15 is Sunday
+		{"sunday-midnight-match", "0 0 * * 0", time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC), true},      // 2025-06-15 is Sunday
 		{"sunday-midnight-wrong-day", "0 0 * * 0", time.Date(2025, 6, 16, 0, 0, 0, 0, time.UTC), false}, // Monday
 
 		// Comma-separated list
@@ -55,7 +55,7 @@ func TestCronMatches(t *testing.T) {
 		{"range-9-17-no-match-18", "0 9-17 * * *", time.Date(2025, 6, 15, 18, 0, 0, 0, time.UTC), false},
 
 		// Weekday working hours
-		{"weekday-9to5-match", "0 9-17 * * 1-5", time.Date(2025, 6, 16, 9, 0, 0, 0, time.UTC), true},   // Monday
+		{"weekday-9to5-match", "0 9-17 * * 1-5", time.Date(2025, 6, 16, 9, 0, 0, 0, time.UTC), true},     // Monday
 		{"weekday-9to5-saturday", "0 9-17 * * 1-5", time.Date(2025, 6, 14, 9, 0, 0, 0, time.UTC), false}, // Saturday
 		{"weekday-9to5-sunday", "0 9-17 * * 1-5", time.Date(2025, 6, 15, 9, 0, 0, 0, time.UTC), false},   // Sunday
 
@@ -170,9 +170,9 @@ func TestSchedulerFire(t *testing.T) {
 
 	t.Run("fires-matching-jobs", func(t *testing.T) {
 		// June 15, 2025, 14:30 UTC
-		s.UpdateSchedule(Job{InstanceID: 1, ContainerName: "db1", Cron: "* * * * *"})      // matches any time
-		s.UpdateSchedule(Job{InstanceID: 2, ContainerName: "db2", Cron: "30 14 * * *"})    // matches 14:30
-		s.UpdateSchedule(Job{InstanceID: 3, ContainerName: "db3", Cron: "0 0 1 1 *"})     // only Jan 1 midnight
+		s.UpdateSchedule(Job{InstanceID: 1, ContainerName: "db1", Cron: "* * * * *"})   // matches any time
+		s.UpdateSchedule(Job{InstanceID: 2, ContainerName: "db2", Cron: "30 14 * * *"}) // matches 14:30
+		s.UpdateSchedule(Job{InstanceID: 3, ContainerName: "db3", Cron: "0 0 1 1 *"})   // only Jan 1 midnight
 
 		s.checkAndFire()
 

@@ -71,24 +71,24 @@ type DeploymentSpec struct {
 }
 
 type ContainerSpec struct {
-	ID            int               `json:"id"`
-	Name          string            `json:"name"`
-	Image         string            `json:"image"`
-	Tag           string            `json:"tag"`
-	PortMappings  []PortMapping     `json:"port_mappings"`
-	EnvVars       map[string]string `json:"env_vars"`
-	Volumes       map[string]string `json:"volumes"`
-	CPULimit      float64           `json:"cpu_limit"`
-	MemoryLimit   int64             `json:"memory_limit"`
-	Replicas      int               `json:"replicas"`
-	RestartPolicy string            `json:"restart_policy"`
-	Command       []string          `json:"command"`
-	Entrypoint    []string          `json:"entrypoint"`
+	ID             int               `json:"id"`
+	Name           string            `json:"name"`
+	Image          string            `json:"image"`
+	Tag            string            `json:"tag"`
+	PortMappings   []PortMapping     `json:"port_mappings"`
+	EnvVars        map[string]string `json:"env_vars"`
+	Volumes        map[string]string `json:"volumes"`
+	CPULimit       float64           `json:"cpu_limit"`
+	MemoryLimit    int64             `json:"memory_limit"`
+	Replicas       int               `json:"replicas"`
+	RestartPolicy  string            `json:"restart_policy"`
+	Command        []string          `json:"command"`
+	Entrypoint     []string          `json:"entrypoint"`
 	Networks       []string          `json:"networks"`
-	NetworkAliases []string         `json:"network_aliases,omitempty"`
-	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
-	RegistryAuth  *RegistryAuth     `json:"registry_auth,omitempty"`
-	DependsOn     []string          `json:"depends_on,omitempty"`
+	NetworkAliases []string          `json:"network_aliases,omitempty"`
+	HealthCheck    *HealthCheck      `json:"health_check,omitempty"`
+	RegistryAuth   *RegistryAuth     `json:"registry_auth,omitempty"`
+	DependsOn      []string          `json:"depends_on,omitempty"`
 }
 
 type HealthCheck struct {

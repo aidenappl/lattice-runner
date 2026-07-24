@@ -113,7 +113,7 @@ func cronMatches(expr string, t time.Time) bool {
 	minute := t.Minute()          // 0-59
 	hour := t.Hour()              // 0-23
 	dayOfMonth := t.Day()         // 1-31
-	month := int(t.Month())      // 1-12
+	month := int(t.Month())       // 1-12
 	dayOfWeek := int(t.Weekday()) // 0-6, 0=Sunday
 
 	checks := []struct {

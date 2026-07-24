@@ -225,4 +225,3 @@ refresh();setInterval(refresh,5000);setInterval(loadLogs,10000);
 </script>
 </body>
 </html>`
-
