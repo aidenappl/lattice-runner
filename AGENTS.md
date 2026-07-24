@@ -372,7 +372,7 @@ Read in `config/config.go` (unless noted). Required vars **panic** if missing.
 | `ORCHESTRATOR_URL` | **Yes** | — | WebSocket URL to `lattice-api` (`wss://…/ws/worker`). `ws://` rejected unless `ALLOW_INSECURE`. |
 | `WORKER_TOKEN` | **Yes** | — | Worker auth token; sent as `?token=` on the WS handshake. |
 | `WORKER_NAME` | No | hostname | Human-readable worker name in registration. |
-| `HEARTBEAT_INTERVAL` | No | `10s` | Metrics/heartbeat cadence. (README/CLAUDE.md say 15s; code default is 10s.) |
+| `HEARTBEAT_INTERVAL` | No | `10s` | Metrics/heartbeat cadence. (README says 15s; code default is 10s.) |
 | `RECONNECT_INTERVAL` | No | `5s` | WS reconnect backoff. |
 | `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port. |
 | `LATTICE_URL` | No | `""` | Link back to the orchestrator UI, shown on the dashboard. |
