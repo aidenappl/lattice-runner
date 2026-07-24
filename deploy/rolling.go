@@ -193,12 +193,16 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				if createErr != nil {
 					e.reportProgress(spec.DeploymentID, "deploying",
 						fmt.Sprintf("[%d/%d] failed to create %s after port swap: %v", i+1, len(spec.Containers), deployName, createErr), nil)
-					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					// The old container was already stopped to free ports; include this
+					// in-flight index so its predecessor is restored, not just the
+					// previously-completed containers.
+					e.rollbackContainers(ctx, spec, snapshots, appendIdx(updatedContainers, snapshotIdx))
 					return fmt.Errorf("create container %s: %w", name, createErr)
 				}
 			} else {
 				// No port conflict — stop old containers first if needed, then create
-				if len(oldContainers) > 0 {
+				stoppedOld := len(oldContainers) > 0
+				if stoppedOld {
 					for _, old := range oldContainers {
 						log.Printf("deploy: stopping old container %s (id=%s)", old.name, old.id[:12])
 						if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
@@ -213,16 +217,24 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				if createErr != nil {
 					e.reportProgress(spec.DeploymentID, "deploying",
 						fmt.Sprintf("[%d/%d] failed to create %s: %v", i+1, len(spec.Containers), deployName, createErr), nil)
-					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+					// If we already stopped a predecessor, include this in-flight index
+					// so it gets restarted rather than left down.
+					rb := updatedContainers
+					if stoppedOld {
+						rb = appendIdx(updatedContainers, snapshotIdx)
+					}
+					e.rollbackContainers(ctx, spec, snapshots, rb)
 					return fmt.Errorf("create container %s: %w", name, createErr)
 				}
 			}
 
-			// Verify new container is running
+			// Verify new container is running. The predecessor was already stopped
+			// (both the port-swap and no-port branches), so include this in-flight
+			// index in the rollback set to restore it.
 			if info, err := e.Docker.InspectContainer(ctx, containerID); err != nil || !info.State.Running {
 				e.reportProgress(spec.DeploymentID, "deploying",
 					fmt.Sprintf("[%d/%d] container %s created but not running", i+1, len(spec.Containers), deployName), nil)
-				e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
+				e.rollbackContainers(ctx, spec, snapshots, appendIdx(updatedContainers, snapshotIdx))
 				return fmt.Errorf("container %s not running after create", name)
 			}
 
@@ -254,6 +266,14 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 	}
 
 	return nil
+}
+
+// appendIdx returns a new slice with idx appended, without mutating base. Used to
+// add the in-flight container index to the rollback set on a mid-swap failure.
+func appendIdx(base []int, idx int) []int {
+	out := make([]int, len(base), len(base)+1)
+	copy(out, base)
+	return append(out, idx)
 }
 
 // oldContainer tracks an existing container found by canonical name matching.
@@ -298,7 +318,10 @@ func (e *Executor) findAllMatchingContainers(ctx context.Context, canonicalName 
 }
 
 // isCanonicalVariant checks if dockerName is a variant of canonicalName.
-// Matches: name-XXXXXX (suffix), name-retired-*, name-lattice-updating
+// Matches: name-ltc<6> (generated deploy suffix), name-retired-*, name-lattice-updating.
+// It deliberately does NOT match a bare 6-char segment — that over-matched real
+// names ending in a 6-char word (-worker/-server/-master/-canary/-backup) and made
+// recreate target the wrong container. Generated suffixes carry the SuffixMarker.
 func isCanonicalVariant(canonicalName, dockerName string) bool {
 	if !strings.HasPrefix(dockerName, canonicalName+"-") {
 		return false
@@ -308,16 +331,8 @@ func isCanonicalVariant(canonicalName, dockerName string) bool {
 	if strings.HasPrefix(rest, "retired") || rest == "lattice-updating" {
 		return true
 	}
-	// 6-char alphanumeric suffix (our deploy suffix)
-	if len(rest) == 6 {
-		for _, c := range rest {
-			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-				return false
-			}
-		}
-		return true
-	}
-	return false
+	// Marker-prefixed generated deploy suffix
+	return dockerclient.IsGeneratedSuffixSegment(rest)
 }
 
 // rollbackContainers restores previously-updated containers to their original image.
@@ -333,6 +348,18 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 		idx := updatedContainers[j]
 		snap := snapshots[idx]
 		cSpec := spec.Containers[snap.SpecIdx]
+
+		// No predecessor existed (this was a fresh container, OldID==""). There is
+		// nothing to restore to — recreating would just re-launch the failing new
+		// image. Remove any current containers with this name and move on.
+		if snap.OldID == "" {
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("rollback: removing %s (no prior version to restore)", snap.Name), nil)
+			for _, cur := range e.findAllMatchingContainers(ctx, snap.Name) {
+				_ = e.Docker.StopAndRemoveContainer(ctx, cur.id, 10)
+			}
+			continue
+		}
 
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("rollback: restoring %s to %s", snap.Name, snap.OldImage), nil)

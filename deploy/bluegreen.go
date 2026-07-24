@@ -115,13 +115,20 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 		}
 	}
 
-	// Phase 3: Swap — stop blue, remove green, recreate with ports + canonical name
-	// Order: stop blue (frees ports) → remove blue (frees name) → remove green → create final
+	// Phase 3: Swap — retire blue (rename + keep stopped), remove green, create
+	// final with ports + canonical name. Blue is NOT removed until the final
+	// container is confirmed running, so a create/crash failure can roll back by
+	// renaming the retired blue back to its canonical name and starting it.
+	// Order per replica: rename+stop blue (frees name/ports, keeps it recoverable)
+	// → remove green → create final → verify → (only on full success) remove blues.
 	e.reportProgress(spec.DeploymentID, "deploying", "health check passed, swapping blue→green", nil)
 
+	// blueBackup records a retired blue container so it can be restored on failure
+	// or removed on success. retiredName is the name blue was renamed to.
 	type blueBackup struct {
-		name string
-		id   string
+		canonicalName string
+		id            string
+		retiredName   string
 	}
 	var blueBackups []blueBackup
 	var swapErr error
@@ -141,20 +148,24 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				canonicalName = fmt.Sprintf("%s-%d", cSpec.Name, replica+1)
 			}
 
-			// Capture blue ID before stopping
-			var blueID string
-			if id, err := e.Docker.FindContainerByName(ctx, canonicalName); err == nil && id != "" {
-				blueID = id
-				blueBackups = append(blueBackups, blueBackup{name: canonicalName, id: blueID})
-			}
-
-			// Step 1: Stop and remove blue (frees ports and canonical name)
+			// Step 1: Retire blue — rename it out of the way and stop it (do NOT
+			// remove it yet). This frees the canonical name and host ports while
+			// keeping blue recoverable for rollback.
 			e.reportProgress(spec.DeploymentID, "deploying",
-				fmt.Sprintf("stopping blue (old) container: %s", canonicalName),
+				fmt.Sprintf("retiring blue (old) container: %s", canonicalName),
 				map[string]any{"container_name": canonicalName, "step": "stopping_blue"})
-			if blueID != "" {
-				_ = e.Docker.StopContainer(ctx, blueID, 30)
-				_ = e.Docker.RemoveContainer(ctx, blueID, true)
+			if id, err := e.Docker.FindContainerByName(ctx, canonicalName); err == nil && id != "" {
+				retiredName := fmt.Sprintf("%s-retired-%d", canonicalName, time.Now().UnixNano())
+				if renameErr := e.Docker.RenameContainer(ctx, id, retiredName); renameErr != nil {
+					// Rename failed — fall back to stop only so the port frees;
+					// record the id under its canonical name for restart-based rollback.
+					log.Printf("deploy: blue-green retire rename failed for %s: %v (stopping in place)", canonicalName, renameErr)
+					_ = e.Docker.StopContainer(ctx, id, 30)
+					blueBackups = append(blueBackups, blueBackup{canonicalName: canonicalName, id: id, retiredName: ""})
+				} else {
+					_ = e.Docker.StopContainer(ctx, id, 30)
+					blueBackups = append(blueBackups, blueBackup{canonicalName: canonicalName, id: id, retiredName: retiredName})
+				}
 			}
 
 			// Step 2: Remove green container (frees its name, image layers are cached)
@@ -191,9 +202,17 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
 			}
 
-			_, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
+			finalID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 			if err != nil {
 				swapErr = fmt.Errorf("recreate container %s: %w", canonicalName, err)
+				break
+			}
+
+			// Step 4: Verify the final container is actually running before we
+			// commit — a crash-on-real-port must not leave old gone with no rollback.
+			if info, inspErr := e.Docker.InspectContainer(ctx, finalID); inspErr != nil || !info.State.Running {
+				_ = e.Docker.StopAndRemoveContainer(ctx, finalID, 5)
+				swapErr = fmt.Errorf("final container %s not running after swap", canonicalName)
 				break
 			}
 
@@ -203,13 +222,33 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 		}
 	}
 
-	// If swap failed, try to restart blue containers as rollback
+	// If swap failed, restore blue containers as rollback, then surface the error.
 	if swapErr != nil {
-		log.Printf("deploy: blue-green swap failed, attempting to restart blue containers: %v", swapErr)
+		log.Printf("deploy: blue-green swap failed, restoring blue containers: %v", swapErr)
 		for _, bb := range blueBackups {
-			_ = e.Docker.StartContainer(ctx, bb.id)
+			// Remove any partially-created final now occupying the canonical name.
+			if id, err := e.Docker.FindContainerByName(ctx, bb.canonicalName); err == nil && id != "" && id != bb.id {
+				_ = e.Docker.StopAndRemoveContainer(ctx, id, 5)
+			}
+			// Rename the retired blue back to its canonical name (if it was renamed).
+			if bb.retiredName != "" {
+				if renameErr := e.Docker.RenameContainer(ctx, bb.id, bb.canonicalName); renameErr != nil {
+					log.Printf("deploy: rollback rename %s -> %s failed: %v", bb.retiredName, bb.canonicalName, renameErr)
+				}
+			}
+			// Start blue back up.
+			if startErr := e.Docker.StartContainer(ctx, bb.id); startErr != nil {
+				log.Printf("deploy: rollback failed to start blue %s: %v", bb.canonicalName, startErr)
+			}
 		}
+		// Clean up any green containers left from un-swapped services.
+		e.cleanupGreen(ctx, greenIDs)
 		return swapErr
+	}
+
+	// Success: the finals are confirmed running, so retired blues are safe to remove.
+	for _, bb := range blueBackups {
+		_ = e.Docker.RemoveContainer(ctx, bb.id, true)
 	}
 
 	return nil

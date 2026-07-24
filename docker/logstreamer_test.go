@@ -11,14 +11,18 @@ func TestCanonicalContainerName(t *testing.T) {
 		{"no-suffix", "myapp", "myapp"},
 		{"retired-suffix", "myapp-retired-1234567890", "myapp"},
 		{"lattice-updating", "myapp-lattice-updating", "myapp"},
-		{"6-char-deploy-suffix", "openbucket-zixn9i", "openbucket"},
-		{"6-char-alpha-only", "myapp-abcdef", "myapp"},
-		{"6-char-alphanumeric", "myapp-a1b2c3", "myapp"},
-		{"uppercase-not-stripped", "myapp-ZIXN9I", "myapp-ZIXN9I"},
-		{"3-char-not-stripped", "myapp-abc", "myapp-abc"},
-		{"7-char-not-stripped", "myapp-abcdefg", "myapp-abcdefg"},
-		{"5-char-not-stripped", "myapp-abcde", "myapp-abcde"},
-		{"multi-hyphen-with-suffix", "my-long-app-zixn9i", "my-long-app"},
+		{"marker-deploy-suffix", "openbucket-ltczixn9i", "openbucket"},
+		{"marker-alpha-only", "myapp-ltcabcdef", "myapp"},
+		{"marker-alphanumeric", "myapp-ltca1b2c3", "myapp"},
+		// Bare 6-char segments are NO LONGER stripped — they collide with real names.
+		{"bare-6-char-not-stripped", "openbucket-zixn9i", "openbucket-zixn9i"},
+		{"worker-not-stripped", "myapp-worker", "myapp-worker"},
+		{"server-not-stripped", "myapp-server", "myapp-server"},
+		{"canary-not-stripped", "myapp-canary", "myapp-canary"},
+		{"uppercase-not-stripped", "myapp-ltcZIXN9I", "myapp-ltcZIXN9I"},
+		{"marker-only-not-stripped", "myapp-ltc", "myapp-ltc"},
+		{"marker-short-not-stripped", "myapp-ltcabc", "myapp-ltcabc"},
+		{"multi-hyphen-with-suffix", "my-long-app-ltczixn9i", "my-long-app"},
 		{"retired-in-middle", "my-retired-app", "my"}, // -retired- is detected and stripped
 	}
 

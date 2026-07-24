@@ -54,6 +54,10 @@ func (c *WSClient) OnMessage(handler func(Envelope)) {
 	c.onMessage = handler
 }
 
+// SendJSON enqueues a message on a best-effort basis: if the send queue is full
+// the message is DROPPED. Use this only for pure telemetry (heartbeat, metrics,
+// container_sync, logs, lifecycle_log, progress) where a dropped message is
+// tolerable. For a reply the orchestrator blocks on, use SendJSONReliable.
 func (c *WSClient) SendJSON(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -67,6 +71,31 @@ func (c *WSClient) SendJSON(v any) error {
 		return fmt.Errorf("send queue full")
 	}
 }
+
+// SendJSONReliable enqueues a message, blocking until the send queue has room or
+// the timeout elapses (rather than dropping immediately when full). Use this for
+// command_id-correlated replies that lattice-api blocks waiting on — exec_output,
+// list_volumes_response, list_networks_response, backup_dest_test_result,
+// db_delete_snapshot_result and the db_*_status replies — so a burst of telemetry
+// can't silently drop the one message a caller is awaiting. Still bounded: if the
+// write pump is gone (disconnected) the send can't complete and it gives up after
+// reliableSendTimeout instead of blocking forever.
+func (c *WSClient) SendJSONReliable(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	select {
+	case c.send <- b:
+		return nil
+	case <-time.After(reliableSendTimeout):
+		log.Printf("ws: reliable send timed out after %v (queue %d/%d), dropping message", reliableSendTimeout, len(c.send), cap(c.send))
+		return fmt.Errorf("send queue full after %v", reliableSendTimeout)
+	}
+}
+
+// reliableSendTimeout bounds how long SendJSONReliable waits for queue room.
+const reliableSendTimeout = 10 * time.Second
 
 // Connect establishes a WebSocket connection and maintains it with auto-reconnect.
 func (c *WSClient) Connect(ctx context.Context) {

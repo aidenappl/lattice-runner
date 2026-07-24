@@ -109,17 +109,17 @@ type HealthCheck struct {
 
 // ContainerSpec defines a container to create.
 type ContainerSpec struct {
-	Name          string
-	Image         string
-	Tag           string
-	PortMappings  []PortMapping
-	EnvVars       map[string]string
-	Volumes       map[string]string // host:container
-	CPULimit      float64           // CPU cores
-	MemoryLimit   int64             // bytes
-	RestartPolicy string
-	Command       []string
-	Entrypoint    []string
+	Name           string
+	Image          string
+	Tag            string
+	PortMappings   []PortMapping
+	EnvVars        map[string]string
+	Volumes        map[string]string // host:container
+	CPULimit       float64           // CPU cores
+	MemoryLimit    int64             // bytes
+	RestartPolicy  string
+	Command        []string
+	Entrypoint     []string
 	Networks       []string
 	NetworkAliases []string
 	StackName      string // used for lattice-stack label
@@ -170,7 +170,16 @@ func encodeAuthConfig(auth *RegistryAuth) (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// GenerateSuffix returns a 6-character lowercase alphanumeric string for unique container naming.
+// SuffixMarker prefixes every Lattice-generated deploy suffix so that the
+// suffix segment is UNAMBIGUOUS. Without it a generated 6-char suffix collides
+// with legitimate container names ending in a 6-char word ("-worker", "-server",
+// "-master", "-canary", "-backup"), which caused canonical-name stripping and
+// recreate to target the WRONG container. The full generated segment is
+// SuffixMarker + 6 lowercase-alphanumeric chars (e.g. "ltcabc123").
+const SuffixMarker = "ltc"
+
+// GenerateSuffix returns a marker-prefixed unique segment ("ltc" + 6 lowercase
+// alphanumeric chars) for temporary container naming during deploys.
 func GenerateSuffix() string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, 6)
@@ -178,7 +187,26 @@ func GenerateSuffix() string {
 	for i := range b {
 		b[i] = chars[int(b[i])%len(chars)]
 	}
-	return string(b)
+	return SuffixMarker + string(b)
+}
+
+// IsGeneratedSuffixSegment reports whether seg (the part after the last '-' of a
+// container name) is a Lattice-generated deploy suffix: the SuffixMarker followed
+// by exactly 6 lowercase-alphanumeric chars. It deliberately does NOT match a
+// bare 6-char segment, so real names like "-worker"/"-server" are never stripped.
+func IsGeneratedSuffixSegment(seg string) bool {
+	if len(seg) != len(SuffixMarker)+6 {
+		return false
+	}
+	if !strings.HasPrefix(seg, SuffixMarker) {
+		return false
+	}
+	for _, c := range seg[len(SuffixMarker):] {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 // StopAndRemoveContainer stops then removes a container, verifying each step.
@@ -575,13 +603,13 @@ func (c *Client) RecreateContainer(ctx context.Context, containerID string, name
 }
 
 // GracefulRecreate performs a zero-downtime container replacement:
-// 1. Creates a new container with a temporary name (without host port bindings to avoid conflicts)
-// 2. Connects it to the same networks
-// 3. Waits for it to be running (and healthy if healthcheck configured)
-// 4. Stops and removes the old container
-// 5. Renames the new container to the original name
-// 6. If the original had host port bindings, stops the temp container,
-//    recreates it with the full config (including ports), and starts it.
+//  1. Creates a new container with a temporary name (without host port bindings to avoid conflicts)
+//  2. Connects it to the same networks
+//  3. Waits for it to be running (and healthy if healthcheck configured)
+//  4. Stops and removes the old container
+//  5. Renames the new container to the original name
+//  6. If the original had host port bindings, stops the temp container,
+//     recreates it with the full config (including ports), and starts it.
 func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newImage string) (string, error) {
 	info, err := c.cli.ContainerInspect(ctx, containerID)
 	if err != nil {
@@ -670,8 +698,11 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		time.Sleep(2 * time.Second)
 	}
 
-	// Step 3: Rename old container to free the name, then stop and remove
+	// Step 3: Rename old container out of the way to free the canonical name, but
+	// KEEP it stopped (not removed) so we can roll back if the final container
+	// fails to come up. It is only removed once the final is confirmed healthy.
 	retiredName := originalName + "-retired-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	oldRetired := false
 	if renameErr := c.cli.ContainerRename(ctx, containerID, retiredName); renameErr != nil {
 		log.Printf("graceful-recreate: rename failed for %s: %v — falling back to stop+remove", originalName, renameErr)
 		_ = c.StopContainer(ctx, containerID, 10)
@@ -679,14 +710,36 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		// Wait briefly for name release
 		time.Sleep(2 * time.Second)
 	} else {
-		// Renamed — clean up in background
+		oldRetired = true
+		_ = c.StopContainer(ctx, containerID, 10)
+	}
+
+	// restoreOld brings the retired old container back under the original name.
+	// Used as rollback when the final container fails to become healthy.
+	restoreOld := func() {
+		if !oldRetired {
+			return
+		}
+		if renameErr := c.cli.ContainerRename(ctx, containerID, originalName); renameErr != nil {
+			log.Printf("graceful-recreate: rollback rename %s -> %s failed: %v", retiredName, originalName, renameErr)
+		}
+		_ = c.StartContainer(ctx, containerID)
+	}
+	// removeOld disposes of the retired old container once the swap succeeded.
+	removeOld := func() {
+		if !oldRetired {
+			return
+		}
 		go func() {
-			_ = c.StopContainer(context.Background(), containerID, 10)
 			_ = c.RemoveContainer(context.Background(), containerID, true)
 		}()
 	}
 
-	// Step 4: If there were port bindings, we need to recreate with the full config
+	// Step 4: If there were port bindings, recreate with the full config (ports),
+	// then HEALTH-CHECK the final container before declaring success. The temp
+	// container was validated without host ports, so a crash that only manifests
+	// on the real port must be caught here — otherwise the old container is gone
+	// with nothing serving.
 	if hasPortBindings {
 		_ = c.StopContainer(ctx, resp.ID, 5)
 		_ = c.RemoveContainer(ctx, resp.ID, true)
@@ -694,11 +747,41 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		// Recreate with original host config (including ports) and original name
 		finalResp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, networkConfig, nil, originalName)
 		if err != nil {
+			restoreOld()
 			return "", fmt.Errorf("recreate with ports: %w", err)
 		}
 		if err := c.cli.ContainerStart(ctx, finalResp.ID, container.StartOptions{}); err != nil {
+			_ = c.RemoveContainer(ctx, finalResp.ID, true)
+			restoreOld()
 			return "", fmt.Errorf("start final container: %w", err)
 		}
+
+		// Health-gate the final container (up to 30s), mirroring the temp check.
+		finalDeadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(finalDeadline) {
+			check, inspErr := c.cli.ContainerInspect(ctx, finalResp.ID)
+			if inspErr != nil {
+				break
+			}
+			if !check.State.Running {
+				_ = c.RemoveContainer(ctx, finalResp.ID, true)
+				restoreOld()
+				return "", fmt.Errorf("final container stopped unexpectedly after port bind")
+			}
+			if check.State.Health == nil || check.State.Health.Status == "healthy" {
+				break // No healthcheck or healthy
+			}
+			if check.State.Health.Status == "unhealthy" {
+				_ = c.StopContainer(ctx, finalResp.ID, 5)
+				_ = c.RemoveContainer(ctx, finalResp.ID, true)
+				restoreOld()
+				return "", fmt.Errorf("final container is unhealthy after port bind")
+			}
+			time.Sleep(2 * time.Second)
+		}
+
+		// Final verified — old is now safe to discard.
+		removeOld()
 		return finalResp.ID, nil
 	}
 
@@ -708,6 +791,8 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		log.Printf("warning: failed to rename %s to %s: %v", tempName, originalName, err)
 	}
 
+	// Temp (now canonical) container is running — dispose of the retired old.
+	removeOld()
 	return resp.ID, nil
 }
 

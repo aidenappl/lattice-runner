@@ -81,7 +81,12 @@ func (nm *NetMonitor) check(ctx context.Context, restartCb RestartLoopCallback) 
 		return
 	}
 
+	// Track which container IDs are present so we can prune stale restart trackers.
+	present := make(map[string]struct{}, len(containers))
+
 	for _, c := range containers {
+		present[c.ID] = struct{}{}
+
 		if c.State != "running" && c.State != "restarting" {
 			continue
 		}
@@ -104,6 +109,16 @@ func (nm *NetMonitor) check(ctx context.Context, restartCb RestartLoopCallback) 
 
 		nm.checkContainerNetwork(ctx, c.ID, name)
 	}
+
+	// Prune restart trackers for containers that no longer exist so the map does
+	// not grow unbounded over the lifetime of the runner (mirrors logstreamer.sync).
+	nm.mu.Lock()
+	for id := range nm.restartCounts {
+		if _, ok := present[id]; !ok {
+			delete(nm.restartCounts, id)
+		}
+	}
+	nm.mu.Unlock()
 }
 
 func (nm *NetMonitor) checkRestartLoop(ctx context.Context, containerID, name string, cb RestartLoopCallback) {

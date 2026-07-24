@@ -20,10 +20,16 @@ type LogLine struct {
 	RecordedAt    time.Time // Docker-recorded timestamp (nanosecond precision)
 }
 
-// CanonicalContainerName strips Lattice deploy suffixes (6-char alphanumeric,
-// "-retired-*", "-lattice-updating") so log lines are attributed to the
-// canonical container name that matches the DB entry. This prevents log gaps
-// when the logstreamer discovers a container before the rolling deploy renames it.
+// CanonicalContainerName strips Lattice deploy suffixes (the marker-prefixed
+// generated suffix "ltc<6>", "-retired-*", "-lattice-updating") so log lines are
+// attributed to the canonical container name that matches the DB entry. This
+// prevents log gaps when the logstreamer discovers a container before the rolling
+// deploy renames it.
+//
+// It deliberately does NOT strip a bare 6-char segment — that over-matched real
+// names like "-worker"/"-server"/"-master"/"-canary"/"-backup" (all 6 chars).
+// Generated suffixes now carry the SuffixMarker (see GenerateSuffix) precisely so
+// this stripping is unambiguous.
 func CanonicalContainerName(name string) string {
 	// Strip -retired-<timestamp> or -lattice-updating
 	if idx := strings.Index(name, "-retired-"); idx > 0 {
@@ -32,20 +38,10 @@ func CanonicalContainerName(name string) string {
 	if strings.HasSuffix(name, "-lattice-updating") {
 		return strings.TrimSuffix(name, "-lattice-updating")
 	}
-	// Strip 6-char alphanumeric deploy suffix (e.g. "openbucket-zixn9i" -> "openbucket")
+	// Strip the marker-prefixed generated deploy suffix (e.g. "openbucket-ltcz9i7q2" -> "openbucket")
 	if dashIdx := strings.LastIndex(name, "-"); dashIdx > 0 {
-		suffix := name[dashIdx+1:]
-		if len(suffix) == 6 {
-			allValid := true
-			for _, c := range suffix {
-				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-					allValid = false
-					break
-				}
-			}
-			if allValid {
-				return name[:dashIdx]
-			}
+		if IsGeneratedSuffixSegment(name[dashIdx+1:]) {
+			return name[:dashIdx]
 		}
 	}
 	return name

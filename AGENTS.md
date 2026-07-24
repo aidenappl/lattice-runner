@@ -174,21 +174,41 @@ differ from a typical Go API.
   for lifecycle actions, `db_status` for db actions, `worker_action_status` for host/volume/network
   actions, plus streaming `lifecycle_log` lines for human-visible progress. Silence is a bug: the
   dashboard shows what the runner reports.
-- **`wsSend(ws, type, msg)` vs `ws.SendJSON(msg)`.** `wsSend` is a thin wrapper that logs send
-  failures with the message type; some older handlers call `ws.SendJSON` directly. Both push onto
-  the same buffered send channel — **and that channel drops messages when full** (256 buffer,
-  non-blocking send). Status messages are best-effort, not guaranteed delivery.
+- **`wsSend`/`SendJSON` (best-effort) vs `wsSendReliable`/`SendJSONReliable` (blocking-with-deadline).**
+  Both push onto the same 256-deep buffered send channel. `SendJSON` (via `wsSend`) does a
+  **non-blocking** send and **drops the message when the queue is full** — correct for pure
+  telemetry (heartbeat, metrics, container_sync, logs, lifecycle_log, deployment_progress), which is
+  best-effort by design. `SendJSONReliable` (via `wsSendReliable`) **blocks until the queue has room
+  or a 10s deadline elapses**, so it is used for the **command_id-correlated replies the orchestrator
+  blocks waiting on** — `exec_output`, `list_volumes_response`, `list_networks_response`,
+  `backup_dest_test_result`, `db_delete_snapshot_result`, and the `db_*_status` replies. A telemetry
+  burst can no longer silently drop the one reply a caller is awaiting. It is still bounded (won't
+  block forever if the socket is gone). **When adding a new correlated reply, send it via
+  `wsSendReliable`, not `wsSend`.**
 - **The recreate canonical-name fallback (a load-bearing convention).** Rolling deploys don't keep
   a container at its plain name during the swap — they create the new container as
   `<name>-<6charsuffix>`, health-check it, then rename to the canonical name. As a result a
   container may transiently exist under a *suffixed* name, or be left there if a rename failed.
   So the `recreate` handler, after a plain `FindContainerByName` miss, falls back to
   `executor.FindCanonicalContainer(ctx, name)`, which matches the exact name **or** any
-  `isCanonicalVariant` — `<name>-<6 lowercase-alnum>`, `<name>-retired-*`, `<name>-lattice-updating`.
+  `isCanonicalVariant` — `<name>-ltc<6 lowercase-alnum>` (the **marker-prefixed** generated deploy
+  suffix), `<name>-retired-*`, `<name>-lattice-updating`.
   The mirror of this is `docker.CanonicalContainerName`, which *strips* those same suffixes so log
   lines and heartbeat container-sync events are attributed to the DB name. **If you change the
-  suffix format in one place, change it in all three** (`GenerateSuffix`, `isCanonicalVariant`,
-  `CanonicalContainerName`) or containers become unfindable / logs orphan.
+  suffix format in one place, change it in all three** (`GenerateSuffix`,
+  `docker.IsGeneratedSuffixSegment` used by `isCanonicalVariant`, and `CanonicalContainerName`) or
+  containers become unfindable / logs orphan.
+  - **Generated suffixes carry the `docker.SuffixMarker` (`"ltc"`) prefix** so the segment is
+    `ltc` + 6 lowercase-alnum (e.g. `myapp-ltcz9i7q2`). This is deliberate: the previous *bare*
+    6-char suffix collided with real container names ending in a 6-char word (`-worker`, `-server`,
+    `-master`, `-canary`, `-backup`), which made canonical-name stripping and `recreate` target the
+    **wrong** container. The matchers now **never** strip a bare 6-char segment — only the
+    marker-prefixed suffix, `-retired-*`, and `-lattice-updating`.
+  - **Transition note:** containers deployed by an *older* runner during the upgrade window may
+    carry the old bare-6-char suffix; the new matchers will NOT recognize those as variants. In
+    practice this self-heals — such names are transient (renamed to canonical on deploy success) or
+    get cleaned as orphans on the next deploy — and correctness (not targeting the wrong container)
+    was preferred over recognizing the ambiguous old format.
 - **Deploy progress uses a state map + retry-aware callback.** `deploymentStates[deploymentID]`
   tracks status/step/attempt across the async deploy; the executor's `ProgressCallback` enriches
   every progress event with `attempt`/`max_retries`/`last_progress_at` and emits
@@ -314,8 +334,24 @@ carries a `DeploymentSpec`. `Executor.Execute` (in `deploy/executor.go`):
    issues at the final check fail the deployment.
 
 Progress is streamed as `deployment_progress` throughout; `main.go` layers retry bookkeeping
-(`attempt`/`max_retries`) on top and dedupes duplicate in-flight deploys for the same
-`deployment_id`.
+(`attempt`/`max_retries`) on top. The **in-flight guard is atomic (single-lock check-and-set)** and
+serializes **by stack name**: a duplicate of the same `deployment_id` is rejected while it is
+`deploying` OR in the ~60s `validating` window (tracked by an `InProgress` flag, not just
+`Status=="deploying"`), and a *different* `deployment_id` targeting a stack that already has an
+in-flight deployment is rejected with a `deployment_progress{status:"failed"}` reply.
+
+**Partial-failure safety in the strategies** (all three keep the previous container recoverable
+until the replacement is verified):
+- **rolling** — on a create/verify failure *after* the predecessor was stopped, the in-flight
+  container's index is added to the rollback set so its just-stopped predecessor is restored, not
+  left down. A snapshot with no predecessor (`OldID==""`) is *removed* on rollback rather than
+  recreated with the failing image.
+- **blue-green** — the old ("blue") container is **renamed to a retired name and kept stopped** (not
+  removed) during the swap; the final container is health-verified before blue is removed, and a
+  swap failure rolls back by renaming blue back and starting it.
+- **`GracefulRecreate`** (single-container `recreate`) — for a port-bound container, the final
+  (real-port) container is **health-gated after start**, and the old container is kept renamed+stopped
+  until the final is verified; failure restores the old container.
 
 ### Docker lifecycle management
 
@@ -390,8 +426,11 @@ control-plane protocol.
 ### Graceful shutdown
 
 On `SIGINT`/`SIGTERM`: wait up to 60s for in-flight deployments to finish, send `worker_shutdown`,
-cancel the root context (stopping all goroutines), pause ~2s for in-flight work, `Drain` the send
-queue (5s) so buffered messages actually go out, then `Close` the socket.
+pause ~2s for in-flight handlers to enqueue their final status, `Drain` the send queue (5s) **while
+the write pump is still alive**, then cancel the root context (stopping all goroutines) and `Close`
+the socket. **Order matters: `Drain` must happen BEFORE `cancel()`** — the write pump exits on
+context cancellation, so cancelling first would strand every queued message (including
+`worker_shutdown`).
 
 ## Ecosystem & related repos
 
@@ -435,7 +474,9 @@ or `go-monitor`.
     name; `recreate` handles this via the canonical fallback, but plain start/stop/restart use exact
     lookup only.
   - *Dropped telemetry* — the 256-deep send queue overflowed under a burst (`ws: send queue full`);
-    status is best-effort by design.
+    pure telemetry is best-effort by design. Command_id-correlated replies use `SendJSONReliable`
+    (blocking with a 10s deadline) so they are not dropped on a transient full queue; a
+    `ws: reliable send timed out` log means the socket was genuinely stuck for 10s.
 
 ## Rules & guardrails
 
@@ -448,9 +489,11 @@ or `go-monitor`.
   in the same change. Read the `lattice-api` handler — don't infer the shape.
 - **Always validate container names from the orchestrator** with `validContainerName` before any
   Docker call or exec. Names reach shell (db dumps) and Docker lookups.
-- **Keep the three suffix helpers in sync** — `GenerateSuffix`, `isCanonicalVariant`, and
-  `CanonicalContainerName`. They encode one format (`<name>-<6 lowercase-alnum>`, `-retired-*`,
-  `-lattice-updating`); divergence orphans containers and logs.
+- **Keep the suffix helpers in sync** — `GenerateSuffix`, `docker.IsGeneratedSuffixSegment` (used by
+  `isCanonicalVariant`), and `CanonicalContainerName`. They encode one format
+  (`<name>-ltc<6 lowercase-alnum>` via `docker.SuffixMarker`, `-retired-*`, `-lattice-updating`);
+  divergence orphans containers and logs. **Never** match/strip a bare 6-char segment — it collides
+  with real names (`-worker`/`-server`/`-master`/`-canary`/`-backup`) and targets the wrong container.
 - **Preserve panic isolation.** Handlers must not be allowed to crash the read pump; long-lived
   goroutines go through `safeGo` so a panic is reported as `worker_crash` before exit.
 - **Don't log secrets.** Deploy specs, `recreate`/`pull_image` `auth`, and db handlers carry
