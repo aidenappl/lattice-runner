@@ -262,10 +262,16 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 // containers that were renamed or removed from the compose file. They must be
 // stopped before deploying to free ports and avoid orphans.
 //
-// For containers without the lattice-stack label (created before labels were
-// added), falls back to a port-conflict check: if a lattice-managed container
-// holds a host port needed by the new spec and isn't in the spec by name,
-// it is stopped.
+// IMPORTANT: this only ever touches Lattice-managed containers
+// (managed-by=lattice) — anything else is skipped up front and never stopped.
+// A foreign (non-Lattice) container holding a needed host port is deliberately
+// left running: silently killing a legitimate non-Lattice service to free a
+// port would be far worse than failing the port bind. Such a conflict surfaces
+// as a bind error from the strategy, not a stealth stop here.
+//
+// The port-conflict check (Check 2) is therefore a fallback for Lattice-managed
+// containers that predate the lattice-stack label (so Check 1 can't match them),
+// NOT a mechanism for reclaiming ports from foreign containers.
 func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSpec) {
 	// Build set of canonical names in the new spec
 	specNames := make(map[string]bool)
@@ -308,6 +314,9 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 		if specNames[canonical] || specNames[name] {
 			continue
 		}
+		// Note: only managed-by=lattice containers reach this point (foreign
+		// containers were skipped above), so Check 2 below can never stop a
+		// non-Lattice container that happens to hold a needed port.
 
 		shouldRemove := false
 		reason := ""
@@ -318,7 +327,8 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 			reason = fmt.Sprintf("stale stack container (was in stack %q, not in new spec)", spec.StackName)
 		}
 
-		// Check 2: container holds a port we need (fallback for unlabeled containers)
+		// Check 2: container holds a port we need (fallback for Lattice-managed
+		// containers that predate the lattice-stack label — NOT foreign containers)
 		if !shouldRemove && len(neededPorts) > 0 {
 			for _, p := range c.Ports {
 				if p.PublicPort > 0 && neededPorts[fmt.Sprintf("%d", p.PublicPort)] {
