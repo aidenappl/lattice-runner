@@ -1,187 +1,144 @@
 # lattice-runner
 
-Lightweight agent that runs on each worker VM in the Lattice platform. Connects to the central orchestrator via WebSocket, executes container deployments, and reports system metrics. Includes a local web dashboard for at-a-glance status.
+Worker-agent daemon for the Lattice container orchestration platform. Runs on each worker VM, connects outbound to the orchestrator over WebSocket, and manages the local Docker daemon.
+
+> **Lattice platform** · Go worker daemon · one per worker VM · `wss://lattice-api.appleby.cloud/ws/worker`
 
 ---
 
-## Quick Install
+## Overview
 
-The fastest way to set up a worker is from the Lattice dashboard:
+`lattice-runner` is the **data plane** of Lattice. One instance runs on every worker machine. On startup it connects to the local Docker Engine API, then dials **outbound** to [`lattice-api`](https://github.com/aidenappl/lattice-api) over a single persistent WebSocket (authenticated with a worker token) and reconnects forever with backoff. From there it:
 
-1. Go to **Workers** -> **Add Worker**, enter a name and hostname
-2. Copy the one-liner shown after creation and run it on the target VM:
+- Executes **deployments** (rolling, blue-green, canary strategies) with health-gating and post-deploy verification
+- Runs **container lifecycle** actions on demand — start, stop, restart, kill, pause, unpause, remove, recreate, pull image
+- Manages **database containers** and runs scheduled/on-demand **snapshots** to remote backup destinations (S3, Google Drive, Samba)
+- Streams **container logs** and reports **host + container metrics** via a heartbeat
+- Serves a small read-only **local status dashboard**
+
+Because the connection is outbound-only, a worker needs **no inbound firewall rules** — only outbound access to the orchestrator. It holds no state and makes no scheduling decisions; every instruction arrives as a message from the control plane.
+
+## Role in the Lattice ecosystem
+
+| Repo | Relationship |
+|------|--------------|
+| [`lattice-api`](https://github.com/aidenappl/lattice-api) | **The control plane.** Hosts the `/ws/worker` endpoint this runner dials, issues every command, receives all telemetry, mints worker tokens, and serves the install/upgrade scripts. |
+| [`lattice-web`](https://github.com/aidenappl/lattice-web) | Next.js dashboard over `lattice-api` — where operators add workers and trigger deploys/actions. |
+| [`lattice-mcp`](https://github.com/aidenappl/lattice-mcp) | MCP server exposing the `lattice-api` admin surface to Claude Code as typed tools. |
+
+This runner depends only on the Docker daemon on its host and the WebSocket to `lattice-api`.
+
+## Tech stack
+
+- **Go 1.25** (see `go.mod`)
+- **gorilla/websocket** — the persistent outbound connection to the orchestrator
+- **Docker Engine API** (`docker/docker` SDK) — container/image/network/volume/exec management
+- **AWS SDK v2 · Google API + OAuth2 · `smbclient`** — S3, Google Drive, and Samba backup destinations
+- **`net/http`** — the local status dashboard (no framework)
+
+## Getting started
+
+### Prerequisites
+
+- **Docker** — `curl -fsSL https://get.docker.com | sh`
+- **Go 1.25+** — https://go.dev/dl/ (only needed to build from source)
+- A **worker token** from the Lattice dashboard (*Workers → Add Worker*)
+
+### Setup
+
+The fastest path is the one-liner from the dashboard, which builds the binary, writes the config, installs a `systemd` service, and starts it:
 
 ```bash
 curl -fsSL https://lattice-api.appleby.cloud/install/runner | WORKER_TOKEN=<token> WORKER_NAME=<name> bash
 ```
 
-This clones the repo, builds the binary, writes the config, installs a systemd service, and starts it.
-
-### Prerequisites
-
-- **Docker** — `curl -fsSL https://get.docker.com | sh`
-- **Go 1.24+** — `https://go.dev/dl/`
-
----
-
-## Interactive Setup
-
-If you prefer to configure step by step:
+To configure interactively instead:
 
 ```bash
 git clone https://github.com/aidenappl/lattice-runner.git
 cd lattice-runner
 go build -o lattice-runner .
-sudo ./lattice-runner setup
+sudo ./lattice-runner setup    # prompts for URL/token/name, installs systemd unit on Linux
 ```
 
-The setup wizard prompts for:
-
-```
-  Orchestrator URL [wss://lattice-api.appleby.cloud/ws/worker]:
-  Worker Token (from dashboard): <paste>
-  Worker Name [hostname]:
-  Install as systemd service? [Y/n]:
-```
-
-It writes the config to `/opt/lattice-runner/.env`, copies the binary, creates the systemd unit, and starts the service.
-
----
-
-## Manual Setup
+Or run manually with environment variables:
 
 ```bash
-# Build
-go build -o lattice-runner .
-
-# Configure
-cat > .env << 'EOF'
-ORCHESTRATOR_URL=wss://lattice-api.appleby.cloud/ws/worker
-WORKER_TOKEN=your-token
-WORKER_NAME=your-worker
-EOF
-
-# Run
-source .env && ./lattice-runner
+export ORCHESTRATOR_URL=wss://lattice-api.appleby.cloud/ws/worker
+export WORKER_TOKEN=<token>
+export WORKER_NAME=<name>
+./lattice-runner
 ```
 
-### Systemd (manual)
+#### Configuration
 
-```bash
-sudo mkdir -p /opt/lattice-runner
-sudo cp lattice-runner /opt/lattice-runner/
-sudo cp .env /opt/lattice-runner/
+Loaded in `config/config.go`. Required variables cause a startup panic if missing.
 
-# Note: .env for systemd must NOT have `export` — just KEY=value
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `ORCHESTRATOR_URL` | **Yes** | — | WebSocket URL to `lattice-api` (`wss://…/ws/worker`). `ws://` is rejected unless `ALLOW_INSECURE=true`. |
+| `WORKER_TOKEN` | **Yes** | — | Worker auth token; sent as `?token=` on the WS handshake. |
+| `WORKER_NAME` | No | hostname | Human-readable worker name in registration. |
+| `HEARTBEAT_INTERVAL` | No | `10s` | Metrics/heartbeat cadence. |
+| `RECONNECT_INTERVAL` | No | `5s` | WebSocket reconnect backoff. |
+| `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port. |
+| `DASHBOARD_BIND` | No | `127.0.0.1` | Dashboard bind address (localhost-only by default). |
+| `LATTICE_URL` | No | — | Link to the orchestrator UI, shown on the dashboard. |
+| `ALLOW_INSECURE` | No | `false` | Permit an unencrypted `ws://` URL (local dev only). |
 
-sudo tee /etc/systemd/system/lattice-runner.service << 'EOF'
-[Unit]
-Description=Lattice Runner
-After=network.target docker.service
-Requires=docker.service
+## Development
 
-[Service]
-Type=simple
-WorkingDirectory=/opt/lattice-runner
-EnvironmentFile=/opt/lattice-runner/.env
-ExecStart=/opt/lattice-runner/lattice-runner
-Restart=always
-RestartSec=5
+Uses the standard `dev` CLI (`Devfile.yaml`):
 
-[Install]
-WantedBy=multi-user.target
-EOF
+| Command | What it does |
+|---------|--------------|
+| `dev build` | `go build -o bin/app .` |
+| `dev` | `go run .` (needs `ORCHESTRATOR_URL` + `WORKER_TOKEN`) |
+| `dev test` | `go test ./...` |
+| `dev fmt` | `gofmt -w -s .` |
+| `dev vet` | `go vet ./...` |
+| `dev check` | fmt + vet + test |
+| `dev tidy` | `go mod tidy` |
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now lattice-runner
+The binary itself has three modes: `lattice-runner` (start the daemon), `lattice-runner setup` (interactive install wizard), and `lattice-runner version` (print the build version). The version is injected at build time via `-ldflags "-X main.Version=<tag>"`.
+
+## Project structure
+
+```
+main.go              # Entrypoint + the message-handler switch, heartbeat loop, graceful shutdown
+validate.go          # validContainerName — allow-list guard for orchestrator-supplied names
+config/config.go     # Config loading from env; enforces wss:// unless ALLOW_INSECURE
+client/websocket.go  # WebSocket client: auto-reconnect, read/write pumps, ping/pong, send buffer
+cmd/setup.go         # Interactive setup wizard + systemd install
+deploy/              # Deployment executor + rolling / blue-green / canary strategies, spec validation
+docker/              # Docker Engine API wrapper, log streamer, network monitor, database helpers
+metrics/collector.go # Host + runner metrics from /proc and syscall.Statfs
+scheduler/           # Cron-style snapshot scheduler (5-field matcher, per-instance dedupe)
+backup/              # Snapshot destinations: S3, Google Drive, Samba
+web/                 # Local read-only status dashboard (HTTP)
 ```
 
----
+## Deployment
 
-## Environment Variables
+Workers run the binary directly on the host (under `systemd`), **not** as a container — the process needs access to `/var/run/docker.sock` to manage sibling containers. The install one-liner and `lattice-runner setup` create the `systemd` unit (`Restart=always`), write config to `/opt/lattice-runner/.env` (mode 0600), and start the service.
 
-| Variable             | Required | Description                                                                          |
-| -------------------- | -------- | ------------------------------------------------------------------------------------ |
-| `ORCHESTRATOR_URL`   | Yes      | WebSocket URL of the orchestrator (e.g. `wss://lattice-api.appleby.cloud/ws/worker`) |
-| `WORKER_TOKEN`       | Yes      | API token generated from the Lattice dashboard                                       |
-| `WORKER_NAME`        | No       | Human-readable worker name (defaults to hostname)                                    |
-| `HEARTBEAT_INTERVAL` | No       | Metrics reporting interval (default `15s`)                                           |
-| `RECONNECT_INTERVAL` | No       | Reconnect backoff on disconnect (default `5s`)                                       |
-| `DASHBOARD_PORT`     | No       | Local dashboard port (default `9100`)                                                |
-
----
-
-## Tech Stack
-
-- **Go 1.24** with gorilla/websocket
-- **Docker Engine API** — container lifecycle management
-- **WebSocket** — persistent connection to the orchestrator
-- **Built-in HTTP server** — local status dashboard
-
----
-
-## Features
-
-- **One-liner install** — `curl | bash` from the dashboard sets up everything including systemd
-- **Interactive setup** — `lattice-runner setup` walks through configuration
-- **Auto-reconnect** — Maintains persistent WebSocket connection with backoff
-- **Heartbeat** — Reports CPU, memory, disk, network, swap, load average, and container count at configurable intervals
-- **Deployment strategies** — Rolling, blue-green, and canary deployments
-- **Container lifecycle** — Pull, create, start, stop, restart, remove containers on demand
-- **Registry auth** — Supports authenticated image pulls via credentials from the orchestrator
-- **Local dashboard** — Web UI showing real-time system metrics and container status
-
----
-
-## Update
-
-To update an existing runner to the latest version:
+Updates are driven by the control plane: an `upgrade_runner` message tells the runner to download the install script, verify its SHA-256, run it, and let `systemd` restart the new binary (surfaced in the Lattice MCP as `lattice_upgrade_worker`). Manual update:
 
 ```bash
 curl -fsSL https://lattice-api.appleby.cloud/install/update.sh | bash
 ```
 
----
-
-## Version Check
-
-```bash
-lattice-runner version
-```
-
-Prints the current version string (e.g. `v0.1.5`). The version is hardcoded in the binary and can be overridden at build time:
-
-```bash
-go build -ldflags "-X main.Version=v1.2.3" -o lattice-runner .
-```
-
----
-
-## Local Dashboard
-
-Each runner serves a status dashboard on its configured port:
-
-```
-http://<ip>:9100
-```
-
-The dashboard shows:
-
-- System info (hostname, OS, arch, Docker version, runner version)
-- Real-time CPU, memory, disk, swap, and network metrics
-- Load average and process count
-- Running containers with state and image info
-- Container log viewer
-
----
-
-## Useful Commands
+Useful host commands:
 
 ```bash
 sudo systemctl status lattice-runner      # check status
 sudo journalctl -u lattice-runner -f      # view logs
 sudo systemctl restart lattice-runner     # restart
-sudo systemctl stop lattice-runner        # stop
-sudo systemctl enable lattice-runner      # enable on boot
-sudo systemctl disable lattice-runner     # disable on boot
 ```
+
+The local dashboard is served at `http://127.0.0.1:9100` (system info, live metrics, container list, and log viewer).
+
+## Contributing & further reading
+
+- **[AGENTS.md](./AGENTS.md)** — the authoritative deep reference: the full WebSocket message protocol (every inbound/outbound message type), deploy strategy internals, the recreate canonical-name fallback, Docker interaction model, config surface, operations, and guardrails. Read it before making changes.
+- Related repos: [`lattice-api`](https://github.com/aidenappl/lattice-api) · [`lattice-web`](https://github.com/aidenappl/lattice-web) · [`lattice-mcp`](https://github.com/aidenappl/lattice-mcp)
