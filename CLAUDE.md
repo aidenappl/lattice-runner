@@ -52,7 +52,7 @@ Environment variables (loaded in `config/config.go`):
 | `ORCHESTRATOR_URL` | Yes | — | WebSocket URL to lattice-api (`wss://...`) |
 | `WORKER_TOKEN` | Yes | — | API authentication token |
 | `WORKER_NAME` | No | hostname | Human-readable worker name |
-| `HEARTBEAT_INTERVAL` | No | `15s` | Metrics reporting interval |
+| `HEARTBEAT_INTERVAL` | No | `10s` | Metrics reporting interval |
 | `RECONNECT_INTERVAL` | No | `5s` | WebSocket reconnect backoff |
 | `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port |
 | `DASHBOARD_BIND` | No | `127.0.0.1` | Dashboard bind address (default localhost-only) |
@@ -73,23 +73,25 @@ Environment variables (loaded in `config/config.go`):
 | `pause` | Pause container execution |
 | `unpause` | Resume paused container |
 | `remove` | Stop (10s timeout), then force remove |
-| `recreate` | Pull new image (if specified), stop, remove, recreate with same config |
+| `recreate` | Pull new image (if specified), locate via canonical-name fallback, `GracefulRecreate` (start new, health-check, swap) |
 | `pull_image` | Pull image from registry with optional auth |
-| `reboot_os` | Execute `sudo reboot` |
-| `upgrade_runner` | Run upgrade script via curl/bash from orchestrator URL |
+| `reboot_os` | Execute `sudo reboot` (5-min cooldown) |
+| `upgrade_runner` | Download install script from orchestrator URL, verify SHA-256, run it |
 | `stop_all` | Stop all running containers (30s timeout each) |
 | `start_all` | Start all non-running containers |
 
+Also handled (see AGENTS.md for the full protocol tables): `deployment_ping`, `force_remove`; volume ops (`list_volumes`/`create_volume`/`remove_volume`); network ops (`list_networks`/`create_network`/`remove_network`); interactive exec (`exec_start`/`exec_input`/`exec_resize`/`exec_close`); database family (`db_create`/`db_start`/`db_stop`/`db_restart`/`db_remove`/`db_snapshot`/`db_restore`/`db_update_schedule`, `backup_dest_test`, `db_delete_snapshot_file`).
+
 ### Outgoing Messages (to lattice-api)
 
-`registration`, `heartbeat`, `container_status`, `container_health_status`, `container_sync`, `container_logs`, `deployment_progress`, `lifecycle_log`, `worker_action_status`, `worker_shutdown`, `worker_crash`
+`registration`, `heartbeat`, `container_status`, `container_health_status`, `container_sync`, `container_logs`, `deployment_progress`, `deployment_status`, `lifecycle_log`, `worker_action_status`, `exec_output`, `list_volumes_response`, `list_networks_response`, `db_status`, `db_snapshot_status`, `db_restore_status`, `db_schedule_status`, `backup_dest_test_result`, `db_delete_snapshot_result`, `worker_shutdown`, `worker_crash`
 
 ## Deployment Strategies
 
 All strategies defined in `deploy/`:
 
-- **Rolling** (`rolling.go`): Sequential per container — pull, stop old, remove, create new
-- **Blue-Green** (`bluegreen.go`): Start green containers without ports, wait 5s for health, swap (stop old, recreate with ports)
+- **Rolling** (`rolling.go`): Per container — pull, create new under a `<name>-<6charsuffix>` temp name, health-gate it, then stop/remove the old and rename the new to the canonical name (with rollback + orphan cleanup on failure)
+- **Blue-Green** (`bluegreen.go`): Start green containers without host ports, poll health up to a 30s deadline, then swap (stop blue → remove blue → remove green → recreate final with ports)
 - **Canary** (`canary.go`): Start canary with `-canary` suffix, monitor every 5s for 30s, if healthy proceed with rolling
 
 DeploymentSpec includes containers, networks, and volumes. Progress reported to orchestrator at each step.
@@ -135,9 +137,9 @@ HTTP server on port 9100 (`web/`), binds to `127.0.0.1` by default (override wit
 - `lifecycle_log` messages sent during operations for real-time progress in web UI
 - `container_status` sent on completion with action + success/failure
 - Heartbeat sends full system metrics + container state snapshots for DB reconciliation
-- Container state mapping: Docker `running`->`running`, `paused`->`paused`, `exited`/`dead`->`stopped`, `created`/`restarting`->`pending`
-- WebSocket: 60s read deadline, 10s write deadline, 54s ping interval, auto-reconnect with backoff
-- Graceful shutdown: sends `worker_shutdown` message, drains send queue for 3s
+- Container state mapping: Docker `running`->`running`, `paused`->`paused`, `exited`/`dead`->`stopped`, `created`->`pending`, `restarting`->`restarting`, anything else->`error`
+- WebSocket: 60s read deadline, 10s write deadline, 54s ping interval, 4MB read limit, auto-reconnect with backoff
+- Graceful shutdown: waits up to 60s for in-flight deployments, sends `worker_shutdown`, cancels context, then drains the send queue for 5s before closing
 
 ## Build
 
