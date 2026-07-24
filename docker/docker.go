@@ -568,40 +568,6 @@ func (c *Client) ListNetworks(ctx context.Context) ([]network.Summary, error) {
 	return c.cli.NetworkList(ctx, network.ListOptions{})
 }
 
-// RecreateContainer stops, removes, and recreates a container with the same config.
-func (c *Client) RecreateContainer(ctx context.Context, containerID string, name string) (string, error) {
-	info, err := c.cli.ContainerInspect(ctx, containerID)
-	if err != nil {
-		return "", fmt.Errorf("inspect container: %w", err)
-	}
-
-	// Preserve network configuration from the original container
-	networkConfig := &network.NetworkingConfig{}
-	if info.NetworkSettings != nil && len(info.NetworkSettings.Networks) > 0 {
-		networkConfig.EndpointsConfig = make(map[string]*network.EndpointSettings)
-		for netName, netSettings := range info.NetworkSettings.Networks {
-			networkConfig.EndpointsConfig[netName] = &network.EndpointSettings{
-				IPAMConfig: netSettings.IPAMConfig,
-				Aliases:    netSettings.Aliases,
-			}
-		}
-	}
-
-	_ = c.StopContainer(ctx, containerID, 10)
-	_ = c.RemoveContainer(ctx, containerID, true)
-
-	resp, err := c.cli.ContainerCreate(ctx, info.Config, info.HostConfig, networkConfig, nil, name)
-	if err != nil {
-		return "", fmt.Errorf("recreate container: %w", err)
-	}
-
-	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("start recreated container: %w", err)
-	}
-
-	return resp.ID, nil
-}
-
 // GracefulRecreate performs a zero-downtime container replacement:
 //  1. Creates a new container with a temporary name (without host port bindings to avoid conflicts)
 //  2. Connects it to the same networks
