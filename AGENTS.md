@@ -158,9 +158,16 @@ differ from a typical Go API.
   `go func()` without the semaphore.
 - **Panic isolation is deliberate and layered.** The whole `OnMessage` callback is wrapped in a
   `recover()` that logs the stack but keeps the WS read-pump alive (one bad message must not kill
-  the process). Long-lived background goroutines are launched via `safeGo`, which on panic logs the
-  stack, sends a **`worker_crash`** message to the orchestrator, drains, and `os.Exit(2)` (so
-  `systemd` restarts a cleanly-reported crash).
+  the process). Long-lived background goroutines are launched two ways depending on how fatal a
+  panic is:
+  - **`safeGo`** (the WS connect loop only): a panic is *unrecoverable* — the worker can't function
+    without the socket — so it logs the stack, sends a **`worker_crash`** message, drains, and
+    `os.Exit(2)` (so `systemd` restarts a cleanly-reported crash).
+  - **`safeGoResilient`** (the telemetry/diagnostic loops: `log-streamer`, `net-monitor`,
+    `heartbeat`): a panic degrades one subsystem but is **not** grounds to kill a worker that is
+    otherwise running containers fine. It logs the stack, waits a 2s backoff, and **restarts the
+    loop** — it does **not** emit `worker_crash` (that message means the worker is exiting) and does
+    **not** `os.Exit`. It stops only when the loop returns normally (ctx cancelled on shutdown).
 - **Container names from the orchestrator are always validated first.** Every lifecycle/db handler
   calls `validContainerName` (or `!validContainerName`) before touching Docker, and rejects with a
   `worker_action_status` error. This is the injection guard — names flow into Docker lookups and,
@@ -469,8 +476,12 @@ or `go-monitor`.
     `RECONNECT_INTERVAL`; check journald for `ws: connection failed`.
   - *Runner won't start* — `config.Load` panicked on a missing `ORCHESTRATOR_URL`/`WORKER_TOKEN`, or
     it exited after 30 failed Docker connects (`docker.sock` perms / daemon down).
-  - *`systemd` restart loop* — a background goroutine panicked; look for a `worker_crash` message
-    (it carries the goroutine name + stack) and the corresponding journald `[<name>] PANIC` line.
+  - *`systemd` restart loop* — the WS connect loop panicked (the only loop that exits on panic);
+    look for a `worker_crash` message (it carries the goroutine name + stack) and the corresponding
+    journald `[ws-connect] PANIC` line. A panic in a telemetry loop (`log-streamer`/`net-monitor`/
+    `heartbeat`) does **not** restart the process — it self-heals via `safeGoResilient` and shows up
+    only as a journald `[<name>] PANIC (recovered, restarting loop…)` line, so a subsystem going
+    quiet without a restart is the signature there.
   - *Deploy stuck/failed* — inspect `deployment_progress`/`lifecycle_log`; `postDeployVerify` fails a
     deploy when containers crash-loop or report unhealthy within 60s.
   - *Container "not found" on a lifecycle action after a deploy* — likely still under a suffixed

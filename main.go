@@ -2578,7 +2578,7 @@ func main() {
 			},
 		})
 	}, 10*time.Second)
-	safeGo(ws, "log-streamer", func() { logStreamer.Run(ctx) })
+	safeGoResilient("log-streamer", func() { logStreamer.Run(ctx) })
 
 	// Network health monitor — detects DNS failures, bridge-only containers,
 	// restart loops, and attempts auto-repair. Reports via lifecycle_log.
@@ -2596,7 +2596,7 @@ func main() {
 			},
 		})
 	}, 30*time.Second)
-	safeGo(ws, "net-monitor", func() {
+	safeGoResilient("net-monitor", func() {
 		netMonitor.Run(ctx, func(event dockerclient.RestartLoopEvent) {
 			_ = ws.SendJSON(client.OutgoingMessage{
 				Type: "lifecycle_log",
@@ -2610,7 +2610,7 @@ func main() {
 	})
 
 	// Heartbeat ticker — also pushes live container states each tick
-	safeGo(ws, "heartbeat", func() {
+	safeGoResilient("heartbeat", func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
 		defer ticker.Stop()
 
@@ -3021,6 +3021,10 @@ func localIP() string {
 // safeGo runs fn in a new goroutine with panic recovery. If fn panics, the
 // full stack trace is logged and a worker_crash event is sent to the
 // orchestrator before the process exits.
+// safeGo runs a truly-unrecoverable background goroutine (the WS connect loop).
+// A panic here means the worker cannot function, so it is reported as a
+// worker_crash and the process exits(2) so systemd restarts a cleanly-reported
+// crash. Do NOT use this for degradable telemetry loops — use safeGoResilient.
 func safeGo(ws *client.WSClient, name string, fn func()) {
 	go func() {
 		defer func() {
@@ -3043,5 +3047,36 @@ func safeGo(ws *client.WSClient, name string, fn func()) {
 			}
 		}()
 		fn()
+	}()
+}
+
+// safeGoResilient runs a long-lived background loop that must survive panics
+// WITHOUT taking the whole worker down. Used for the telemetry/diagnostic loops
+// (log-streamer, net-monitor, heartbeat): a panic in one of those degrades a
+// single subsystem, it is not grounds to kill a worker that is otherwise
+// happily running containers. On panic it logs the stack, waits a short backoff,
+// and restarts the loop. It does NOT emit worker_crash — that message means the
+// worker is exiting, and here it is not. If fn returns normally (e.g. ctx was
+// cancelled on shutdown) the goroutine stops.
+func safeGoResilient(name string, fn func()) {
+	go func() {
+		for {
+			returnedNormally := func() (ok bool) {
+				defer func() {
+					if r := recover(); r != nil {
+						buf := make([]byte, 8192)
+						n := runtime.Stack(buf, false)
+						log.Printf("[%s] PANIC (recovered, restarting loop after backoff): %v\n%s", name, r, string(buf[:n]))
+						ok = false
+					}
+				}()
+				fn()
+				return true
+			}()
+			if returnedNormally {
+				return
+			}
+			time.Sleep(2 * time.Second) // backoff to avoid a tight panic-restart loop
+		}
 	}()
 }
