@@ -3,9 +3,11 @@ package docker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/go-connections/nat"
 )
@@ -114,11 +116,17 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 		},
 	}
 
-	// Health check config
+	// Health check config.
+	//
+	// StartPeriod matters more than it looks: failures inside it don't count
+	// toward the failing streak that flips a container to unhealthy. A cold
+	// database legitimately takes far longer than a few seconds — first-time
+	// initdb, or InnoDB crash recovery on restart — and 30s was tight enough to
+	// mark a perfectly healthy database unhealthy while it was still starting.
 	healthInterval := 10 * time.Second
 	healthTimeout := 5 * time.Second
 	healthRetries := 5
-	healthStart := 30 * time.Second
+	healthStart := 60 * time.Second
 
 	// Resource limits
 	resources := container.Resources{}
@@ -171,6 +179,71 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 	}
 
 	return resp.ID, nil
+}
+
+// ContainerHealth is the health state Docker reports for a container.
+type ContainerHealth struct {
+	Status        string // healthy, unhealthy, starting, or "" when no healthcheck
+	FailingStreak int
+}
+
+// ObservedDatabaseContainer is the state of one managed database container as
+// the worker actually sees it, as opposed to what the control plane believes.
+type ObservedDatabaseContainer struct {
+	ID           string
+	Name         string
+	State        string // running, exited, restarting, created, paused, dead
+	Health       *ContainerHealth
+	RestartCount int
+	ExitCode     int
+}
+
+// ListDatabaseContainers returns every Lattice-managed database container on
+// this host, including stopped ones.
+//
+// Selection is by the labels applied at creation rather than by name prefix, so
+// a container that merely looks like a database is never reported as one.
+func (c *Client) ListDatabaseContainers(ctx context.Context) ([]ObservedDatabaseContainer, error) {
+	f := filters.NewArgs()
+	f.Add("label", "managed-by=lattice")
+	f.Add("label", "lattice-type=database")
+
+	list, err := c.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		return nil, fmt.Errorf("list database containers: %w", err)
+	}
+
+	observed := make([]ObservedDatabaseContainer, 0, len(list))
+	for _, ctr := range list {
+		name := ""
+		if len(ctr.Names) > 0 {
+			name = strings.TrimPrefix(ctr.Names[0], "/")
+		}
+
+		entry := ObservedDatabaseContainer{
+			ID:    ctr.ID,
+			Name:  name,
+			State: ctr.State,
+		}
+
+		// Restart count and health only come back from an inspect. A failure
+		// here shouldn't drop the container from the report — knowing it exists
+		// is already more than the control plane had before.
+		if info, err := c.cli.ContainerInspect(ctx, ctr.ID); err == nil && info.State != nil {
+			entry.RestartCount = info.RestartCount
+			entry.ExitCode = info.State.ExitCode
+			if info.State.Health != nil {
+				entry.Health = &ContainerHealth{
+					Status:        info.State.Health.Status,
+					FailingStreak: info.State.Health.FailingStreak,
+				}
+			}
+		}
+
+		observed = append(observed, entry)
+	}
+
+	return observed, nil
 }
 
 // defaultDBPort returns the default internal port for a database engine.

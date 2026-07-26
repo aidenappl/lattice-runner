@@ -1759,6 +1759,17 @@ func main() {
 				session.cancel()
 			}()
 
+		case "db_sync_request":
+			// The orchestrator wants an immediate report of observed database
+			// state — sent on its reconcile tick and whenever this worker
+			// reconnects, so anything that changed while we were unreachable is
+			// corrected straight away.
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+				sendDatabaseSync(ctx, ws, docker)
+			}()
+
 		case "db_create":
 			handlerSem <- struct{}{}
 			go func() {
@@ -1766,11 +1777,8 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_create: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"action": "db_create", "status": "error", "message": "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"action": "db_create", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
@@ -1790,18 +1798,57 @@ func main() {
 					volumeName = containerName + "-data"
 				}
 
+				port := int(portF)
+
+				// Acknowledge receipt before doing anything slow. Pulling a
+				// database image can take minutes; without this the
+				// orchestrator cannot distinguish "the worker never got the
+				// command" from "the worker is working on it".
+				sendDbReply(ws, env, "db_status", map[string]any{
+					"container_name": containerName,
+					"action":         "db_create",
+					"status":         "accepted",
+					"phase":          "ack",
+				})
+
+				// Bind the host port for real before pulling several hundred
+				// megabytes of image. Probing is not enough on its own — the
+				// port can be taken between the check and the container start —
+				// but failing here turns a late, opaque Docker bind error into
+				// an immediate, specific one.
+				if port > 0 {
+					if err := probeHostPort(port); err != nil {
+						msg := fmt.Sprintf("host port %d is not available: %v", port, err)
+						log.Printf("db_create: %s", msg)
+						sendLifecycleLog(ws, containerName, "db_create", msg)
+						sendDbReply(ws, env, "db_status", map[string]any{
+							"container_name": containerName,
+							"action":         "db_create",
+							"status":         "failed",
+							"message":        msg,
+						})
+						return
+					}
+				}
+
+				memoryLimit := normaliseMemoryLimit(int64(memoryLimitF))
+				if memoryLimit != int64(memoryLimitF) {
+					log.Printf("db_create: memory_limit %.0f is below Docker's minimum; interpreted as megabytes (%d bytes)",
+						memoryLimitF, memoryLimit)
+				}
+
 				spec := dockerclient.DatabaseSpec{
 					ContainerName: containerName,
 					VolumeName:    volumeName,
 					Engine:        engine,
 					EngineVersion: engineVersion,
-					Port:          int(portF),
+					Port:          port,
 					RootPassword:  rootPassword,
 					DatabaseName:  databaseName,
 					Username:      username,
 					Password:      password,
 					CPULimit:      cpuLimitF,
-					MemoryLimit:   int64(memoryLimitF),
+					MemoryLimit:   memoryLimit,
 				}
 
 				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
@@ -1809,28 +1856,22 @@ func main() {
 				if err != nil {
 					log.Printf("db_create: failed to create %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("failed to create: %v", err))
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_create",
-							"status":         "failed",
-							"message":        err.Error(),
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_create",
+						"status":         "failed",
+						"message":        err.Error(),
 					})
 					return
 				}
 
 				log.Printf("db_create: created database container %s (id=%s)", containerName, containerID[:12])
 				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("database container created and started (id=%s)", containerID[:12]))
-				wsSendReliable(ws, "db_status", client.OutgoingMessage{
-					Type: "db_status",
-					Payload: map[string]any{
-						"container_name": containerName,
-						"action":         "db_create",
-						"status":         "success",
-						"container_id":   containerID,
-					},
+				sendDbReply(ws, env, "db_status", map[string]any{
+					"container_name": containerName,
+					"action":         "db_create",
+					"status":         "success",
+					"container_id":   containerID,
 				})
 			}()
 
@@ -1841,11 +1882,8 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_start: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"action": "db_start", "status": "error", "message": "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"action": "db_start", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
@@ -1854,14 +1892,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_start: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_start", "container not found")
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_start",
-							"status":         "failed",
-							"message":        "container not found",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_start",
+						"status":         "failed",
+						"message":        "container not found",
 					})
 					return
 				}
@@ -1869,24 +1904,18 @@ func main() {
 				if err := docker.StartContainer(ctx, id); err != nil {
 					log.Printf("db_start: failed to start %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("failed to start: %v", err))
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_start",
-							"status":         "failed",
-							"message":        err.Error(),
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_start",
+						"status":         "failed",
+						"message":        err.Error(),
 					})
 				} else {
 					log.Printf("db_start: started database container %s", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_start",
-							"status":         "success",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_start",
+						"status":         "success",
 					})
 				}
 			}()
@@ -1898,11 +1927,8 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_stop: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"action": "db_stop", "status": "error", "message": "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"action": "db_stop", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
@@ -1911,14 +1937,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_stop: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_stop", "container not found")
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_stop",
-							"status":         "failed",
-							"message":        "container not found",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_stop",
+						"status":         "failed",
+						"message":        "container not found",
 					})
 					return
 				}
@@ -1926,24 +1949,18 @@ func main() {
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
 					log.Printf("db_stop: failed to stop %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("failed to stop: %v", err))
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_stop",
-							"status":         "failed",
-							"message":        err.Error(),
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_stop",
+						"status":         "failed",
+						"message":        err.Error(),
 					})
 				} else {
 					log.Printf("db_stop: stopped database container %s", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_stop",
-							"status":         "success",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_stop",
+						"status":         "success",
 					})
 				}
 			}()
@@ -1955,11 +1972,8 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_restart: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"action": "db_restart", "status": "error", "message": "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"action": "db_restart", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
@@ -1968,14 +1982,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_restart: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_restart", "container not found")
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_restart",
-							"status":         "failed",
-							"message":        "container not found",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_restart",
+						"status":         "failed",
+						"message":        "container not found",
 					})
 					return
 				}
@@ -1983,24 +1994,18 @@ func main() {
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
 					log.Printf("db_restart: failed to restart %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("failed to restart: %v", err))
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_restart",
-							"status":         "failed",
-							"message":        err.Error(),
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_restart",
+						"status":         "failed",
+						"message":        err.Error(),
 					})
 				} else {
 					log.Printf("db_restart: restarted database container %s", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_restart",
-							"status":         "success",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_restart",
+						"status":         "success",
 					})
 				}
 			}()
@@ -2012,11 +2017,8 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_remove: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"action": "db_remove", "status": "error", "message": "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"action": "db_remove", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
@@ -2025,14 +2027,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_remove: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_remove", "container not found")
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_remove",
-							"status":         "failed",
-							"message":        "container not found",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "failed",
+						"message":        "container not found",
 					})
 					return
 				}
@@ -2045,25 +2044,19 @@ func main() {
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
 					log.Printf("db_remove: failed to remove %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_remove",
-							"status":         "failed",
-							"message":        err.Error(),
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "failed",
+						"message":        err.Error(),
 					})
 				} else {
 					log.Printf("db_remove: removed database container %s (volume preserved)", containerName)
 					sendLifecycleLog(ws, containerName, "db_remove", "database container removed (volume preserved)")
-					wsSendReliable(ws, "db_status", client.OutgoingMessage{
-						Type: "db_status",
-						Payload: map[string]any{
-							"container_name": containerName,
-							"action":         "db_remove",
-							"status":         "success",
-						},
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "success",
 					})
 				}
 			}()
@@ -2084,38 +2077,29 @@ func main() {
 
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_snapshot: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "invalid or missing container_name",
 					})
 					return
 				}
 				if engine == "" || databaseName == "" {
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "missing required fields (engine, database_name)",
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "missing required fields (engine, database_name)",
 					})
 					return
 				}
 
 				// Send uploading status
-				wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-					Type: "db_snapshot_status",
-					Payload: map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "uploading",
-					},
+				sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					"snapshot_id":    snapshotID,
+					"container_name": containerName,
+					"status":         "uploading",
 				})
 
 				sendLifecycleLog(ws, containerName, "db_snapshot", "looking up database container…")
@@ -2123,14 +2107,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_snapshot: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_snapshot", "container not found")
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "container not found",
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "container not found",
 					})
 					return
 				}
@@ -2140,14 +2121,11 @@ func main() {
 				if err != nil {
 					log.Printf("db_snapshot: dump failed for %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("dump failed: %v", err))
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("dump failed: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("dump failed: %v", err),
 					})
 					return
 				}
@@ -2156,14 +2134,11 @@ func main() {
 				tmpDir, err := os.MkdirTemp("", "lattice-snapshot-*")
 				if err != nil {
 					log.Printf("db_snapshot: failed to create temp dir: %v", err)
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
 					})
 					return
 				}
@@ -2173,28 +2148,22 @@ func main() {
 				f, err := os.Create(tmpFile)
 				if err != nil {
 					log.Printf("db_snapshot: failed to create temp file: %v", err)
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
 					})
 					return
 				}
 				if _, err := io.Copy(f, dumpReader); err != nil {
 					f.Close()
 					log.Printf("db_snapshot: failed to write dump: %v", err)
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to write dump: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to write dump: %v", err),
 					})
 					return
 				}
@@ -2205,14 +2174,11 @@ func main() {
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
 					log.Printf("db_snapshot: failed to create backup destination: %v", err)
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
 					})
 					return
 				}
@@ -2221,28 +2187,22 @@ func main() {
 				if err != nil {
 					log.Printf("db_snapshot: upload failed for %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("upload failed: %v", err))
-					wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-						Type: "db_snapshot_status",
-						Payload: map[string]any{
-							"snapshot_id":    snapshotID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("upload failed: %v", err),
-						},
+					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+						"snapshot_id":    snapshotID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("upload failed: %v", err),
 					})
 					return
 				}
 
 				log.Printf("db_snapshot: snapshot completed for %s (size=%d bytes)", containerName, size)
 				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("snapshot completed (size=%d bytes)", size))
-				wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-					Type: "db_snapshot_status",
-					Payload: map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "completed",
-						"size_bytes":     size,
-					},
+				sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					"snapshot_id":    snapshotID,
+					"container_name": containerName,
+					"status":         "completed",
+					"size_bytes":     size,
 				})
 			}()
 
@@ -2262,52 +2222,40 @@ func main() {
 
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_restore: invalid or empty container name: %q", containerName)
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "invalid or missing container_name",
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "invalid or missing container_name",
 					})
 					return
 				}
 				if engine == "" || databaseName == "" {
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "missing required fields (engine, database_name)",
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "missing required fields (engine, database_name)",
 					})
 					return
 				}
 
 				// Send downloading status
-				wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-					Type: "db_restore_status",
-					Payload: map[string]any{
-						"restore_id":     restoreID,
-						"container_name": containerName,
-						"status":         "downloading",
-					},
+				sendDbReply(ws, env, "db_restore_status", map[string]any{
+					"restore_id":     restoreID,
+					"container_name": containerName,
+					"status":         "downloading",
 				})
 
 				sendLifecycleLog(ws, containerName, "db_restore", "downloading snapshot from backup destination…")
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
 					log.Printf("db_restore: failed to create backup destination: %v", err)
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
 					})
 					return
 				}
@@ -2315,14 +2263,11 @@ func main() {
 				tmpDir, err := os.MkdirTemp("", "lattice-restore-*")
 				if err != nil {
 					log.Printf("db_restore: failed to create temp dir: %v", err)
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
 					})
 					return
 				}
@@ -2332,14 +2277,11 @@ func main() {
 				if err := dest.Download(ctx, remotePath, tmpFile); err != nil {
 					log.Printf("db_restore: download failed: %v", err)
 					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("download failed: %v", err))
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("download failed: %v", err),
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("download failed: %v", err),
 					})
 					return
 				}
@@ -2349,14 +2291,11 @@ func main() {
 				if err != nil || id == "" {
 					log.Printf("db_restore: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_restore", "container not found")
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  "container not found",
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  "container not found",
 					})
 					return
 				}
@@ -2365,14 +2304,11 @@ func main() {
 				restoreFile, err := os.Open(tmpFile)
 				if err != nil {
 					log.Printf("db_restore: failed to open temp file: %v", err)
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("failed to open restore file: %v", err),
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("failed to open restore file: %v", err),
 					})
 					return
 				}
@@ -2381,27 +2317,21 @@ func main() {
 				if err := docker.ExecDatabaseRestore(ctx, id, engine, databaseName, username, password, restoreFile); err != nil {
 					log.Printf("db_restore: restore failed for %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restore failed: %v", err))
-					wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-						Type: "db_restore_status",
-						Payload: map[string]any{
-							"restore_id":     restoreID,
-							"container_name": containerName,
-							"status":         "failed",
-							"error_message":  fmt.Sprintf("restore failed: %v", err),
-						},
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  fmt.Sprintf("restore failed: %v", err),
 					})
 					return
 				}
 
 				log.Printf("db_restore: restore completed for %s", containerName)
 				sendLifecycleLog(ws, containerName, "db_restore", "database restore completed")
-				wsSendReliable(ws, "db_restore_status", client.OutgoingMessage{
-					Type: "db_restore_status",
-					Payload: map[string]any{
-						"restore_id":     restoreID,
-						"container_name": containerName,
-						"status":         "completed",
-					},
+				sendDbReply(ws, env, "db_restore_status", map[string]any{
+					"restore_id":     restoreID,
+					"container_name": containerName,
+					"status":         "completed",
 				})
 			}()
 
@@ -2416,12 +2346,9 @@ func main() {
 				if !enabled {
 					snapshotScheduler.RemoveSchedule(instanceID)
 					log.Printf("db_update_schedule: removed schedule for instance %d", instanceID)
-					wsSendReliable(ws, "db_schedule_status", client.OutgoingMessage{
-						Type: "db_schedule_status",
-						Payload: map[string]any{
-							"instance_id": instanceID,
-							"status":      "removed",
-						},
+					sendDbReply(ws, env, "db_schedule_status", map[string]any{
+						"instance_id": instanceID,
+						"status":      "removed",
 					})
 					return
 				}
@@ -2448,13 +2375,10 @@ func main() {
 				})
 
 				log.Printf("db_update_schedule: updated schedule for instance %d (cron=%s)", instanceID, cron)
-				wsSendReliable(ws, "db_schedule_status", client.OutgoingMessage{
-					Type: "db_schedule_status",
-					Payload: map[string]any{
-						"instance_id": instanceID,
-						"status":      "updated",
-						"cron":        cron,
-					},
+				sendDbReply(ws, env, "db_schedule_status", map[string]any{
+					"instance_id": instanceID,
+					"status":      "updated",
+					"cron":        cron,
 				})
 			}()
 
@@ -2513,13 +2437,10 @@ func main() {
 				snapshotID, _ := env.Payload["snapshot_id"].(string)
 
 				if remotePath == "" {
-					wsSendReliable(ws, "db_delete_snapshot_result", client.OutgoingMessage{
-						Type: "db_delete_snapshot_result",
-						Payload: map[string]any{
-							"snapshot_id": snapshotID,
-							"status":      "failed",
-							"message":     "missing remote_path",
-						},
+					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+						"snapshot_id": snapshotID,
+						"status":      "failed",
+						"message":     "missing remote_path",
 					})
 					return
 				}
@@ -2527,37 +2448,28 @@ func main() {
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
 					log.Printf("db_delete_snapshot_file: failed to create destination: %v", err)
-					wsSendReliable(ws, "db_delete_snapshot_result", client.OutgoingMessage{
-						Type: "db_delete_snapshot_result",
-						Payload: map[string]any{
-							"snapshot_id": snapshotID,
-							"status":      "failed",
-							"message":     fmt.Sprintf("failed to create destination: %v", err),
-						},
+					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+						"snapshot_id": snapshotID,
+						"status":      "failed",
+						"message":     fmt.Sprintf("failed to create destination: %v", err),
 					})
 					return
 				}
 
 				if err := dest.Delete(ctx, remotePath); err != nil {
 					log.Printf("db_delete_snapshot_file: delete failed: %v", err)
-					wsSendReliable(ws, "db_delete_snapshot_result", client.OutgoingMessage{
-						Type: "db_delete_snapshot_result",
-						Payload: map[string]any{
-							"snapshot_id": snapshotID,
-							"status":      "failed",
-							"message":     fmt.Sprintf("delete failed: %v", err),
-						},
+					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+						"snapshot_id": snapshotID,
+						"status":      "failed",
+						"message":     fmt.Sprintf("delete failed: %v", err),
 					})
 					return
 				}
 
 				log.Printf("db_delete_snapshot_file: deleted %s", remotePath)
-				wsSendReliable(ws, "db_delete_snapshot_result", client.OutgoingMessage{
-					Type: "db_delete_snapshot_result",
-					Payload: map[string]any{
-						"snapshot_id": snapshotID,
-						"status":      "success",
-					},
+				sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+					"snapshot_id": snapshotID,
+					"status":      "success",
 				})
 			}()
 		}
@@ -2579,6 +2491,11 @@ func main() {
 		})
 	}, 10*time.Second)
 	safeGoResilient("log-streamer", func() { logStreamer.Run(ctx) })
+
+	// Database observer — periodically reports the true state of managed
+	// database containers so the orchestrator can reconcile against it rather
+	// than relying solely on command replies arriving intact.
+	safeGoResilient("db-observer", func() { startDatabaseObserver(ctx, ws, docker) })
 
 	// Network health monitor — detects DNS failures, bridge-only containers,
 	// restart loops, and attempts auto-repair. Reports via lifecycle_log.
@@ -2801,6 +2718,96 @@ func main() {
 
 // sendLifecycleLog sends a verbose lifecycle log entry to the orchestrator so
 // it gets persisted in the lifecycle_logs table and broadcast to the admin UI.
+// sendDbReply emits a database-subsystem reply to the orchestrator, echoing the
+// correlation fields from the command that triggered it.
+//
+// Every db_* reply must go through here. Replies used to be built as bare
+// payload literals that omitted database_instance_id entirely, so the
+// orchestrator could not match a reply to the row it was supposed to update —
+// which meant no managed database could ever leave "pending", whether the
+// operation succeeded or failed.
+func sendDbReply(ws *client.WSClient, env client.Envelope, msgType string, payload map[string]any) {
+	wsSendReliable(ws, msgType, client.OutgoingMessage{
+		Type:    msgType,
+		Payload: buildDbReplyPayload(env, payload),
+	})
+}
+
+// buildDbReplyPayload attaches correlation and phase to a database reply.
+//
+// Kept separate from the send so the contract can be tested without a socket —
+// this is the exact logic whose absence meant no managed database could ever
+// leave "pending".
+func buildDbReplyPayload(env client.Envelope, payload map[string]any) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+
+	// Echo correlation back verbatim. Pass through exactly what the
+	// orchestrator sent so a reply is never ambiguous.
+	for _, key := range []string{"database_instance_id", "request_id", "idempotency_key"} {
+		if v, ok := env.Payload[key]; ok {
+			if _, already := payload[key]; !already {
+				payload[key] = v
+			}
+		}
+	}
+
+	// Commands from an older orchestrator carry no instance id, but the
+	// scheduler path supplies one via instance_id. Prefer the explicit field.
+	if _, ok := payload["database_instance_id"]; !ok {
+		if v, ok := payload["instance_id"]; ok {
+			payload["database_instance_id"] = v
+		}
+	}
+
+	if _, ok := payload["action"]; !ok && env.Type != "" {
+		payload["action"] = env.Type
+	}
+
+	// Classify the outcome so the orchestrator does not have to infer lifecycle
+	// state from an action-outcome string.
+	if _, ok := payload["phase"]; !ok {
+		switch payload["status"] {
+		case "success", "completed":
+			payload["phase"] = "completed"
+		case "failed", "error":
+			payload["phase"] = "failed"
+		default:
+			payload["phase"] = "ack"
+		}
+	}
+
+	return payload
+}
+
+// normaliseMemoryLimit corrects a memory limit that was sent in megabytes where
+// bytes were expected.
+//
+// Docker rejects any limit below 6MB, so a value in that range is never a
+// legitimate request — it is always a caller that skipped the MB→bytes
+// conversion. That mismatch made every database create fail: a 512MB request
+// arrived as 512 bytes and Docker refused the container outright.
+func normaliseMemoryLimit(limit int64) int64 {
+	const dockerMinimumBytes = 6 * 1024 * 1024
+	if limit > 0 && limit < dockerMinimumBytes {
+		return limit * 1024 * 1024
+	}
+	return limit
+}
+
+// scheduledEnv synthesises an envelope for replies produced by the cron
+// scheduler rather than by an incoming command, so scheduled snapshots are
+// correlated to their instance the same way manual ones are.
+func scheduledEnv(instanceID int) client.Envelope {
+	return client.Envelope{
+		Type: "db_snapshot",
+		Payload: map[string]any{
+			"database_instance_id": instanceID,
+		},
+	}
+}
+
 func sendLifecycleLog(ws *client.WSClient, containerName, event, message string) {
 	log.Printf("[lifecycle] %s: %s — %s", containerName, event, message)
 	wsSend(ws, "lifecycle_log", client.OutgoingMessage{
@@ -2840,31 +2847,25 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 
 	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot triggered (instance=%d)", job.InstanceID))
 
-	wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-		Type: "db_snapshot_status",
-		Payload: map[string]any{
-			"snapshot_id":    snapshotID,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "uploading",
-		},
+	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		"snapshot_id":    snapshotID,
+		"container_name": containerName,
+		"instance_id":    job.InstanceID,
+		"scheduled":      true,
+		"status":         "uploading",
 	})
 
 	id, err := docker.FindContainerByName(ctx, containerName)
 	if err != nil || id == "" {
 		log.Printf("scheduled snapshot: container %s not found", containerName)
 		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot failed: container not found")
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  "container not found",
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  "container not found",
 		})
 		return
 	}
@@ -2874,16 +2875,13 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	if err != nil {
 		log.Printf("scheduled snapshot: dump failed for %s: %v", containerName, err)
 		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled dump failed: %v", err))
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("dump failed: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("dump failed: %v", err),
 		})
 		return
 	}
@@ -2892,16 +2890,13 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	tmpDir, err := os.MkdirTemp("", "lattice-scheduled-snapshot-*")
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create temp dir: %v", err)
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
 		})
 		return
 	}
@@ -2911,32 +2906,26 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	f, err := os.Create(tmpFile)
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create temp file: %v", err)
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
 		})
 		return
 	}
 	if _, err := io.Copy(f, dumpReader); err != nil {
 		f.Close()
 		log.Printf("scheduled snapshot: failed to write dump: %v", err)
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("failed to write dump: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("failed to write dump: %v", err),
 		})
 		return
 	}
@@ -2949,16 +2938,13 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	dest, err := backup.NewDestination(destType, destConfig)
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create backup destination: %v", err)
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("failed to create backup destination: %v", err),
 		})
 		return
 	}
@@ -2967,33 +2953,27 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	if err != nil {
 		log.Printf("scheduled snapshot: upload failed for %s: %v", containerName, err)
 		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled upload failed: %v", err))
-		wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-			Type: "db_snapshot_status",
-			Payload: map[string]any{
-				"snapshot_id":    snapshotID,
-				"container_name": containerName,
-				"instance_id":    job.InstanceID,
-				"scheduled":      true,
-				"status":         "failed",
-				"error_message":  fmt.Sprintf("upload failed: %v", err),
-			},
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"snapshot_id":    snapshotID,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  fmt.Sprintf("upload failed: %v", err),
 		})
 		return
 	}
 
 	log.Printf("scheduled snapshot: completed for %s (size=%d bytes)", containerName, size)
 	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot completed (size=%d bytes)", size))
-	wsSendReliable(ws, "db_snapshot_status", client.OutgoingMessage{
-		Type: "db_snapshot_status",
-		Payload: map[string]any{
-			"snapshot_id":    snapshotID,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "completed",
-			"size_bytes":     size,
-			"remote_path":    remotePath,
-		},
+	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		"snapshot_id":    snapshotID,
+		"container_name": containerName,
+		"instance_id":    job.InstanceID,
+		"scheduled":      true,
+		"status":         "completed",
+		"size_bytes":     size,
+		"remote_path":    remotePath,
 	})
 }
 

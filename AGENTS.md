@@ -282,15 +282,18 @@ silently ignored.
 | `exec_input` | `data` (b64), `command_id` | Write stdin to the exec session | — |
 | `exec_resize` | `height`, `width`, `command_id` | Resize the exec TTY | — |
 | `exec_close` | `command_id` | Cancel/close the exec session | `exec_output` (`closed:true`) |
-| `db_create` | `container_name`, `engine`, `engine_version`, `port`, creds, `volume_name?`, limits | Create+start a managed database container | `db_status`, `lifecycle_log` |
+| `db_create` | `container_name`, `engine`, `engine_version`, `port`, creds, `volume_name?`, limits (`memory_limit` in **bytes**) | Ack → probe the host port → pull → create+start a managed database container | `db_status` (`ack`→`completed`/`failed`), `lifecycle_log` |
 | `db_start` / `db_stop` / `db_restart` / `db_remove` | `container_name` | Lifecycle for a db container (`db_remove` preserves the volume) | `db_status`, `lifecycle_log` |
 | `db_snapshot` | `container_name`, `engine`, `database_name`, creds, `snapshot_id`, `remote_path`, `dest_type`, `dest_config` | Dump db → temp file → upload to backup destination | `db_snapshot_status` (`uploading`→`completed`/`failed`), `lifecycle_log` |
 | `db_restore` | as snapshot + `restore_id` | Download from destination → restore into db | `db_restore_status` (`downloading`→`completed`/`failed`), `lifecycle_log` |
 | `db_update_schedule` | `instance_id`, `enabled`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_dest` | Add/update or remove a scheduled snapshot job | `db_schedule_status` |
 | `backup_dest_test` | `dest_type`, `dest_config` | Build destination + connectivity `Test()` | `backup_dest_test_result` |
 | `db_delete_snapshot_file` | `dest_type`, `dest_config`, `remote_path`, `snapshot_id` | Delete a snapshot file from the destination | `db_delete_snapshot_result` |
+| `db_sync_request` | — | Report every `lattice-type=database` container it can see | `db_sync` |
 
-**Outbound messages the runner sends.** Every one is a `type` on `OutgoingMessage`.
+**Outbound messages the runner sends.** Every one is a `type` on `OutgoingMessage`. Every `db_*`
+reply carries the correlation fields echoed by `sendDbReply` — see *Managed databases* below;
+omitting `database_instance_id` makes the reply unusable to the orchestrator.
 
 | Outbound `type` | When | Notable payload |
 |---|---|---|
@@ -306,11 +309,12 @@ silently ignored.
 | `container_logs` | Continuously (log streamer) | `container_name`, `stream`, `message`, `recorded_at` (RFC3339Nano) |
 | `exec_output` | During an exec session | `command_id`, `data` (b64) / `error` / `closed` |
 | `list_volumes_response` / `list_networks_response` | Reply to the matching list command | `command_id`, `status`, `volumes`/`networks` |
-| `db_status` | End of a db lifecycle action | `container_name`, `action`, `status`, `container_id?` |
+| `db_status` | On receipt of, and at the end of, a db lifecycle action | `database_instance_id`, `request_id`, `idempotency_key`, `container_name`, `action`, `phase` (`ack`/`completed`/`failed`), `status`, `container_id?` |
 | `db_snapshot_status` / `db_restore_status` | Snapshot/restore progress | ids, `status`, `size_bytes?`, `error_message?`, `scheduled?` |
 | `db_schedule_status` | Reply to `db_update_schedule` | `instance_id`, `status` (`updated`/`removed`), `cron?` |
 | `backup_dest_test_result` | Reply to `backup_dest_test` | `command_id`, `status`, `message` |
 | `db_delete_snapshot_result` | Reply to `db_delete_snapshot_file` | `snapshot_id`, `status`, `message?` |
+| `db_sync` | Every 60s and on `db_sync_request` | `containers[]` of `container_name`, `container_id`, `state`, `health`, `restart_count`, `fatal_hint?` — the observed state the orchestrator reconciles against |
 | `worker_shutdown` | Graceful shutdown | `reason`, `message` — lets the orchestrator mark the worker offline cleanly |
 | `worker_crash` | A `safeGo` goroutine panicked | `goroutine`, `panic`, `stack` — sent just before `os.Exit(2)` |
 
@@ -384,6 +388,42 @@ stats (`ContainerStats`) are attached only every 3rd heartbeat because they're e
 heartbeat tick also pushes a `container_sync` snapshot per container so the orchestrator's DB
 stays reconciled even when containers change state outside Lattice.
 
+### Managed databases
+
+`docker/database.go` creates and inspects managed database containers, labelled
+`managed-by=lattice`, `lattice-type=database`, `lattice-engine=<engine>`. Selection is always by
+label, never by name prefix, so a container that merely looks like a database is never treated as
+one.
+
+**Every `db_*` reply must go through `sendDbReply` (`main.go`).** It echoes
+`database_instance_id`, `request_id` and `idempotency_key` from the triggering command and derives
+a `phase` (`ack` → `completed`/`failed`). This is not optional bookkeeping: replies were originally
+built as bare payload literals with no instance ID, so the orchestrator could not match a reply to
+the row it was meant to update and **no managed database could ever leave `pending`**, whether the
+operation succeeded or failed. `buildDbReplyPayload` holds the logic separately so it is testable
+without a socket. Scheduler-triggered replies have no incoming command, so they use
+`scheduledEnv(instanceID)` to correlate.
+
+**`database_observer.go`** reports observed state so the orchestrator can reconcile against
+reality rather than trusting that command replies arrived:
+
+- `startDatabaseObserver` sends `db_sync` every 60s, immediately on start, and on demand in
+  response to `db_sync_request`.
+- Each entry carries Docker state, mapped health, and restart count. A container with ≥3 restarts
+  is additionally scanned for a known-fatal startup signature (`fatalInitSignatures` — wrong volume
+  ownership, a non-empty Postgres data directory, and so on) and the diagnosis is attached as
+  `fatal_hint`, so the orchestrator can say *why* rather than "it keeps restarting".
+- `probeHostPort` binds the host port for real before `db_create` pulls the image. Probing is not a
+  substitute for the orchestrator's ledger — a port can be taken between check and bind — but it
+  turns a late, opaque Docker error into an immediate, specific one.
+- `normaliseMemoryLimit` converts a limit below Docker's 6MB floor from megabytes to bytes. Such a
+  value is never legitimate; it always means the caller skipped the conversion, which is exactly
+  the bug that made every create fail when 512MB arrived as 512 bytes.
+
+Database healthchecks use a **60s `start_period`**. Failures inside it don't count toward the
+failing streak, which matters because a cold database legitimately takes far longer than a moment
+to initialise — first-time `initdb`, or InnoDB crash recovery on restart.
+
 ### Scheduler (cron snapshots)
 
 `scheduler/scheduler.go` keeps a map of `Job`s keyed by database instance ID, set via
@@ -392,7 +432,8 @@ fires jobs whose 5-field cron expression matches. It supports `*`, exact values,
 ranges (`1-5`), and steps (`*/5`, `1-30/5`) via a hand-written matcher (no cron library). A
 per-instance `inflight` `sync.Map` skips a fire if the previous snapshot for that instance is still
 running. Fired jobs call back into `main.go`'s `handleScheduledSnapshot`, which mirrors the
-`db_snapshot` flow and reports `db_snapshot_status` with `scheduled:true`.
+`db_snapshot` flow and reports `db_snapshot_status` with `scheduled:true`, correlated via
+`scheduledEnv`.
 
 ### Backup subsystem
 
@@ -528,18 +569,23 @@ or `go-monitor`.
 ```bash
 gofmt -w -s .        # format (CI rejects unformatted Go)
 go build ./...       # must compile
-go test ./...        # unit tests: validate, config, deploy, docker, backup, scheduler
+go test ./...        # unit tests: root (validate, db observer), config, deploy, docker, backup, scheduler
 go vet ./...         # must be clean
 ```
 
-`dev check` runs fmt + vet + test in one shot. There is no integration suite and no live smoke
-test in this repo. If you change the message protocol, the real verification is a round-trip against
-a running `lattice-api` (or its worker WS endpoint) — schema-level agreement is not enough.
+`dev check` runs fmt + vet + test in one shot. **CI runs all of the above in a `test` job that
+`build-and-push` depends on**, so unformatted code or a failing test blocks the image build and the
+deploy. The formatting gate uses plain `gofmt -l .`.
 
-> Note: as of this writing several existing files carry pre-existing `gofmt` drift
-> (`gofmt -w -s .` will touch `deploy/executor.go`, `docker/docker.go`, `main.go`,
-> `scheduler/*.go`, `web/dashboard.go`). Format only the files your change actually touches;
-> don't sweep unrelated files in a docs/behavior change.
+There is no integration suite and no live smoke test in this repo. If you change the message
+protocol, the real verification is a round-trip against a running `lattice-api` (or its worker WS
+endpoint) — schema-level agreement is not enough, and the database subsystem is the cautionary
+example: eight separate defects shipped because both sides compiled fine and nobody exercised the
+contract end to end.
+
+> The `gofmt` drift this file previously warned about is gone — the tree is clean under both
+> `gofmt -l .` and `gofmt -l -s .`. Still format only what your change touches rather than sweeping
+> unrelated files.
 
 ## Keeping this file updated
 
