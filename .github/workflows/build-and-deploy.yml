@@ -19,8 +19,14 @@ jobs:
 
       - name: Resolve version
         id: version
+        # MSG comes in via env, never via ${{ }} interpolation into the script.
+        # Expanded inline, a commit message containing a quote or paren is
+        # pasted in as shell source and the step dies with a syntax error —
+        # exit 127 at resolve-version, no image, no release, and a failure that
+        # looks nothing like its cause. Never move this back inline.
+        env:
+          MSG: ${{ github.event.head_commit.message }}
         run: |
-          MSG="${{ github.event.head_commit.message }}"
           IS_RELEASE=false
 
           if echo "$MSG" | grep -qE '\[release-(patch|minor|major)\]'; then
