@@ -202,3 +202,108 @@ func TestHealthCheckUnmarshalJSON(t *testing.T) {
 		}
 	})
 }
+
+// TestCleanupDecisionNeverRemovesDatabases guards the rule whose violation
+// destroys data rather than merely failing a deploy.
+//
+// Managed database containers carry managed-by=lattice and no lattice-stack
+// label, so before this guard existed the port-conflict fallback would stop and
+// remove a live database to hand its host port to a deploying stack — and an
+// empty stack name would match every database via the stack check.
+func TestCleanupDecisionNeverRemovesDatabases(t *testing.T) {
+	dbLabels := map[string]string{
+		"managed-by":     "lattice",
+		"lattice-type":   "database",
+		"lattice-engine": "mariadb",
+	}
+
+	tests := []struct {
+		name        string
+		stackName   string
+		publicPorts []uint16
+		neededPorts map[string]bool
+	}{
+		{
+			name:        "database holding a port the new spec wants",
+			stackName:   "some-stack",
+			publicPorts: []uint16{20000},
+			neededPorts: map[string]bool{"20000": true},
+		},
+		{
+			name:        "empty stack name must not match the absent stack label",
+			stackName:   "",
+			publicPorts: nil,
+			neededPorts: nil,
+		},
+		{
+			name:        "database with no ports and an unrelated stack",
+			stackName:   "other",
+			publicPorts: nil,
+			neededPorts: map[string]bool{"8080": true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			remove, reason := cleanupDecision(
+				dbLabels, "lattice-db-testdb", tt.publicPorts,
+				tt.stackName, map[string]bool{}, tt.neededPorts,
+			)
+			if remove {
+				t.Errorf("cleanup would remove a managed database (%s) — this is data loss", reason)
+			}
+		})
+	}
+}
+
+func TestCleanupDecisionSkipsForeignContainers(t *testing.T) {
+	foreign := map[string]string{"com.docker.compose.project": "something-else"}
+	remove, reason := cleanupDecision(
+		foreign, "postgres", []uint16{5432},
+		"stack", map[string]bool{}, map[string]bool{"5432": true},
+	)
+	if remove {
+		t.Errorf("cleanup would remove a foreign container (%s); failing the port bind is correct instead", reason)
+	}
+}
+
+func TestCleanupDecisionRemovesStaleStackContainers(t *testing.T) {
+	labels := map[string]string{
+		"managed-by":    "lattice",
+		"lattice-stack": "my-stack",
+	}
+
+	t.Run("stale container from this stack is removed", func(t *testing.T) {
+		remove, reason := cleanupDecision(
+			labels, "old-service", nil,
+			"my-stack", map[string]bool{"new-service": true}, nil,
+		)
+		if !remove {
+			t.Error("a stack container absent from the new spec should be removed")
+		}
+		if reason == "" {
+			t.Error("removal must carry a reason")
+		}
+	})
+
+	t.Run("container still in the spec is kept", func(t *testing.T) {
+		remove, _ := cleanupDecision(
+			labels, "kept-service", nil,
+			"my-stack", map[string]bool{"kept-service": true}, nil,
+		)
+		if remove {
+			t.Error("a container present in the new spec must not be removed")
+		}
+	})
+
+	t.Run("lattice container holding a needed port is reclaimed", func(t *testing.T) {
+		legacy := map[string]string{"managed-by": "lattice"}
+		remove, _ := cleanupDecision(
+			legacy, "legacy", []uint16{8080},
+			"my-stack", map[string]bool{}, map[string]bool{"8080": true},
+		)
+		if !remove {
+			t.Error("a Lattice-managed non-database container holding a needed port should be reclaimed")
+		}
+	})
+}

@@ -1889,7 +1889,22 @@ func main() {
 				}
 				sendLifecycleLog(ws, containerName, "db_start", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_start: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_start",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_start: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_start", "container not found")
 					sendDbReply(ws, env, "db_status", map[string]any{
@@ -1934,7 +1949,22 @@ func main() {
 				}
 				sendLifecycleLog(ws, containerName, "db_stop", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_stop: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_stop",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_stop: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_stop", "container not found")
 					sendDbReply(ws, env, "db_status", map[string]any{
@@ -1979,7 +2009,22 @@ func main() {
 				}
 				sendLifecycleLog(ws, containerName, "db_restart", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_restart: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_restart",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_restart: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_restart", "container not found")
 					sendDbReply(ws, env, "db_status", map[string]any{
@@ -2024,7 +2069,22 @@ func main() {
 				}
 				sendLifecycleLog(ws, containerName, "db_remove", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_remove: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_remove: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_remove", "container not found")
 					sendDbReply(ws, env, "db_status", map[string]any{
@@ -2104,7 +2164,22 @@ func main() {
 
 				sendLifecycleLog(ws, containerName, "db_snapshot", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_snapshot: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_snapshot",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_snapshot: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_snapshot", "container not found")
 					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
@@ -2288,7 +2363,22 @@ func main() {
 
 				sendLifecycleLog(ws, containerName, "db_restore", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
-				if err != nil || id == "" {
+				// Distinguish a Docker API failure from a genuinely absent
+				// container: reporting "not found" for both sends the reader
+				// hunting for a deleted container when the daemon merely
+				// errored.
+				if err != nil {
+					log.Printf("db_restore: failed to look up %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_restore",
+						"status":         "failed",
+						"message":        fmt.Sprintf("failed to look up container: %v", err),
+					})
+					return
+				}
+				if id == "" {
 					log.Printf("db_restore: container %s not found", containerName)
 					sendLifecycleLog(ws, containerName, "db_restore", "container not found")
 					sendDbReply(ws, env, "db_restore_status", map[string]any{

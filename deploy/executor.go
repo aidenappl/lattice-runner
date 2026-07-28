@@ -257,6 +257,59 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 	return nil
 }
 
+// cleanupDecision reports whether a container should be removed ahead of a
+// deployment, and why.
+//
+// Pure, so the safety rules can be asserted directly — the surrounding function
+// needs a live Docker daemon, and these rules are the ones where a mistake
+// destroys somebody's data rather than merely failing a deploy.
+func cleanupDecision(
+	labels map[string]string,
+	name string,
+	publicPorts []uint16,
+	stackName string,
+	specNames map[string]bool,
+	neededPorts map[string]bool,
+) (bool, string) {
+	// Foreign containers are never touched. Silently killing a legitimate
+	// non-Lattice service to free a port would be far worse than failing the
+	// bind, which is what the strategy will do instead.
+	if labels["managed-by"] != "lattice" {
+		return false, ""
+	}
+
+	// Managed databases are Lattice-managed but are not stack containers: they
+	// carry managed-by=lattice with no lattice-stack label. Without this guard
+	// the port-conflict fallback below would stop and remove a live database to
+	// hand its host port to a deploying stack, and an empty stackName would
+	// match every database via the stack check. Databases have their own
+	// lifecycle; only the db_* commands may remove them.
+	if labels["lattice-type"] == "database" {
+		return false, ""
+	}
+
+	canonical := dockerclient.CanonicalContainerName(name)
+	if specNames[canonical] || specNames[name] {
+		return false, ""
+	}
+
+	// Check 1: container belongs to this stack but is not in the new spec.
+	if labels["lattice-stack"] == stackName {
+		return true, fmt.Sprintf("stale stack container (was in stack %q, not in new spec)", stackName)
+	}
+
+	// Check 2: container holds a port the new spec needs. This is a fallback for
+	// Lattice-managed stack containers predating the lattice-stack label, not a
+	// mechanism for reclaiming ports from anything else.
+	for _, p := range publicPorts {
+		if neededPorts[fmt.Sprintf("%d", p)] {
+			return true, fmt.Sprintf("holds port %d needed by new spec", p)
+		}
+	}
+
+	return false, ""
+}
+
 // cleanupStaleContainers finds containers that belong to this stack (via the
 // lattice-stack label) but are NOT in the new deployment spec. These are
 // containers that were renamed or removed from the compose file. They must be
@@ -296,10 +349,6 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 	}
 
 	for _, c := range containers {
-		if c.Labels["managed-by"] != "lattice" {
-			continue
-		}
-
 		name := ""
 		if len(c.Names) > 0 {
 			name = strings.TrimPrefix(c.Names[0], "/")
@@ -308,36 +357,14 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 			continue
 		}
 
-		canonical := dockerclient.CanonicalContainerName(name)
-
-		// Skip containers that are part of the new spec
-		if specNames[canonical] || specNames[name] {
-			continue
-		}
-		// Note: only managed-by=lattice containers reach this point (foreign
-		// containers were skipped above), so Check 2 below can never stop a
-		// non-Lattice container that happens to hold a needed port.
-
-		shouldRemove := false
-		reason := ""
-
-		// Check 1: container has the lattice-stack label matching this stack
-		if c.Labels["lattice-stack"] == spec.StackName {
-			shouldRemove = true
-			reason = fmt.Sprintf("stale stack container (was in stack %q, not in new spec)", spec.StackName)
-		}
-
-		// Check 2: container holds a port we need (fallback for Lattice-managed
-		// containers that predate the lattice-stack label — NOT foreign containers)
-		if !shouldRemove && len(neededPorts) > 0 {
-			for _, p := range c.Ports {
-				if p.PublicPort > 0 && neededPorts[fmt.Sprintf("%d", p.PublicPort)] {
-					shouldRemove = true
-					reason = fmt.Sprintf("holds port %d needed by new spec", p.PublicPort)
-					break
-				}
+		publicPorts := make([]uint16, 0, len(c.Ports))
+		for _, p := range c.Ports {
+			if p.PublicPort > 0 {
+				publicPorts = append(publicPorts, p.PublicPort)
 			}
 		}
+
+		shouldRemove, reason := cleanupDecision(c.Labels, name, publicPorts, spec.StackName, specNames, neededPorts)
 
 		if shouldRemove {
 			log.Printf("deploy: cleanup: removing %s (%s)", name, reason)
@@ -363,6 +390,11 @@ func (e *Executor) forceRemoveAllStackContainers(ctx context.Context, spec Deplo
 
 	for _, c := range containers {
 		if c.Labels["managed-by"] != "lattice" {
+			continue
+		}
+		// Never force-remove a managed database. It has no lattice-stack label,
+		// so an empty spec.StackName would otherwise match every one of them.
+		if c.Labels["lattice-type"] == "database" {
 			continue
 		}
 		if c.Labels["lattice-stack"] != spec.StackName {
