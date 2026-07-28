@@ -25,6 +25,10 @@ type DatabaseSpec struct {
 	Password      string
 	CPULimit      float64 // CPU cores
 	MemoryLimit   int64   // bytes
+	// AdoptVolume permits reusing an existing data volume. Off by default: see
+	// the check in CreateDatabaseContainer for why silently reusing one is
+	// dangerous.
+	AdoptVolume bool
 }
 
 // CreateDatabaseContainer creates and starts a database container with the appropriate
@@ -89,6 +93,29 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 		healthCmd = []string{"CMD", "pg_isready", "-U", spec.Username}
 	default:
 		return "", fmt.Errorf("unsupported database engine: %s", spec.Engine)
+	}
+
+	// Refuse to silently adopt an existing data volume.
+	//
+	// Every official database image only initialises when its data directory is
+	// empty. Attaching a volume that already has data means MARIADB_USER,
+	// MYSQL_PASSWORD, POSTGRES_PASSWORD and friends are ignored entirely: the
+	// container starts, reports healthy, and serves the *old* credentials while
+	// the control plane records the new ones it just generated. Nothing looks
+	// wrong until someone tries to connect.
+	//
+	// Volumes deliberately outlive their instances (db_remove preserves them),
+	// so this is reachable whenever a database is recreated under a name that
+	// was used before.
+	if _, inspectErr := c.cli.VolumeInspect(ctx, spec.VolumeName); inspectErr == nil {
+		if !spec.AdoptVolume {
+			return "", fmt.Errorf(
+				"data volume %q already exists and would be reused: %s would skip initialisation "+
+					"and keep its previous credentials, ignoring the ones configured here. "+
+					"Remove the volume (docker volume rm %s), choose a different instance name, "+
+					"or set adopt_existing_volume to reuse it deliberately",
+				spec.VolumeName, spec.Engine, spec.VolumeName)
+		}
 	}
 
 	// Create the named volume

@@ -420,6 +420,14 @@ reality rather than trusting that command replies arrived:
   value is never legitimate; it always means the caller skipped the conversion, which is exactly
   the bug that made every create fail when 512MB arrived as 512 bytes.
 
+**Data volumes are never silently reused.** `CreateDatabaseContainer` refuses to start when
+`lattice-dbdata-<name>` already exists unless `adopt_existing_volume` is set. Every official
+database image only initialises when its data directory is empty, so attaching a populated volume
+means `MARIADB_USER`/`POSTGRES_PASSWORD` and friends are ignored entirely: the container starts,
+reports healthy, and serves its *previous* credentials while the control plane records the new ones
+it just generated. Nothing looks wrong until a connection fails. `db_remove` deliberately preserves
+volumes, so this is reachable whenever a database is recreated under a previously-used name.
+
 Database healthchecks use a **60s `start_period`**. Failures inside it don't count toward the
 failing streak, which matters because a cold database legitimately takes far longer than a moment
 to initialise — first-time `initdb`, or InnoDB crash recovery on restart.

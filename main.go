@@ -1793,6 +1793,7 @@ func main() {
 				volumeName, _ := env.Payload["volume_name"].(string)
 				cpuLimitF, _ := env.Payload["cpu_limit"].(float64)
 				memoryLimitF, _ := env.Payload["memory_limit"].(float64)
+				adoptVolume, _ := env.Payload["adopt_existing_volume"].(bool)
 
 				if volumeName == "" {
 					volumeName = containerName + "-data"
@@ -1849,6 +1850,7 @@ func main() {
 					Password:      password,
 					CPULimit:      cpuLimitF,
 					MemoryLimit:   memoryLimit,
+					AdoptVolume:   adoptVolume,
 				}
 
 				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
