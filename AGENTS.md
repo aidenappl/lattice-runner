@@ -283,7 +283,8 @@ silently ignored.
 | `exec_resize` | `height`, `width`, `command_id` | Resize the exec TTY | — |
 | `exec_close` | `command_id` | Cancel/close the exec session | `exec_output` (`closed:true`) |
 | `db_create` | `container_name`, `engine`, `engine_version`, `port`, creds, `volume_name?`, limits (`memory_limit` in **bytes**) | Ack → probe the host port → pull → create+start a managed database container | `db_status` (`ack`→`completed`/`failed`), `lifecycle_log` |
-| `db_start` / `db_stop` / `db_restart` / `db_remove` | `container_name` | Lifecycle for a db container (`db_remove` preserves the volume) | `db_status`, `lifecycle_log` |
+| `db_start` / `db_stop` / `db_restart` | `container_name` | Lifecycle for a db container | `db_status`, `lifecycle_log` |
+| `db_remove` | `container_name`, `remove_volume?`, `volume_name?` | Destroy a db container. Preserves the data volume unless `remove_volume` is set, which purges `volume_name` too (that is how a delete differs from the `remove` action). **Idempotent** — an absent container is success, not failure | `db_status` (with `volume_removed`), `lifecycle_log` |
 | `db_snapshot` | `container_name`, `engine`, `database_name`, creds, `snapshot_id`, `remote_path`, `dest_type`, `dest_config` | Dump db → temp file → upload to backup destination | `db_snapshot_status` (`uploading`→`completed`/`failed`), `lifecycle_log` |
 | `db_restore` | as snapshot + `restore_id` | Download from destination → restore into db | `db_restore_status` (`downloading`→`completed`/`failed`), `lifecycle_log` |
 | `db_update_schedule` | `instance_id`, `enabled`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_dest` | Add/update or remove a scheduled snapshot job | `db_schedule_status` |
@@ -426,7 +427,17 @@ database image only initialises when its data directory is empty, so attaching a
 means `MARIADB_USER`/`POSTGRES_PASSWORD` and friends are ignored entirely: the container starts,
 reports healthy, and serves its *previous* credentials while the control plane records the new ones
 it just generated. Nothing looks wrong until a connection fails. `db_remove` deliberately preserves
-volumes, so this is reachable whenever a database is recreated under a previously-used name.
+volumes unless the orchestrator asks for a purge, so this is reachable whenever a database is
+recreated under a previously-used name.
+
+**`db_remove` is idempotent in both halves.** An already-absent container is the *goal* of a remove,
+so it is reported as success with the volume phase still carried out — replying `failed: container
+not found` (as it once did) drove the control plane's instance into `error` on any second remove and
+left a purge unable to reach the volume the first one stranded. The volume removal passes
+`force=true` for the same reason: the daemon then treats an already-absent volume as success, so a
+retried delete converges instead of failing on the volume it deleted last time. A purge that cannot
+remove the volume fails loudly rather than reporting success — the control plane retires the database
+record only on `volume_removed: true`.
 
 Database healthchecks use a **60s `start_period`**. Failures inside it don't count toward the
 failing streak, which matters because a cold database legitimately takes far longer than a moment

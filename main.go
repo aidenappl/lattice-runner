@@ -2069,6 +2069,22 @@ func main() {
 					})
 					return
 				}
+				// removeVolume distinguishes the two callers of db_remove: the
+				// `remove` action tears the container down and keeps the data,
+				// a delete purges both.
+				removeVolume, _ := env.Payload["remove_volume"].(bool)
+				volumeName, _ := env.Payload["volume_name"].(string)
+				if removeVolume && (volumeName == "" || !validContainerName(volumeName)) {
+					log.Printf("db_remove: volume purge requested with invalid volume name: %q", volumeName)
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "failed",
+						"message":        "volume purge requested but volume_name is missing or invalid",
+					})
+					return
+				}
+
 				sendLifecycleLog(ws, containerName, "db_remove", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
@@ -2086,41 +2102,70 @@ func main() {
 					})
 					return
 				}
+
+				// An absent container is the *goal* of a remove, not a failure.
+				// Reporting it as one used to poison the instance into `error`
+				// on any second remove — and made a delete unable to clean up
+				// the volume left behind by a first one.
 				if id == "" {
-					log.Printf("db_remove: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_remove", "container not found")
-					sendDbReply(ws, env, "db_status", map[string]any{
-						"container_name": containerName,
-						"action":         "db_remove",
-						"status":         "failed",
-						"message":        "container not found",
-					})
-					return
-				}
-				sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stopping database container before removal (timeout=10s, id=%s)…", id[:12]))
-				if err := docker.StopContainer(ctx, id, 10); err != nil {
-					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stop returned: %v (proceeding with remove)", err))
+					log.Printf("db_remove: container %s already absent", containerName)
+					sendLifecycleLog(ws, containerName, "db_remove", "container already absent, nothing to remove")
 				} else {
-					sendLifecycleLog(ws, containerName, "db_remove", "container stopped, removing…")
+					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stopping database container before removal (timeout=10s, id=%s)…", id[:12]))
+					if err := docker.StopContainer(ctx, id, 10); err != nil {
+						sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stop returned: %v (proceeding with remove)", err))
+					} else {
+						sendLifecycleLog(ws, containerName, "db_remove", "container stopped, removing…")
+					}
+					if err := docker.RemoveContainer(ctx, id, true); err != nil {
+						log.Printf("db_remove: failed to remove %s: %v", containerName, err)
+						sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
+						sendDbReply(ws, env, "db_status", map[string]any{
+							"container_name": containerName,
+							"action":         "db_remove",
+							"status":         "failed",
+							"message":        err.Error(),
+						})
+						return
+					}
+					log.Printf("db_remove: removed database container %s", containerName)
 				}
-				if err := docker.RemoveContainer(ctx, id, true); err != nil {
-					log.Printf("db_remove: failed to remove %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
-						"container_name": containerName,
-						"action":         "db_remove",
-						"status":         "failed",
-						"message":        err.Error(),
-					})
-				} else {
-					log.Printf("db_remove: removed database container %s (volume preserved)", containerName)
+
+				if !removeVolume {
 					sendLifecycleLog(ws, containerName, "db_remove", "database container removed (volume preserved)")
 					sendDbReply(ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_remove",
 						"status":         "success",
+						"volume_removed": false,
 					})
+					return
 				}
+
+				// force=true makes the daemon treat an already-absent volume as
+				// success, so a retried purge converges instead of erroring on
+				// the volume it removed last time.
+				sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("removing data volume %s…", volumeName))
+				if err := docker.RemoveVolume(ctx, volumeName, true); err != nil {
+					log.Printf("db_remove: failed to remove volume %s: %v", volumeName, err)
+					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove data volume: %v", err))
+					sendDbReply(ws, env, "db_status", map[string]any{
+						"container_name": containerName,
+						"action":         "db_remove",
+						"status":         "failed",
+						"message":        fmt.Sprintf("container removed but data volume %s could not be deleted: %v", volumeName, err),
+					})
+					return
+				}
+
+				log.Printf("db_remove: removed database container %s and data volume %s", containerName, volumeName)
+				sendLifecycleLog(ws, containerName, "db_remove", "database container and data volume removed")
+				sendDbReply(ws, env, "db_status", map[string]any{
+					"container_name": containerName,
+					"action":         "db_remove",
+					"status":         "success",
+					"volume_removed": true,
+				})
 			}()
 
 		case "db_snapshot":
