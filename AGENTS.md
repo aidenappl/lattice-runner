@@ -289,6 +289,7 @@ silently ignored.
 | `db_restore` | as snapshot (the restore is identified by `snapshot_id`; `restore_id` is never sent) | Download from destination → restore into db | `db_restore_status` (`downloading`→`completed`/`failed`), `lifecycle_log` |
 | `db_update_schedule` | `database_instance_id`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_destination` (legacy `backup_dest` also accepted) | Add/update or remove a scheduled snapshot job. An empty `cron` removes it | `db_schedule_status` |
 | `backup_dest_test` | `dest_type`, `dest_config` | Build destination + connectivity `Test()` | `backup_dest_test_result` |
+| `db_mirror_snapshot` | `filename`, `source_destination.{type,config}`, `target_destination.{type,config}` | Copy an existing snapshot from one destination to another. Staged via a temp file, not streamed between the two: a mirror is a background copy of an artifact that already exists safely, and no database is waiting on it | `db_mirror_status` |
 | `db_delete_snapshot_file` | `backup_destination.{type,config}`, `filename` (legacy `dest_type`/`dest_config`/`remote_path` also accepted), `snapshot_id` | Delete a snapshot file from the destination | `db_delete_snapshot_result` |
 | `db_sync_request` | — | Report every `lattice-type=database` container it can see, with state, health, restart count and data volume size | `db_sync` |
 
@@ -312,6 +313,7 @@ omitting `database_instance_id` makes the reply unusable to the orchestrator.
 | `list_volumes_response` / `list_networks_response` | Reply to the matching list command | `command_id`, `status`, `volumes`/`networks` |
 | `db_status` | On receipt of, and at the end of, a db lifecycle action | `database_instance_id`, `request_id`, `idempotency_key`, `container_name`, `action`, `phase` (`ack`/`completed`/`failed`), `status`, `container_id?` |
 | `db_snapshot_status` / `db_restore_status` | Snapshot/restore progress | ids, `status`, `size_bytes?`, `error_message?`, `scheduled?` |
+| `db_mirror_status` | Reply to `db_mirror_snapshot` | `snapshot_id`, `filename`, `status`, `size_bytes?`, `error_message?` |
 | `db_schedule_status` | Reply to `db_update_schedule` | `instance_id`, `status` (`updated`/`removed`), `cron?` |
 | `backup_dest_test_result` | Reply to `backup_dest_test` | `command_id`, `status`, `message` |
 | `db_delete_snapshot_result` | Reply to `db_delete_snapshot_file` | `snapshot_id`, `status`, `message?` |

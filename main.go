@@ -2531,6 +2531,77 @@ func main() {
 				})
 			}()
 
+		case "db_mirror_snapshot":
+			handlerSem <- struct{}{}
+			go func() {
+				defer func() { <-handlerSem }()
+
+				filename := payloadString(env.Payload, "filename", "remote_path")
+				sourceRaw, _ := env.Payload["source_destination"].(map[string]any)
+				targetRaw, _ := env.Payload["target_destination"].(map[string]any)
+
+				fail := func(reason string) {
+					log.Printf("db_mirror_snapshot: %s", reason)
+					sendDbReply(ws, env, "db_mirror_status", map[string]any{
+						"filename":      filename,
+						"status":        "failed",
+						"error_message": reason,
+					})
+				}
+
+				if filename == "" || sourceRaw == nil || targetRaw == nil {
+					fail("missing filename, source_destination or target_destination")
+					return
+				}
+
+				sourceType, _ := sourceRaw["type"].(string)
+				sourceConfig, _ := sourceRaw["config"].(map[string]any)
+				targetType, _ := targetRaw["type"].(string)
+				targetConfig, _ := targetRaw["config"].(map[string]any)
+
+				source, err := backup.NewDestination(sourceType, sourceConfig)
+				if err != nil {
+					fail(fmt.Sprintf("source destination unusable: %v", err))
+					return
+				}
+				target, err := backup.NewDestination(targetType, targetConfig)
+				if err != nil {
+					fail(fmt.Sprintf("target destination unusable: %v", err))
+					return
+				}
+
+				// Copy via a temp file rather than streaming between the two.
+				// A mirror is a background copy of an artifact that already
+				// exists safely; staging keeps a slow target from holding a
+				// read open on the source for the whole transfer, and no
+				// database is waiting on this.
+				tmpDir, err := os.MkdirTemp("", "lattice-mirror-*")
+				if err != nil {
+					fail(fmt.Sprintf("failed to create temp dir: %v", err))
+					return
+				}
+				defer os.RemoveAll(tmpDir)
+				local := filepath.Join(tmpDir, "snapshot.bin")
+
+				if err := source.Download(ctx, filename, local); err != nil {
+					fail(fmt.Sprintf("failed to read %s from the primary destination: %v", filename, err))
+					return
+				}
+
+				size, err := target.Upload(ctx, local, filename)
+				if err != nil {
+					fail(fmt.Sprintf("failed to write %s to the mirror: %v", filename, err))
+					return
+				}
+
+				log.Printf("db_mirror_snapshot: mirrored %s (%d bytes)", filename, size)
+				sendDbReply(ws, env, "db_mirror_status", map[string]any{
+					"filename":   filename,
+					"status":     "completed",
+					"size_bytes": size,
+				})
+			}()
+
 		case "db_delete_snapshot_file":
 			handlerSem <- struct{}{}
 			go func() {
