@@ -290,7 +290,7 @@ silently ignored.
 | `db_update_schedule` | `database_instance_id`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_destination` (legacy `backup_dest` also accepted) | Add/update or remove a scheduled snapshot job. An empty `cron` removes it | `db_schedule_status` |
 | `backup_dest_test` | `dest_type`, `dest_config` | Build destination + connectivity `Test()` | `backup_dest_test_result` |
 | `db_delete_snapshot_file` | `backup_destination.{type,config}`, `filename` (legacy `dest_type`/`dest_config`/`remote_path` also accepted), `snapshot_id` | Delete a snapshot file from the destination | `db_delete_snapshot_result` |
-| `db_sync_request` | — | Report every `lattice-type=database` container it can see | `db_sync` |
+| `db_sync_request` | — | Report every `lattice-type=database` container it can see, with state, health, restart count and data volume size | `db_sync` |
 
 **Outbound messages the runner sends.** Every one is a `type` on `OutgoingMessage`. Every `db_*`
 reply carries the correlation fields echoed by `sendDbReply` — see *Managed databases* below;
@@ -429,6 +429,38 @@ reports healthy, and serves its *previous* credentials while the control plane r
 it just generated. Nothing looks wrong until a connection fails. `db_remove` deliberately preserves
 volumes unless the orchestrator asks for a purge, so this is reachable whenever a database is
 recreated under a previously-used name.
+
+**Volume size is measured by walking, on an hourly cache — never `docker system df -v`.**
+`Client.VolumeSize` walks the volume's mountpoint; `cachedVolumeSize` in `database_observer.go`
+refreshes at most once an hour per volume and every `db_sync` in between reports the cached figure.
+`docker system df -v` is the only Docker API that reports a per-volume size, and it holds the
+daemon's main container lock while computing — long enough on a host with a few dozen containers
+that a polling agent would intermittently hang every `docker ps` on the box, including its own. A
+failed measurement keeps serving the previous figure: a stale size is far more useful than a blank
+where a growth trend should be.
+
+**Snapshots stream; they are never buffered.** `ExecDatabaseDump` returns an `io.ReadCloser` fed by
+`io.Pipe`, and `streamSnapshot` (`snapshot_pipeline.go`) pipes it dump → gzip → 32MB `bufio` →
+uploader. It previously read the whole dump into a `bytes.Buffer`, so a 4GB database meant a 4GB
+allocation inside the process holding the Docker socket and the control-plane WebSocket for the
+entire worker.
+
+Three properties that are easy to lose and must not be:
+
+- **A failed dump must produce no object.** A non-zero exit surfaces as a *read error* via
+  `pw.CloseWithError`, propagates through the compressor, and makes the S3 uploader abort its
+  multipart upload. Plain `Close()` would look like a clean EOF and complete a truncated object —
+  which is exactly what `mysqldump | gzip | aws s3 cp -` does (MySQL bug #50272: the compressor
+  produces a valid archive of a truncated dump and exits 0).
+- **The `bufio.Writer` is load-bearing.** `io.Pipe` has no internal buffering, so without it every
+  upload hiccup applies backpressure straight to the dump's stdout while it holds a read snapshot
+  open inside the database.
+- **Close the compressor before the pipe and check both errors.** gzip writes its trailer on Close;
+  a missing trailer is a corrupt archive that only fails at restore time.
+
+Only S3 implements `backup.StreamUploader`. Google Drive's SDK and the `smbclient` CLI want something
+file-shaped, so those stage to a temp file via `stageAndUpload` — memory is still never the
+constraint, but a 40GB dump to Samba needs 40GB of local disk while the same dump to S3 needs none.
 
 **Payload keys: accept both spellings, because the two sides disagreed on all of them.** Ten
 defects shipped where the orchestrator wrote one key and this side read another — an unknown key

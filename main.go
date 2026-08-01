@@ -2238,61 +2238,8 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("executing %s dump…", engine))
-				dumpReader, err := docker.ExecDatabaseDump(ctx, id, engine, databaseName, username, password)
-				if err != nil {
-					log.Printf("db_snapshot: dump failed for %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("dump failed: %v", err))
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "failed",
-						"error_message":  fmt.Sprintf("dump failed: %v", err),
-					})
-					return
-				}
-
-				// Write dump to temp file
-				tmpDir, err := os.MkdirTemp("", "lattice-snapshot-*")
-				if err != nil {
-					log.Printf("db_snapshot: failed to create temp dir: %v", err)
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "failed",
-						"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
-					})
-					return
-				}
-				defer os.RemoveAll(tmpDir)
-
-				tmpFile := filepath.Join(tmpDir, "dump.sql")
-				f, err := os.Create(tmpFile)
-				if err != nil {
-					log.Printf("db_snapshot: failed to create temp file: %v", err)
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "failed",
-						"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
-					})
-					return
-				}
-				if _, err := io.Copy(f, dumpReader); err != nil {
-					f.Close()
-					log.Printf("db_snapshot: failed to write dump: %v", err)
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
-						"snapshot_id":    snapshotID,
-						"container_name": containerName,
-						"status":         "failed",
-						"error_message":  fmt.Sprintf("failed to write dump: %v", err),
-					})
-					return
-				}
-				f.Close()
-
-				// Create backup destination and upload
-				sendLifecycleLog(ws, containerName, "db_snapshot", "uploading snapshot to backup destination…")
+				// Build the destination first: a bad destination should fail
+				// before the database is asked to produce a dump.
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
 					log.Printf("db_snapshot: failed to create backup destination: %v", err)
@@ -2305,15 +2252,19 @@ func main() {
 					return
 				}
 
-				size, err := dest.Upload(ctx, tmpFile, remotePath)
+				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination…", engine))
+				size, err := streamSnapshot(ctx,
+					func(c context.Context) (io.ReadCloser, error) {
+						return docker.ExecDatabaseDump(c, id, engine, databaseName, username, password)
+					}, dest, remotePath)
 				if err != nil {
-					log.Printf("db_snapshot: upload failed for %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("upload failed: %v", err))
+					log.Printf("db_snapshot: snapshot failed for %s: %v", containerName, err)
+					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("snapshot failed: %v", err))
 					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
-						"error_message":  fmt.Sprintf("upload failed: %v", err),
+						"error_message":  err.Error(),
 					})
 					return
 				}
@@ -3102,75 +3053,10 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		return
 	}
 
-	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("executing %s dump (scheduled)…", job.Engine))
-	dumpReader, err := docker.ExecDatabaseDump(ctx, id, job.Engine, job.DatabaseName, job.Username, job.Password)
-	if err != nil {
-		log.Printf("scheduled snapshot: dump failed for %s: %v", containerName, err)
-		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled dump failed: %v", err))
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"filename":       filename,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "failed",
-			"error_message":  fmt.Sprintf("dump failed: %v", err),
-		})
-		return
-	}
-
-	// Write dump to temp file
-	tmpDir, err := os.MkdirTemp("", "lattice-scheduled-snapshot-*")
-	if err != nil {
-		log.Printf("scheduled snapshot: failed to create temp dir: %v", err)
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"filename":       filename,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "failed",
-			"error_message":  fmt.Sprintf("failed to create temp dir: %v", err),
-		})
-		return
-	}
-	defer os.RemoveAll(tmpDir)
-
-	tmpFile := filepath.Join(tmpDir, "dump.sql")
-	f, err := os.Create(tmpFile)
-	if err != nil {
-		log.Printf("scheduled snapshot: failed to create temp file: %v", err)
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"filename":       filename,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "failed",
-			"error_message":  fmt.Sprintf("failed to create temp file: %v", err),
-		})
-		return
-	}
-	if _, err := io.Copy(f, dumpReader); err != nil {
-		f.Close()
-		log.Printf("scheduled snapshot: failed to write dump: %v", err)
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"filename":       filename,
-			"container_name": containerName,
-			"instance_id":    job.InstanceID,
-			"scheduled":      true,
-			"status":         "failed",
-			"error_message":  fmt.Sprintf("failed to write dump: %v", err),
-		})
-		return
-	}
-	f.Close()
-
-	// The object key is the filename the control plane recorded, so a row and
-	// its artifact can never point at different objects.
-	remotePath := filename
-
-	sendLifecycleLog(ws, containerName, "db_snapshot", "uploading scheduled snapshot to backup destination…")
 	dest, err := backup.NewDestination(destType, destConfig)
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create backup destination: %v", err)
+		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
@@ -3182,17 +3068,25 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		return
 	}
 
-	size, err := dest.Upload(ctx, tmpFile, remotePath)
+	// The object key is the filename the control plane recorded, so a row and
+	// its artifact can never point at different objects.
+	remotePath := filename
+
+	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination (scheduled)…", job.Engine))
+	size, err := streamSnapshot(ctx,
+		func(c context.Context) (io.ReadCloser, error) {
+			return docker.ExecDatabaseDump(c, id, job.Engine, job.DatabaseName, job.Username, job.Password)
+		}, dest, remotePath)
 	if err != nil {
-		log.Printf("scheduled snapshot: upload failed for %s: %v", containerName, err)
-		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled upload failed: %v", err))
+		log.Printf("scheduled snapshot: failed for %s: %v", containerName, err)
+		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
 			"status":         "failed",
-			"error_message":  fmt.Sprintf("upload failed: %v", err),
+			"error_message":  err.Error(),
 		})
 		return
 	}

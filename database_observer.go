@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aidenappl/lattice-runner/client"
@@ -127,8 +128,58 @@ func startDatabaseObserver(ctx context.Context, ws *client.WSClient, docker *doc
 	}
 }
 
+// volumeSizeCache holds the last measured size of each data volume.
+//
+// Measuring walks the volume, which is O(files), so it happens on its own slow
+// cadence and every db_sync in between reports the cached figure. The
+// alternative — `docker system df -v` — holds the daemon's container lock while
+// it computes and would wedge `docker ps` for the whole host.
+var (
+	volumeSizeMu    sync.Mutex
+	volumeSizeCache = map[string]volumeSizeEntry{}
+)
+
+type volumeSizeEntry struct {
+	bytes      int64
+	measuredAt time.Time
+}
+
+// dbVolumeSizeTTL is how stale a volume measurement may get. A database's
+// footprint changes over hours, not seconds, and the walk is expensive.
+const dbVolumeSizeTTL = time.Hour
+
+// cachedVolumeSize returns the last measured size, refreshing it if stale.
+// Returns false when no measurement has ever succeeded.
+func cachedVolumeSize(ctx context.Context, docker *dockerclient.Client, containerID string) (int64, bool) {
+	volumeName, err := docker.DatabaseVolumeName(ctx, containerID)
+	if err != nil || volumeName == "" {
+		return 0, false
+	}
+
+	volumeSizeMu.Lock()
+	entry, ok := volumeSizeCache[volumeName]
+	volumeSizeMu.Unlock()
+
+	if ok && time.Since(entry.measuredAt) < dbVolumeSizeTTL {
+		return entry.bytes, true
+	}
+
+	size, err := docker.VolumeSize(ctx, volumeName)
+	if err != nil {
+		log.Printf("db_sync: failed to measure volume %s: %v", volumeName, err)
+		// Keep serving the stale figure rather than reporting nothing: an old
+		// size is far more useful than a blank where a growth trend should be.
+		return entry.bytes, ok
+	}
+
+	volumeSizeMu.Lock()
+	volumeSizeCache[volumeName] = volumeSizeEntry{bytes: size, measuredAt: time.Now()}
+	volumeSizeMu.Unlock()
+	return size, true
+}
+
 // sendDatabaseSync enumerates every Lattice-managed database container on this
-// host and reports its state, health and restart count.
+// host and reports its state, health, restart count and data volume size.
 func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockerclient.Client) {
 	observed, err := docker.ListDatabaseContainers(ctx)
 	if err != nil {
@@ -154,6 +205,14 @@ func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockercl
 			if hint := detectFatalInitError(ctx, docker, c.ID); hint != "" {
 				entry["fatal_hint"] = hint
 			}
+		}
+
+		// What the database actually costs on disk. Nothing in the platform has
+		// ever tracked this: the only disk figure collected anywhere is the
+		// worker's root filesystem, so a database filling its host was invisible
+		// until it took every other container down with it.
+		if size, ok := cachedVolumeSize(ctx, docker, c.ID); ok {
+			entry["volume_size_bytes"] = size
 		}
 
 		entries = append(entries, entry)

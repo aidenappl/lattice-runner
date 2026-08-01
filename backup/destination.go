@@ -3,7 +3,19 @@ package backup
 import (
 	"context"
 	"fmt"
+	"io"
 )
+
+// StreamUploader is implemented by destinations that can write an object from a
+// reader of unknown length.
+//
+// Only S3 implements it today. Google Drive's SDK and the smbclient CLI both want
+// something file-shaped, so for those the caller stages to a temp file — which is
+// a real constraint to know about, not an oversight: a 40GB dump to Samba needs
+// 40GB of local disk, while the same dump to S3 needs none.
+type StreamUploader interface {
+	UploadStream(ctx context.Context, r io.Reader, remotePath string) (int64, error)
+}
 
 // Destination is the interface for backup storage providers.
 type Destination interface {

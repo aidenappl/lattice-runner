@@ -5,22 +5,42 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
-// ExecDatabaseDump executes a database dump command inside the container and returns
-// the dump output as an io.Reader. The caller is responsible for consuming the reader.
-func (c *Client) ExecDatabaseDump(ctx context.Context, containerID, engine, dbName, user, password string) (io.Reader, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-	defer cancel()
-
+// ExecDatabaseDump executes a database dump inside the container and returns the
+// output as a stream.
+//
+// The dump used to be read into a bytes.Buffer in full before the caller wrote it
+// anywhere, so a 4GB database meant a 4GB allocation inside the process that owns
+// the Docker socket and the control-plane WebSocket for the entire worker — a
+// backup could take down the agent that manages every container on the host.
+//
+// Two properties of the returned reader matter and are easy to lose:
+//
+//   - The exit code is checked *after* the stream drains, and a non-zero exit (or
+//     a mid-stream failure) surfaces as a read error via CloseWithError rather
+//     than as a short, clean EOF. That is what lets an uploader abort a multipart
+//     upload instead of completing a truncated object. `mysqldump | gzip | s3 cp`
+//     has exactly this bug — the compressor happily produces a valid archive of a
+//     truncated dump and exits 0 (MySQL bugs #50272 and #90538), which is how
+//     backups "succeed" for months and fail on the day you need them.
+//   - io.Pipe has no internal buffering, so a stalled upload applies backpressure
+//     directly to the dump's stdout while it holds its read snapshot. Callers
+//     should put a buffered writer between compression and upload.
+//
+// The caller must Close the reader.
+func (c *Client) ExecDatabaseDump(ctx context.Context, containerID, engine, dbName, user, password string) (io.ReadCloser, error) {
 	var cmd []string
 	var envOverride []string
 	switch engine {
 	case "mysql", "mariadb":
+		// No --force: it turns errors into a fully-trailered dump that is missing
+		// objects and still exits 0.
 		cmd = []string{"mysqldump", "-u", user, "--single-transaction", "--routines", "--triggers", dbName}
 		envOverride = []string{"MYSQL_PWD=" + password}
 	case "postgres":
@@ -47,26 +67,40 @@ func (c *Client) ExecDatabaseDump(ctx context.Context, containerID, engine, dbNa
 		return nil, fmt.Errorf("exec attach: %w", err)
 	}
 
-	// Read all stdout into a buffer.
-	// Docker multiplexed streams have an 8-byte header per frame.
-	// Use StdCopy to demux stdout from stderr.
-	var stdout, stderr bytes.Buffer
-	_, err = stdcopy.StdCopy(&stdout, &stderr, resp.Reader)
-	resp.Close()
-	if err != nil {
-		return nil, fmt.Errorf("read dump output: %w", err)
-	}
+	pr, pw := io.Pipe()
 
-	// Check exit code
-	inspectResp, err := c.cli.ContainerExecInspect(ctx, execID.ID)
-	if err != nil {
-		return nil, fmt.Errorf("exec inspect: %w", err)
-	}
-	if inspectResp.ExitCode != 0 {
-		return nil, fmt.Errorf("dump exited with code %d: %s", inspectResp.ExitCode, stderr.String())
-	}
+	go func() {
+		defer resp.Close()
 
-	return &stdout, nil
+		// stderr is captured rather than streamed: it is the diagnosis attached to
+		// a failure, and it is bounded by the engine's own error output.
+		var stderr bytes.Buffer
+		_, copyErr := stdcopy.StdCopy(pw, &stderr, resp.Reader)
+
+		if copyErr != nil {
+			pw.CloseWithError(fmt.Errorf("read dump output: %w", copyErr))
+			return
+		}
+
+		// Inspect with a fresh context: the caller's may already be cancelled by a
+		// failed upload, and the exit code is the only thing that distinguishes a
+		// complete dump from a truncated one.
+		inspectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+
+		inspectResp, inspectErr := c.cli.ContainerExecInspect(inspectCtx, execID.ID)
+		switch {
+		case inspectErr != nil:
+			pw.CloseWithError(fmt.Errorf("exec inspect: %w", inspectErr))
+		case inspectResp.ExitCode != 0:
+			pw.CloseWithError(fmt.Errorf("dump exited with code %d: %s",
+				inspectResp.ExitCode, strings.TrimSpace(stderr.String())))
+		default:
+			pw.Close()
+		}
+	}()
+
+	return pr, nil
 }
 
 // ExecDatabaseRestore executes a database restore command inside the container,

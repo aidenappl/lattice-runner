@@ -3,6 +3,8 @@ package docker
 import (
 	"context"
 	"fmt"
+	"io/fs"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -283,4 +285,64 @@ func defaultDBPort(engine string) int {
 	default:
 		return 3306
 	}
+}
+
+// VolumeSize returns the on-disk size of a Docker volume in bytes.
+//
+// Deliberately walks the volume's mountpoint rather than asking Docker. There is
+// no per-volume size in the Docker API: `docker system df -v` is the only thing
+// that reports one, and it holds the daemon's main container lock while it
+// computes — long enough on a host with a few dozen containers to make every
+// concurrent `docker ps` hang for minutes. An agent that polled it would
+// intermittently wedge its own control path.
+//
+// This walk is O(files), so it must be called on a slow cadence, never per sync.
+func (c *Client) VolumeSize(ctx context.Context, volumeName string) (int64, error) {
+	vol, err := c.cli.VolumeInspect(ctx, volumeName)
+	if err != nil {
+		return 0, fmt.Errorf("inspect volume %s: %w", volumeName, err)
+	}
+	if vol.Mountpoint == "" {
+		return 0, fmt.Errorf("volume %s has no mountpoint", volumeName)
+	}
+
+	var total int64
+	err = filepath.WalkDir(vol.Mountpoint, func(path string, d fs.DirEntry, err error) error {
+		// A file vanishing mid-walk is normal for a live database; it is not a
+		// reason to fail the measurement.
+		if err != nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("walk volume %s: %w", volumeName, err)
+	}
+	return total, nil
+}
+
+// DatabaseVolumeName returns the data volume attached to a managed database
+// container, read from its mounts rather than derived from its name.
+func (c *Client) DatabaseVolumeName(ctx context.Context, containerID string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", fmt.Errorf("inspect container: %w", err)
+	}
+	for _, m := range info.Mounts {
+		if m.Type == "volume" && m.Name != "" {
+			return m.Name, nil
+		}
+	}
+	return "", nil
 }
