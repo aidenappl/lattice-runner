@@ -12,6 +12,25 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
+// mysqlFamilyCmd builds an argv that prefers the MariaDB-named client and falls
+// back to the MySQL-named one.
+//
+// MariaDB removed the mysql*-named symlinks: `mysqldump` does not exist in a
+// mariadb:11 image, and exec'ing it exits **127**, which is how the first real
+// snapshot on this platform failed. Choosing by engine version would work until
+// the next rename; probing the container costs an extra round trip. Letting the
+// container's own shell decide is both cheaper and version-proof, and it fails
+// loudly if neither binary is present rather than silently producing nothing.
+//
+// The arguments are passed positionally so a password or database name can never
+// be reinterpreted as shell syntax.
+func mysqlFamilyCmd(preferred, fallback string, args ...string) []string {
+	script := fmt.Sprintf(
+		`if command -v %s >/dev/null 2>&1; then exec %s "$@"; else exec %s "$@"; fi`,
+		preferred, preferred, fallback)
+	return append([]string{"sh", "-c", script, "sh"}, args...)
+}
+
 // ExecDatabaseDump executes a database dump inside the container and returns the
 // output as a stream.
 //
@@ -41,7 +60,8 @@ func (c *Client) ExecDatabaseDump(ctx context.Context, containerID, engine, dbNa
 	case "mysql", "mariadb":
 		// No --force: it turns errors into a fully-trailered dump that is missing
 		// objects and still exits 0.
-		cmd = []string{"mysqldump", "-u", user, "--single-transaction", "--routines", "--triggers", dbName}
+		cmd = mysqlFamilyCmd("mariadb-dump", "mysqldump",
+			"-u", user, "--single-transaction", "--routines", "--triggers", dbName)
 		envOverride = []string{"MYSQL_PWD=" + password}
 	case "postgres":
 		cmd = []string{"pg_dump", "-U", user, "-Fc", dbName}
@@ -113,7 +133,7 @@ func (c *Client) ExecDatabaseRestore(ctx context.Context, containerID, engine, d
 	var envOverride []string
 	switch engine {
 	case "mysql", "mariadb":
-		cmd = []string{"mysql", "-u", user, dbName}
+		cmd = mysqlFamilyCmd("mariadb", "mysql", "-u", user, dbName)
 		envOverride = []string{"MYSQL_PWD=" + password}
 	case "postgres":
 		// Use pg_restore for custom-format dumps, falls back gracefully
