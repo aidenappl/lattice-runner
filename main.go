@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -2177,10 +2178,9 @@ func main() {
 				databaseName, _ := env.Payload["database_name"].(string)
 				username, _ := env.Payload["username"].(string)
 				password, _ := env.Payload["password"].(string)
-				snapshotID, _ := env.Payload["snapshot_id"].(string)
-				remotePath, _ := env.Payload["remote_path"].(string)
-				destType, _ := env.Payload["dest_type"].(string)
-				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+				snapshotID := payloadString(env.Payload, "snapshot_id")
+				remotePath := payloadString(env.Payload, "remote_path", "filename")
+				destType, destConfig := backupDestinationFrom(env.Payload)
 
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_snapshot: invalid or empty container name: %q", containerName)
@@ -2337,10 +2337,11 @@ func main() {
 				databaseName, _ := env.Payload["database_name"].(string)
 				username, _ := env.Payload["username"].(string)
 				password, _ := env.Payload["password"].(string)
-				restoreID, _ := env.Payload["restore_id"].(string)
-				remotePath, _ := env.Payload["remote_path"].(string)
-				destType, _ := env.Payload["dest_type"].(string)
-				destConfig, _ := env.Payload["dest_config"].(map[string]any)
+				// The orchestrator identifies a restore by the snapshot it is
+				// restoring from; `restore_id` was never sent.
+				restoreID := payloadString(env.Payload, "restore_id", "snapshot_id")
+				remotePath := payloadString(env.Payload, "remote_path", "filename")
+				destType, destConfig := backupDestinationFrom(env.Payload)
 
 				if containerName == "" || !validContainerName(containerName) {
 					log.Printf("db_restore: invalid or empty container name: %q", containerName)
@@ -2497,7 +2498,15 @@ func main() {
 				password, _ := env.Payload["password"].(string)
 				cron, _ := env.Payload["cron"].(string)
 				retentionF, _ := env.Payload["retention_count"].(float64)
-				backupDest, _ := env.Payload["backup_dest"].(map[string]any)
+
+				// The orchestrator sends this as `backup_destination`, matching
+				// every other db_* command; this side read `backup_dest`, so
+				// every scheduled job was registered with a nil destination and
+				// silently did nothing when it fired. Accept both.
+				backupDest, _ := env.Payload["backup_destination"].(map[string]any)
+				if backupDest == nil {
+					backupDest, _ = env.Payload["backup_dest"].(map[string]any)
+				}
 
 				snapshotScheduler.UpdateSchedule(scheduler.Job{
 					InstanceID:     instanceID,
@@ -2568,16 +2577,20 @@ func main() {
 			handlerSem <- struct{}{}
 			go func() {
 				defer func() { <-handlerSem }()
-				destType, _ := env.Payload["dest_type"].(string)
-				destConfig, _ := env.Payload["dest_config"].(map[string]any)
-				remotePath, _ := env.Payload["remote_path"].(string)
-				snapshotID, _ := env.Payload["snapshot_id"].(string)
+				destType, destConfig := backupDestinationFrom(env.Payload)
+				remotePath := payloadString(env.Payload, "remote_path", "filename")
+				snapshotID := payloadString(env.Payload, "snapshot_id")
 
+				// This is the check that made the remote-delete path a no-op:
+				// the orchestrator sends the object name as `filename`, so
+				// `remote_path` was always empty and every snapshot file was
+				// left on the destination forever — the exact leak the July
+				// pass believed it had fixed by starting to send the command.
 				if remotePath == "" {
 					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
 						"snapshot_id": snapshotID,
 						"status":      "failed",
-						"message":     "missing remote_path",
+						"message":     "missing remote_path/filename",
 					})
 					return
 				}
@@ -2870,6 +2883,63 @@ func sendDbReply(ws *client.WSClient, env client.Envelope, msgType string, paylo
 	})
 }
 
+// payloadString reads the first of several candidate keys that yields a
+// non-empty string, tolerating a JSON number where a string is expected.
+//
+// This exists because the orchestrator and the runner disagreed on the name of
+// every field in the snapshot command family: the API sends `filename`,
+// `backup_destination.{type,config}` and a numeric `snapshot_id`, while this
+// side read `remote_path`, `dest_type`/`dest_config` and asserted
+// `snapshot_id.(string)`. Each mismatch failed silently — an empty destination
+// type, an empty object key, and a reply whose snapshot id the orchestrator
+// could not match to a row. Accepting both spellings here (rather than only
+// fixing the API) means a runner upgraded ahead of the control plane repairs
+// the whole family on its own.
+func payloadString(p map[string]any, keys ...string) string {
+	for _, k := range keys {
+		switch v := p[k].(type) {
+		case string:
+			if v != "" {
+				return v
+			}
+		case float64:
+			return strconv.FormatInt(int64(v), 10)
+		case int:
+			return strconv.Itoa(v)
+		}
+	}
+	return ""
+}
+
+// payloadNested reads a nested map by parent key, e.g. backup_destination.config.
+func payloadNested(p map[string]any, parent, child string) any {
+	m, ok := p[parent].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m[child]
+}
+
+// backupDestinationFrom resolves the backup destination from either shape: the
+// flat `dest_type`/`dest_config` pair this side originally read, or the nested
+// `backup_destination` object the orchestrator actually sends.
+func backupDestinationFrom(p map[string]any) (string, map[string]any) {
+	destType := payloadString(p, "dest_type")
+	destConfig, _ := p["dest_config"].(map[string]any)
+
+	if destType == "" {
+		if s, ok := payloadNested(p, "backup_destination", "type").(string); ok {
+			destType = s
+		}
+	}
+	if destConfig == nil {
+		if m, ok := payloadNested(p, "backup_destination", "config").(map[string]any); ok {
+			destConfig = m
+		}
+	}
+	return destType, destConfig
+}
+
 // buildDbReplyPayload attaches correlation and phase to a database reply.
 //
 // Kept separate from the send so the contract can be tested without a socket —
@@ -2959,33 +3029,58 @@ func sendLifecycleLog(ws *client.WSClient, containerName, event, message string)
 
 // handleScheduledSnapshot executes a database snapshot triggered by the scheduler.
 // It follows the same logic as the db_snapshot message handler.
+//
+// Two things differ from a manual snapshot, both deliberate. The filename is
+// computed before anything can fail, so a pre-flight failure still names the
+// artifact it would have produced and the control plane can record a failed
+// snapshot row against it. And the reply carries no snapshot_id: there is no row
+// yet, because the runner's own cron decided to run. The orchestrator keys on
+// (database_instance_id, filename) instead — previously this sent a synthetic
+// string id like "scheduled-5-1738…", which the orchestrator parsed to 0 and
+// dropped, so no scheduled snapshot has ever been recorded.
 func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, job scheduler.Job) {
-	if job.BackupDest == nil {
-		log.Printf("scheduled snapshot for instance %d: no backup destination configured", job.InstanceID)
-		return
+	containerName := job.ContainerName
+	filename := fmt.Sprintf("%s_%s_%s.sql", containerName, job.DatabaseName, time.Now().UTC().Format("20060102T150405Z"))
+
+	// A scheduled snapshot that cannot run must say so where an operator will
+	// see it. These three checks used to return after a bare log.Printf on the
+	// worker: no lifecycle log, no event, no failed row, nothing in Monitor —
+	// which is how a schedule that never once produced a backup went unnoticed.
+	failPreflight := func(reason string) {
+		log.Printf("scheduled snapshot for instance %d: %s", job.InstanceID, reason)
+		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot could not start: "+reason)
+		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+			"filename":       filename,
+			"container_name": containerName,
+			"instance_id":    job.InstanceID,
+			"scheduled":      true,
+			"status":         "failed",
+			"error_message":  reason,
+		})
 	}
 
+	if job.BackupDest == nil {
+		failPreflight("no backup destination configured for this schedule")
+		return
+	}
 	destType, ok := job.BackupDest["type"].(string)
 	if !ok || destType == "" {
-		log.Printf("scheduled snapshot for instance %d: missing backup destination type", job.InstanceID)
+		failPreflight("backup destination has no type")
 		return
 	}
 	destConfig, _ := job.BackupDest["config"].(map[string]any)
 	if destConfig == nil {
-		log.Printf("scheduled snapshot for instance %d: missing backup destination config", job.InstanceID)
+		failPreflight("backup destination has no config")
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	containerName := job.ContainerName
-	snapshotID := fmt.Sprintf("scheduled-%d-%d", job.InstanceID, time.Now().Unix())
-
 	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot triggered (instance=%d)", job.InstanceID))
 
 	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-		"snapshot_id":    snapshotID,
+		"filename":       filename,
 		"container_name": containerName,
 		"instance_id":    job.InstanceID,
 		"scheduled":      true,
@@ -2997,7 +3092,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		log.Printf("scheduled snapshot: container %s not found", containerName)
 		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot failed: container not found")
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3013,7 +3108,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		log.Printf("scheduled snapshot: dump failed for %s: %v", containerName, err)
 		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled dump failed: %v", err))
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3028,7 +3123,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create temp dir: %v", err)
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3044,7 +3139,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create temp file: %v", err)
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3057,7 +3152,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		f.Close()
 		log.Printf("scheduled snapshot: failed to write dump: %v", err)
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3068,15 +3163,16 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	}
 	f.Close()
 
-	// Determine remote path
-	remotePath := fmt.Sprintf("%s/%s-%s.sql", containerName, job.DatabaseName, time.Now().UTC().Format("20060102-150405"))
+	// The object key is the filename the control plane recorded, so a row and
+	// its artifact can never point at different objects.
+	remotePath := filename
 
 	sendLifecycleLog(ws, containerName, "db_snapshot", "uploading scheduled snapshot to backup destination…")
 	dest, err := backup.NewDestination(destType, destConfig)
 	if err != nil {
 		log.Printf("scheduled snapshot: failed to create backup destination: %v", err)
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3091,7 +3187,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		log.Printf("scheduled snapshot: upload failed for %s: %v", containerName, err)
 		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled upload failed: %v", err))
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-			"snapshot_id":    snapshotID,
+			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
 			"scheduled":      true,
@@ -3104,7 +3200,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	log.Printf("scheduled snapshot: completed for %s (size=%d bytes)", containerName, size)
 	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot completed (size=%d bytes)", size))
 	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
-		"snapshot_id":    snapshotID,
+		"filename":       filename,
 		"container_name": containerName,
 		"instance_id":    job.InstanceID,
 		"scheduled":      true,

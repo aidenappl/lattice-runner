@@ -285,11 +285,11 @@ silently ignored.
 | `db_create` | `container_name`, `engine`, `engine_version`, `port`, creds, `volume_name?`, limits (`memory_limit` in **bytes**) | Ack → probe the host port → pull → create+start a managed database container | `db_status` (`ack`→`completed`/`failed`), `lifecycle_log` |
 | `db_start` / `db_stop` / `db_restart` | `container_name` | Lifecycle for a db container | `db_status`, `lifecycle_log` |
 | `db_remove` | `container_name`, `remove_volume?`, `volume_name?` | Destroy a db container. Preserves the data volume unless `remove_volume` is set, which purges `volume_name` too (that is how a delete differs from the `remove` action). **Idempotent** — an absent container is success, not failure | `db_status` (with `volume_removed`), `lifecycle_log` |
-| `db_snapshot` | `container_name`, `engine`, `database_name`, creds, `snapshot_id`, `remote_path`, `dest_type`, `dest_config` | Dump db → temp file → upload to backup destination | `db_snapshot_status` (`uploading`→`completed`/`failed`), `lifecycle_log` |
-| `db_restore` | as snapshot + `restore_id` | Download from destination → restore into db | `db_restore_status` (`downloading`→`completed`/`failed`), `lifecycle_log` |
-| `db_update_schedule` | `instance_id`, `enabled`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_dest` | Add/update or remove a scheduled snapshot job | `db_schedule_status` |
+| `db_snapshot` | `container_name`, `engine`, `database_name`, creds, `snapshot_id`, `filename` (or legacy `remote_path`), `backup_destination.{type,config}` (or legacy `dest_type`/`dest_config`) | Dump db → temp file → upload to backup destination | `db_snapshot_status` (`uploading`→`completed`/`failed`), `lifecycle_log` |
+| `db_restore` | as snapshot (the restore is identified by `snapshot_id`; `restore_id` is never sent) | Download from destination → restore into db | `db_restore_status` (`downloading`→`completed`/`failed`), `lifecycle_log` |
+| `db_update_schedule` | `database_instance_id`, `container_name`, `engine`, creds, `cron`, `retention_count`, `backup_destination` (legacy `backup_dest` also accepted) | Add/update or remove a scheduled snapshot job. An empty `cron` removes it | `db_schedule_status` |
 | `backup_dest_test` | `dest_type`, `dest_config` | Build destination + connectivity `Test()` | `backup_dest_test_result` |
-| `db_delete_snapshot_file` | `dest_type`, `dest_config`, `remote_path`, `snapshot_id` | Delete a snapshot file from the destination | `db_delete_snapshot_result` |
+| `db_delete_snapshot_file` | `backup_destination.{type,config}`, `filename` (legacy `dest_type`/`dest_config`/`remote_path` also accepted), `snapshot_id` | Delete a snapshot file from the destination | `db_delete_snapshot_result` |
 | `db_sync_request` | — | Report every `lattice-type=database` container it can see | `db_sync` |
 
 **Outbound messages the runner sends.** Every one is a `type` on `OutgoingMessage`. Every `db_*`
@@ -429,6 +429,34 @@ reports healthy, and serves its *previous* credentials while the control plane r
 it just generated. Nothing looks wrong until a connection fails. `db_remove` deliberately preserves
 volumes unless the orchestrator asks for a purge, so this is reachable whenever a database is
 recreated under a previously-used name.
+
+**Payload keys: accept both spellings, because the two sides disagreed on all of them.** Ten
+defects shipped where the orchestrator wrote one key and this side read another — an unknown key
+yields the zero value, so each produced an empty destination type or an empty object name instead of
+an error, and every one of them failed silently:
+
+| API sends | this side used to read | result |
+|---|---|---|
+| `backup_destination` | `backup_dest` | every scheduled snapshot no-op'd for three months |
+| `backup_destination.{type,config}` | `dest_type`/`dest_config` | `NewDestination("")` — manual snapshots failed too |
+| `filename` | `remote_path` | empty object key; `db_delete_snapshot_file` refused with "missing remote_path" |
+| `snapshot_id` (JSON number) | `snapshot_id.(string)` | `""` → orchestrator parsed 0 → every status reply dropped |
+| `snapshot_id` (restore) | `restore_id` | restore correlation lost |
+
+`payloadString(p, keys...)`, `payloadNested` and `backupDestinationFrom` resolve either spelling and
+tolerate a number where a string is expected. **The runner is deliberately the tolerant side**, so a
+runner upgraded ahead of the control plane repairs the whole family on its own — upgrade runners
+first. `db_payload_contract_test.go` pins this behaviour; `lattice-api`'s
+`socket/db_payload_contract_test.go` pins the sending half.
+
+**A scheduled snapshot names its artifact before it can fail.** `handleScheduledSnapshot` computes
+`filename` first, then validates, so a pre-flight failure (no destination, no type, no config) still
+reports a failed `db_snapshot_status` carrying that filename — which the orchestrator adopts into a
+real failed snapshot row by `(database_instance_id, filename)`. It sends **no** `snapshot_id`: there
+is no row yet, because the runner's own cron started the run. It previously sent a synthetic
+`"scheduled-5-1738…"`, which the orchestrator parsed to 0 and dropped, and the three pre-flight
+checks returned after a bare `log.Printf` — no lifecycle log, no event, nothing in Monitor. That is
+how a schedule that had never once produced a backup went unnoticed from May to July 2026.
 
 **`db_remove` is idempotent in both halves.** An already-absent container is the *goal* of a remove,
 so it is reported as success with the volume phase still carried out — replying `failed: container
