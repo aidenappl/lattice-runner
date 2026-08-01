@@ -1852,6 +1852,13 @@ func main() {
 					CPULimit:      cpuLimitF,
 					MemoryLimit:   memoryLimit,
 					AdoptVolume:   adoptVolume,
+					// Create-time durability flags. Zero means the 7-day default.
+					BinlogRetentionSeconds: func() int {
+						if v, ok := env.Payload["binlog_retention_seconds"].(float64); ok {
+							return int(v)
+						}
+						return 0
+					}(),
 				}
 
 				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))

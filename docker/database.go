@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,103 @@ type DatabaseSpec struct {
 	// the check in CreateDatabaseContainer for why silently reusing one is
 	// dangerous.
 	AdoptVolume bool
+	// BinlogRetentionSeconds bounds how long binary logs are kept. Set from the
+	// instance's snapshot retention so the PITR window and the snapshot window
+	// cannot silently disagree. Zero means a 7-day default.
+	BinlogRetentionSeconds int
+}
+
+// engineMajor extracts the leading major version from an image tag like "11",
+// "8.4" or "16.2". Returns 0 when it cannot be read, which callers must treat as
+// "assume nothing".
+func engineMajor(version string) int {
+	digits := ""
+	for _, c := range version {
+		if c < '0' || c > '9' {
+			break
+		}
+		digits += string(c)
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// durabilityArgs returns the server flags that must be set at *create* time for
+// point-in-time recovery to be possible later, plus two bounds worth setting
+// once rather than discovering.
+//
+// These are create-time decisions in the strictest sense: binary logging,
+// server_id and Postgres' archive_mode all require a server restart to change,
+// so an instance created without them cannot gain PITR without downtime. Turning
+// them on now costs a few flags and some disk; retrofitting costs a restart of
+// every database on the platform. Nothing here *performs* PITR — it only refuses
+// to foreclose it.
+//
+// Two further bounds, both learned the expensive way by other people:
+//
+//   - innodb_temp_data_file_path is unbounded by default, and MySQL's own manual
+//     says the only way to reclaim that space is to restart the server. One bad
+//     query permanently inflates the instance until someone notices.
+//   - binlog_expire_logs_seconds is set explicitly rather than inherited. The
+//     default is 30 days; a 35-day snapshot retention alongside it yields a
+//     30-day recovery window, and *nothing in either system reports the
+//     disagreement*.
+//
+// Flags are gated on engine version because an unrecognised flag does not
+// degrade — the server refuses to start. expire_logs_days was removed in MySQL
+// 8.4 and writing it makes the container crashloop; this function exists partly
+// so that class of mistake has one place to live.
+func durabilityArgs(engine, version string, binlogRetentionSeconds int) []string {
+	major := engineMajor(version)
+	if binlogRetentionSeconds <= 0 {
+		binlogRetentionSeconds = 7 * 24 * 60 * 60
+	}
+
+	switch engine {
+	case "mysql":
+		if major < 8 {
+			return nil
+		}
+		return []string{
+			"--log-bin=binlog",
+			"--server-id=1",
+			"--binlog-format=ROW",
+			fmt.Sprintf("--binlog-expire-logs-seconds=%d", binlogRetentionSeconds),
+			"--innodb-temp-data-file-path=ibtmp1:12M:autoextend:max:500M",
+		}
+	case "mariadb":
+		// binlog_expire_logs_seconds landed in MariaDB 10.6. Below 10 the safe
+		// move is to set nothing rather than guess at expire_logs_days.
+		if major < 10 {
+			return nil
+		}
+		args := []string{
+			"--log-bin=binlog",
+			"--server-id=1",
+			"--binlog-format=ROW",
+			"--innodb-temp-data-file-path=ibtmp1:12M:autoextend:max:500M",
+		}
+		if major >= 11 {
+			args = append(args, fmt.Sprintf("--binlog-expire-logs-seconds=%d", binlogRetentionSeconds))
+		}
+		return args
+	case "postgres":
+		if major < 12 {
+			return nil
+		}
+		// archive_mode requires a restart to change; archive_command only a
+		// reload. Enabling the former now with a no-op command means WAL
+		// archiving can be switched on later without touching the container.
+		return []string{
+			"-c", "wal_level=replica",
+			"-c", "archive_mode=on",
+			"-c", "archive_command=/bin/true",
+		}
+	}
+	return nil
 }
 
 // CreateDatabaseContainer creates and starts a database container with the appropriate
@@ -176,7 +274,10 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 	// Create the container
 	resp, err := c.cli.ContainerCreate(ctx,
 		&container.Config{
-			Image:        imageRef,
+			Image: imageRef,
+			// Durability flags are create-time only: binary logging, server_id
+			// and archive_mode all need a restart to change.
+			Cmd:          durabilityArgs(spec.Engine, spec.EngineVersion, spec.BinlogRetentionSeconds),
 			Env:          env,
 			ExposedPorts: exposedPorts,
 			Healthcheck: &container.HealthConfig{

@@ -430,6 +430,26 @@ it just generated. Nothing looks wrong until a connection fails. `db_remove` del
 volumes unless the orchestrator asks for a purge, so this is reachable whenever a database is
 recreated under a previously-used name.
 
+**Durability flags are set at create time, because they cannot be set later.**
+`durabilityArgs` in `docker/database.go` passes server flags on the container
+command line — no config file, no mount. Binary logging, `server_id` and Postgres'
+`archive_mode` all require a **server restart** to change, so an instance created
+without them cannot gain point-in-time recovery without downtime. Nothing here
+performs PITR; it only refuses to foreclose it. Postgres gets `archive_mode=on`
+with `archive_command=/bin/true`, because archive_mode needs a restart while
+archive_command needs only a reload — so shipping WAL later touches nothing.
+
+Two bounds ride along: `innodb_temp_data_file_path` is capped (unbounded by
+default, and MySQL's manual says the only way to reclaim it is a server restart),
+and `binlog_expire_logs_seconds` is set explicitly rather than inherited — the
+default is 30 days, so a 35-day snapshot retention silently yields a 30-day
+recovery window with nothing reporting the mismatch.
+
+⚠️ **Flags are gated on engine major version, and that gating is the part that
+matters.** An unrecognised flag does not degrade: the server refuses to start and
+the container crashloops. `expire_logs_days` was removed in MySQL 8.4 and writing
+it is exactly that failure. `docker/durability_test.go` covers the gates.
+
 **Volume size is measured by walking, on an hourly cache — never `docker system df -v`.**
 `Client.VolumeSize` walks the volume's mountpoint; `cachedVolumeSize` in `database_observer.go`
 refreshes at most once an hour per volume and every `db_sync` in between reports the cached figure.
