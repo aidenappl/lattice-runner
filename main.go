@@ -2410,7 +2410,22 @@ func main() {
 				}
 				defer restoreFile.Close()
 
-				if err := docker.ExecDatabaseRestore(ctx, id, engine, databaseName, username, password, restoreFile); err != nil {
+				// Snapshots are gzipped; older ones are not. Decompress by
+				// content rather than by filename — the .sql.gz suffix was a lie
+				// for months before compression actually existed.
+				restoreReader, err := maybeGunzip(restoreFile)
+				if err != nil {
+					log.Printf("db_restore: %v", err)
+					sendDbReply(ws, env, "db_restore_status", map[string]any{
+						"restore_id":     restoreID,
+						"container_name": containerName,
+						"status":         "failed",
+						"error_message":  err.Error(),
+					})
+					return
+				}
+
+				if err := docker.ExecDatabaseRestore(ctx, id, engine, databaseName, username, password, restoreReader); err != nil {
 					log.Printf("db_restore: restore failed for %s: %v", containerName, err)
 					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restore failed: %v", err))
 					sendDbReply(ws, env, "db_restore_status", map[string]any{

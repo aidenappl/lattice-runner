@@ -127,3 +127,40 @@ func stageAndUpload(ctx context.Context, dump io.Reader, dest backup.Destination
 
 	return dest.Upload(ctx, tmpFile, remotePath)
 }
+
+// maybeGunzip returns a reader that transparently decompresses a gzipped
+// artifact, detected by magic bytes rather than by filename.
+//
+// This exists because compression was added to the snapshot path without the
+// restore path being taught about it: the restore fed gzip bytes straight into
+// the SQL client, which failed with `ASCII '\0' appeared in the statement`. A
+// backup that cannot be restored is not a backup, and this is precisely the
+// failure that stays invisible until the day it matters.
+//
+// Detection is by content, not extension, for two reasons: snapshots taken
+// before compression are still uncompressed and must remain restorable, and the
+// `.sql.gz` suffix was historically a lie — the extension claimed gzip while the
+// bytes were plain SQL, so trusting the name is exactly the wrong instinct here.
+func maybeGunzip(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+
+	magic, err := br.Peek(2)
+	if err != nil {
+		// Too short to be a gzip stream — hand it back untouched and let the
+		// SQL client report what it actually is.
+		if err == io.EOF {
+			return br, nil
+		}
+		return nil, fmt.Errorf("read snapshot header: %w", err)
+	}
+
+	if magic[0] != 0x1f || magic[1] != 0x8b {
+		return br, nil
+	}
+
+	gz, err := gzip.NewReader(br)
+	if err != nil {
+		return nil, fmt.Errorf("open gzip stream: %w", err)
+	}
+	return gz, nil
+}
