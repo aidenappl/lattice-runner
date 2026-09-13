@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"log"
 	"strconv"
 	"strings"
@@ -94,6 +95,7 @@ func (s *Scheduler) checkAndFire() {
 			continue
 		}
 		go func() {
+			defer telemetry.Recover("scheduler.fire", map[string]any{"instance_id": j.InstanceID})
 			defer s.inflight.Delete(j.InstanceID)
 			s.onFire(j)
 		}()

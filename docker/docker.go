@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -697,7 +698,10 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 			return
 		}
 		go func() {
-			_ = c.RemoveContainer(context.Background(), containerID, true)
+			defer telemetry.Recover("docker.remove_retired", nil)
+			if err := c.RemoveContainer(context.Background(), containerID, true); err != nil {
+				log.Printf("docker: failed to remove retired container %s: %v", containerID, err)
+			}
 		}()
 	}
 

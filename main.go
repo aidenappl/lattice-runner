@@ -29,6 +29,7 @@ import (
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
 	"github.com/aidenappl/lattice-runner/metrics"
 	"github.com/aidenappl/lattice-runner/scheduler"
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"github.com/aidenappl/lattice-runner/web"
 	"github.com/docker/docker/api/types"
 )
@@ -87,6 +88,12 @@ func main() {
 
 	fmt.Printf("Lattice Runner %s\n\n", Version)
 
+	// Telemetry first, and from the environment alone: config.Load panics on a
+	// missing variable, and that boot failure is exactly what must be reported.
+	// It never blocks — Monitor may be a container on this very worker.
+	telemetry.Init(Version, config.LoadMonitor())
+	defer telemetry.CrashGuard("main")
+
 	// Load configuration
 	cfg := config.Load()
 	fmt.Printf("  Worker:       %s\n", cfg.WorkerName)
@@ -118,7 +125,7 @@ func main() {
 		time.Sleep(2 * time.Second)
 	}
 	if docker == nil {
-		log.Fatal("failed to connect to Docker after 30 attempts")
+		telemetry.Fatal("service.startup.docker_unreachable", "failed to connect to Docker after 30 attempts", nil)
 	}
 	defer docker.Close()
 
@@ -184,6 +191,7 @@ func main() {
 
 	// Periodic exec session cleanup — remove orphaned sessions older than 30 minutes
 	go func() {
+		defer telemetry.Recover("exec-session-cleanup", nil)
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -208,7 +216,7 @@ func main() {
 	snapshotScheduler := scheduler.New(func(job scheduler.Job) {
 		handleScheduledSnapshot(ws, docker, job)
 	})
-	go snapshotScheduler.Run(ctx)
+	safeGoResilient("snapshot-scheduler", func() { snapshotScheduler.Run(ctx) })
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
@@ -219,6 +227,7 @@ func main() {
 				buf := make([]byte, 8192)
 				n := runtime.Stack(buf, false)
 				log.Printf("[message-handler] PANIC for event %q: %v\n%s", env.Type, r, string(buf[:n]))
+				telemetry.ReportPanic("message-handler", r, map[string]any{"event": env.Type, "command_id": env.CommandID})
 			}
 		}()
 		switch env.Type {
@@ -241,6 +250,7 @@ func main() {
 		case "deploy":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:deploy", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				spec, err := deploy.ParseDeploymentSpec(env.Payload)
 				if err != nil {
@@ -352,6 +362,7 @@ func main() {
 
 		case "deployment_ping":
 			go func() {
+				defer telemetry.Recover("handler:deployment_ping", map[string]any{"command_id": env.CommandID})
 				depIDFloat, _ := env.Payload["deployment_id"].(float64)
 				depID := int(depIDFloat)
 
@@ -390,6 +401,7 @@ func main() {
 		case "stop":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:stop", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -458,6 +470,7 @@ func main() {
 		case "start":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:start", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -526,6 +539,7 @@ func main() {
 		case "kill":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:kill", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -594,6 +608,7 @@ func main() {
 		case "pause":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:pause", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -662,6 +677,7 @@ func main() {
 		case "unpause":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:unpause", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -730,6 +746,7 @@ func main() {
 		case "restart":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:restart", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -798,6 +815,7 @@ func main() {
 		case "remove":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:remove", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -870,6 +888,7 @@ func main() {
 		case "recreate":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:recreate", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -983,6 +1002,7 @@ func main() {
 		case "pull_image":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:pull_image", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				imageRef, _ := env.Payload["image"].(string)
 				if imageRef == "" {
@@ -1027,6 +1047,7 @@ func main() {
 
 		case "reboot_os":
 			go func() {
+				defer telemetry.Recover("handler:reboot_os", map[string]any{"command_id": env.CommandID})
 				// Rate-limit reboots: reject if last reboot was within 5 minutes
 				lastRebootMu.Lock()
 				if time.Since(lastRebootTime) < 5*time.Minute {
@@ -1063,6 +1084,7 @@ func main() {
 
 		case "upgrade_runner":
 			go func() {
+				defer telemetry.Recover("handler:upgrade_runner", map[string]any{"command_id": env.CommandID})
 				log.Println("upgrade runner command received")
 				wsSend(ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
@@ -1201,6 +1223,7 @@ func main() {
 
 		case "stop_all":
 			go func() {
+				defer telemetry.Recover("handler:stop_all", map[string]any{"command_id": env.CommandID})
 				log.Println("stop all containers command received")
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
@@ -1258,6 +1281,7 @@ func main() {
 
 		case "start_all":
 			go func() {
+				defer telemetry.Recover("handler:start_all", map[string]any{"command_id": env.CommandID})
 				log.Println("start all containers command received")
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
@@ -1315,6 +1339,7 @@ func main() {
 
 		case "list_volumes":
 			go func() {
+				defer telemetry.Recover("handler:list_volumes", map[string]any{"command_id": env.CommandID})
 				volumes, err := docker.ListVolumes(ctx)
 				if err != nil {
 					log.Printf("failed to list volumes: %v", err)
@@ -1351,6 +1376,7 @@ func main() {
 
 		case "create_volume":
 			go func() {
+				defer telemetry.Recover("handler:create_volume", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
@@ -1393,6 +1419,7 @@ func main() {
 
 		case "remove_volume":
 			go func() {
+				defer telemetry.Recover("handler:remove_volume", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -1432,6 +1459,7 @@ func main() {
 
 		case "list_networks":
 			go func() {
+				defer telemetry.Recover("handler:list_networks", map[string]any{"command_id": env.CommandID})
 				networks, err := docker.ListNetworks(ctx)
 				if err != nil {
 					log.Printf("failed to list networks: %v", err)
@@ -1473,6 +1501,7 @@ func main() {
 
 		case "create_network":
 			go func() {
+				defer telemetry.Recover("handler:create_network", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
@@ -1515,6 +1544,7 @@ func main() {
 
 		case "remove_network":
 			go func() {
+				defer telemetry.Recover("handler:remove_network", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
 					_ = ws.SendJSON(client.OutgoingMessage{
@@ -1554,6 +1584,7 @@ func main() {
 		case "force_remove":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:force_remove", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
@@ -1611,6 +1642,7 @@ func main() {
 
 		case "exec_start":
 			go func() {
+				defer telemetry.Recover("handler:exec_start", map[string]any{"command_id": env.CommandID})
 				containerName, _ := env.Payload["container_name"].(string)
 				commandID := env.CommandID
 				if containerName == "" || commandID == "" {
@@ -1668,6 +1700,7 @@ func main() {
 
 				// Read output from exec and forward to orchestrator
 				go func() {
+					defer telemetry.Recover("handler:exec_start:reader", map[string]any{"command_id": env.CommandID})
 					defer func() {
 						conn.Close()
 						execMu.Lock()
@@ -1710,6 +1743,7 @@ func main() {
 
 		case "exec_input":
 			go func() {
+				defer telemetry.Recover("handler:exec_input", map[string]any{"command_id": env.CommandID})
 				commandID := env.CommandID
 				dataB64, _ := env.Payload["data"].(string)
 				if commandID == "" || dataB64 == "" {
@@ -1730,6 +1764,7 @@ func main() {
 
 		case "exec_resize":
 			go func() {
+				defer telemetry.Recover("handler:exec_resize", map[string]any{"command_id": env.CommandID})
 				commandID := env.CommandID
 				heightF, _ := env.Payload["height"].(float64)
 				widthF, _ := env.Payload["width"].(float64)
@@ -1747,6 +1782,7 @@ func main() {
 
 		case "exec_close":
 			go func() {
+				defer telemetry.Recover("handler:exec_close", map[string]any{"command_id": env.CommandID})
 				commandID := env.CommandID
 				if commandID == "" {
 					return
@@ -1767,6 +1803,7 @@ func main() {
 			// corrected straight away.
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_sync_request", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				sendDatabaseSync(ctx, ws, docker)
 			}()
@@ -1774,6 +1811,7 @@ func main() {
 		case "db_create":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_create", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
@@ -1888,6 +1926,7 @@ func main() {
 		case "db_start":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_start", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
@@ -1948,6 +1987,7 @@ func main() {
 		case "db_stop":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_stop", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
@@ -2008,6 +2048,7 @@ func main() {
 		case "db_restart":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_restart", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
@@ -2068,6 +2109,7 @@ func main() {
 		case "db_remove":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_remove", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
@@ -2179,6 +2221,7 @@ func main() {
 		case "db_snapshot":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_snapshot", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
@@ -2289,6 +2332,7 @@ func main() {
 		case "db_restore":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_restore", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
@@ -2449,6 +2493,7 @@ func main() {
 		case "db_update_schedule":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_update_schedule", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				instanceIDFloat, _ := env.Payload["instance_id"].(float64)
 				instanceID := int(instanceIDFloat)
@@ -2504,6 +2549,7 @@ func main() {
 		case "backup_dest_test":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:backup_dest_test", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				destType, _ := env.Payload["dest_type"].(string)
 				destConfig, _ := env.Payload["dest_config"].(map[string]any)
@@ -2549,6 +2595,7 @@ func main() {
 		case "db_mirror_snapshot":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_mirror_snapshot", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 
 				filename := payloadString(env.Payload, "filename", "remote_path")
@@ -2620,6 +2667,7 @@ func main() {
 		case "db_delete_snapshot_file":
 			handlerSem <- struct{}{}
 			go func() {
+				defer telemetry.Recover("handler:db_delete_snapshot_file", map[string]any{"command_id": env.CommandID})
 				defer func() { <-handlerSem }()
 				destType, destConfig := backupDestinationFrom(env.Payload)
 				remotePath := payloadString(env.Payload, "remote_path", "filename")
@@ -2908,6 +2956,7 @@ func main() {
 	cancel()                    // signal all goroutines to stop
 	ws.Close()
 	log.Println("runner stopped")
+	telemetry.Shutdown("signal")
 }
 
 // sendLifecycleLog sends a verbose lifecycle log entry to the orchestrator so
@@ -3233,6 +3282,9 @@ func safeGo(ws *client.WSClient, name string, fn func()) {
 				n := runtime.Stack(buf, false)
 				stackStr := string(buf[:n])
 				log.Printf("[%s] PANIC: %v\n%s", name, r, stackStr)
+				// Before worker_crash: the orchestrator may be what is unreachable,
+				// and the spool keeps this report through the exit either way.
+				telemetry.ReportCrash(name, r)
 				_ = ws.SendJSON(client.OutgoingMessage{
 					Type: "worker_crash",
 					Payload: map[string]any{
@@ -3267,6 +3319,7 @@ func safeGoResilient(name string, fn func()) {
 						buf := make([]byte, 8192)
 						n := runtime.Stack(buf, false)
 						log.Printf("[%s] PANIC (recovered, restarting loop after backoff): %v\n%s", name, r, string(buf[:n]))
+						telemetry.ReportPanic(name, r, map[string]any{"restarting": true})
 						ok = false
 					}
 				}()

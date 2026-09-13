@@ -50,7 +50,7 @@ cron snapshots.
 
 ## Stack & dependencies
 
-- **Go 1.25** (`go.mod` declares `go 1.25.0`; builder image is `golang:1.25-alpine`). The README
+- **Go 1.25** (`go.mod` declares `go 1.25.5`; builder image is `golang:1.25-alpine`). The README
   still says "Go 1.24+" for the install prerequisite — treat `go.mod` as authoritative.
 - **`github.com/gorilla/websocket` v1.5.3** — the single persistent connection to `lattice-api`.
   The runner is a WebSocket *client*; it never listens.
@@ -59,6 +59,8 @@ cron snapshots.
 - **AWS SDK v2** (`aws-sdk-go-v2`, `.../credentials`, `.../service/s3`) — the S3 backup
   destination for database snapshots.
 - **`google.golang.org/api` + `golang.org/x/oauth2`** — the Google Drive backup destination.
+- **`github.com/aidenappl/go-monitor`** (pseudo-version of commit `17017e5` until it is tagged) —
+  Monitor events, redaction and the durable on-disk spool. Used only through `telemetry/`.
 - Samba backups shell out to the system `smbclient` (see `backup/samba.go`); there is no Samba
   Go library dependency.
 - Standard library everywhere else: `net`, `os/exec`, `crypto/sha256`, `syscall` (for
@@ -74,10 +76,12 @@ message dispatch `switch`.
 
 | Path | Role |
 |------|------|
-| `main.go` | Entrypoint + **the message handler**. CLI dispatch (`setup`/`version`/default), Docker connect-with-retry, wires up every subsystem, and contains the ~40-case `switch env.Type` that handles every inbound message. Also holds `sendLifecycleLog`, `handleScheduledSnapshot`, the heartbeat loop, graceful shutdown, and `safeGo` (panic-recovering goroutine launcher). ~2,978 lines. |
+| `main.go` | Entrypoint + **the message handler**. CLI dispatch (`setup`/`version`/default), Docker connect-with-retry, wires up every subsystem, and contains the ~40-case `switch env.Type` that handles every inbound message. Also holds `sendLifecycleLog`, `handleScheduledSnapshot`, the heartbeat loop, graceful shutdown, and `safeGo` (panic-recovering goroutine launcher). Every command goroutine
+defers `telemetry.Recover`. ~2,978 lines. |
 | `validate.go` | `validContainerName` — the allow-list guard applied to every container name arriving from the orchestrator (alphanumeric + `-_./`, ≤128 chars). |
 | `validate_test.go` | Table-driven tests for `validContainerName` (accepts normal names, rejects spaces and shell metacharacters `;$&\`|`). |
-| `config/config.go` | `Config` struct + `Load()`. Reads env vars, **enforces `wss://`** unless `ALLOW_INSECURE=true`, panics on missing required vars. |
+| `config/config.go` | `Config` struct + `Load()`. Reads env vars, **enforces `wss://`** unless `ALLOW_INSECURE=true`, panics on missing required vars. `LoadMonitor()` reads the `MONITOR_*` block and never panics — it runs first, so a failing `Load` is reported. |
+| `telemetry/telemetry.go` | Monitor wiring: `Init` (never fails or blocks), the standard-logger tee (`parseLine`/`classify` → `<component>.log.<level>`), `Recover` / `ReportPanic` / `ReportCrash` / `CrashGuard`, `Fatal`, `Shutdown`. Every event carries `worker`. See *Operations → Monitor telemetry*. |
 | `client/websocket.go` | The WebSocket client: `Envelope` (inbound) and `OutgoingMessage` (outbound) types, auto-reconnect loop, read/write pumps, ping/pong keepalive, buffered send channel with drop-on-full, `Drain`/`Close`. |
 | `cmd/setup.go` | `RunSetup()` — interactive install wizard. Prompts for URL/token/name, writes `.env` (mode 0600), installs the `systemd` unit on Linux. |
 | `deploy/executor.go` | `Executor`, `DeploymentSpec` + all nested spec types, `Validate()`, spec parsing, network/volume creation, stale-container cleanup, force-remove, `postDeployVerify`, strategy dispatch. |
@@ -566,6 +570,12 @@ Read in `config/config.go` (unless noted). Required vars **panic** if missing.
 | `LATTICE_URL` | No | `""` | Link back to the orchestrator UI, shown on the dashboard. |
 | `ALLOW_INSECURE` | No | `false` | Set `true` to permit an unencrypted `ws://` URL (local dev only). |
 | `DASHBOARD_BIND` | No | `127.0.0.1` | Dashboard bind address (read in `web/server.go`). Localhost-only by default. |
+| `MONITOR_INGEST_URL` | No | `""` | Monitor ingest endpoint (`https://appleby-monitor-api.appleby.cloud/v1/events`). Unset = nothing ships. This and the rest of the `MONITOR_*` block are read by `config.LoadMonitor`, which never panics. |
+| `MONITOR_API_KEY` | No | — | Ingest-scoped key minted on the appleby zone; it decides the project. |
+| `MONITOR_ZONE` | No | `appleby` | Zone asserted against ingest's `/health` at boot, in the background; never transmitted. |
+| `MONITOR_ENV` | No | `production` | The events' `env`. |
+| `MONITOR_SPOOL_DIR` | No | `/opt/lattice-runner/monitor-spool` | Durable on-disk spool. Forced off when `MONITOR_INGEST_URL` is unset (nothing would drain it); set it empty to keep events in memory only. |
+| `MONITOR_DEBUG` / `MONITOR_STDOUT` | No | `false` | Ship debug events / also print every event to stdout (journald already has each line). |
 
 ### Local dashboard
 
@@ -582,7 +592,8 @@ pause ~2s for in-flight handlers to enqueue their final status, `Drain` the send
 the write pump is still alive**, then cancel the root context (stopping all goroutines) and `Close`
 the socket. **Order matters: `Drain` must happen BEFORE `cancel()`** — the write pump exits on
 context cancellation, so cancelling first would strand every queued message (including
-`worker_shutdown`).
+`worker_shutdown`). Last, `telemetry.Shutdown` delivers (or spools) the buffered Monitor events —
+bounded to a few seconds.
 
 ## Ecosystem & related repos
 
@@ -602,7 +613,9 @@ or `go-monitor`.
   (`/etc/systemd/system/lattice-runner.service`, `Restart=always`, `RestartSec=5`), working dir
   `/opt/lattice-runner`, config in `/opt/lattice-runner/.env` (mode 0600). It needs access to
   `/var/run/docker.sock`.
-- **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host; centrally, the worker's
+- **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host. Every log line, recovered
+  panic, crash and boot failure also goes to **Monitor** (service `lattice-runner`, field `worker`)
+  — see *Monitor telemetry* below. Centrally, the worker's
   heartbeats/lifecycle logs/deploy progress show up in `lattice-web` and via the Lattice MCP
   (`mcp__lattice__lattice_get_worker`, `lattice_get_container_logs`, `lattice_get_deployment_logs`,
   `lattice_get_anomalies`). The local dashboard (`http://127.0.0.1:9100`) is a last-resort on-host view.
@@ -617,13 +630,18 @@ or `go-monitor`.
     or the TLS proxy in front of `lattice-api` has an expired cert. The runner keeps retrying every
     `RECONNECT_INTERVAL`; check journald for `ws: connection failed`.
   - *Runner won't start* — `config.Load` panicked on a missing `ORCHESTRATOR_URL`/`WORKER_TOKEN`, or
-    it exited after 30 failed Docker connects (`docker.sock` perms / daemon down).
+    it exited after 30 failed Docker connects (`docker.sock` perms / daemon down). With telemetry
+    configured these arrive in Monitor as `service.crashed` and
+    `service.startup.docker_unreachable`.
   - *`systemd` restart loop* — the WS connect loop panicked (the only loop that exits on panic);
     look for a `worker_crash` message (it carries the goroutine name + stack) and the corresponding
-    journald `[ws-connect] PANIC` line. A panic in a telemetry loop (`log-streamer`/`net-monitor`/
+    journald `[ws-connect] PANIC` line — and a `service.crashed` event in Monitor, sent before
+    `worker_crash` and spooled, so it survives the exit even when the orchestrator is unreachable.
+    A panic in a telemetry loop (`log-streamer`/`net-monitor`/
     `heartbeat`) does **not** restart the process — it self-heals via `safeGoResilient` and shows up
-    only as a journald `[<name>] PANIC (recovered, restarting loop…)` line, so a subsystem going
-    quiet without a restart is the signature there.
+    as a journald `[<name>] PANIC (recovered, restarting loop…)` line and a `panic.recovered`
+    event with `restarting: true`, so a subsystem going quiet without a restart is the signature
+    there.
   - *Deploy stuck/failed* — inspect `deployment_progress`/`lifecycle_log`; `postDeployVerify` fails a
     deploy when containers crash-loop or report unhealthy within 60s.
   - *Container "not found" on a lifecycle action after a deploy* — likely still under a suffixed
@@ -633,6 +651,27 @@ or `go-monitor`.
     pure telemetry is best-effort by design. Command_id-correlated replies use `SendJSONReliable`
     (blocking with a 10s deadline) so they are not dropped on a transient full queue; a
     `ws: reliable send timed out` log means the socket was genuinely stuck for 10s.
+
+### Monitor telemetry
+
+`lattice-runner` reports to the **appleby** Monitor zone through `go-monitor` (`telemetry/`).
+Monitor runs as containers on Lattice workers — possibly this one — so **it is never a boot
+requirement**: `telemetry.Init` runs before `config.Load`, never touches the network and never
+fails, and events are spooled under `MONITOR_SPOOL_DIR` until ingest answers — through a Monitor
+outage, a runner restart, or the redeploy of the very container that hosts Monitor.
+
+| Event | Level | What |
+|-------|-------|------|
+| `<component>.log.<level>` | inferred | Every standard-library `log` line, through a tee on the standard logger. `caller` is the file:line (`log.Lshortfile` is on, so journald shows it too), `component` comes from a `[name] ` or `name: ` prefix (else the event is `runner.log.*`). The level is read from the wording: handled failures (`retrying`, `attempt N`, `falling back`, `trying kill`, `may already exist`, …) → warn; `failed` / `error` / `cannot` / `unable` → **error, which makes it an issue**; `invalid` / `not found` / `timeout` / `full` / … → warn; anything else info. `PANIC` lines are skipped: the panic event already carries them, with the stack. |
+| `panic.recovered` | error | Every recovered panic, with its stack: the message handler, every command goroutine (`handler:<type>`, with `command_id`), `safeGoResilient` loops (`restarting: true`), the snapshot scheduler, snapshot pipe writers, log streams. |
+| `service.crashed` | fatal | A panic the runner exits over — `safeGo` (ws-connect), the WebSocket pumps, `main` (including a `config.Load` panic). Flushed before the exit. |
+| `service.startup.docker_unreachable` | fatal | 30 failed Docker connects. |
+| `service.startup` / `service.shutdown` | info | Version and spool state; the shutdown. |
+
+Every event carries `worker` (`WORKER_NAME`, falling back to the hostname) — the same failure on
+two workers is one issue with two workers in it. Turning it on is a per-worker `.env` change
+(`MONITOR_INGEST_URL` + `MONITOR_API_KEY`) and a restart: neither `setup` nor `install/runner.sh`
+writes these.
 
 ## Rules & guardrails
 
@@ -650,10 +689,19 @@ or `go-monitor`.
   (`<name>-ltc<6 lowercase-alnum>` via `docker.SuffixMarker`, `-retired-*`, `-lattice-updating`);
   divergence orphans containers and logs. **Never** match/strip a bare 6-char segment — it collides
   with real names (`-worker`/`-server`/`-master`/`-canary`/`-backup`) and targets the wrong container.
-- **Preserve panic isolation.** Handlers must not be allowed to crash the read pump; long-lived
-  goroutines go through `safeGo` so a panic is reported as `worker_crash` before exit.
+- **Preserve panic isolation.** Handlers must not be allowed to crash the read pump; every command
+  goroutine starts with `defer telemetry.Recover("handler:<type>", …)` (directly deferred — inside
+  another closure `recover` is a no-op); long-lived loops go through `safeGoResilient`; and the
+  goroutines whose panic should end the process go through `safeGo` / `telemetry.CrashGuard`, so it
+  is reported (`service.crashed`, `worker_crash`) before exit. A goroutine feeding an `io.Pipe` must
+  `CloseWithError` on panic, or its reader waits forever.
+- **Log with a component prefix and plain words.** `log.Printf("deploy: … failed: %v", err)` — the
+  Monitor tee names the event from the prefix and picks the level from the wording, so a handled
+  failure should say how it was handled ("retrying", "falling back"). Never make Monitor a boot
+  requirement.
 - **Don't log secrets.** Deploy specs, `recreate`/`pull_image` `auth`, and db handlers carry
-  registry passwords and database credentials. Log names and outcomes, not payloads.
+  registry passwords and database credentials. Log names and outcomes, not payloads — every log
+  line also reaches Monitor. The SDK redacts credential-shaped values; don't rely on it.
 - **Every handler must reply.** Emit a `*_status`/`worker_action_status` on both success and
   failure so the dashboard reflects reality.
 - **Respect the global guardrails:** never push/deploy without explicit instruction, never modify

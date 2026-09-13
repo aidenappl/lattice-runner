@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"io"
 	"log"
 	"strings"
@@ -155,6 +156,7 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 // container restart) as long as the context has not been cancelled.
 // done is closed when this goroutine exits so sync() can detect it.
 func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName string, done chan struct{}) {
+	defer telemetry.Recover("logstreamer.stream", map[string]any{"container": containerName})
 	defer close(done)
 
 	var since time.Time // zero → use Tail:100 on first connect

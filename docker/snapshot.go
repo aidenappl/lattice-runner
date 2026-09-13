@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -91,6 +92,14 @@ func (c *Client) ExecDatabaseDump(ctx context.Context, containerID, engine, dbNa
 
 	go func() {
 		defer resp.Close()
+		defer func() {
+			// A panic must still end the stream with an error, or the uploader
+			// reading pr waits forever with the database's dump open.
+			if rec := recover(); rec != nil {
+				telemetry.ReportPanic("snapshot.dump", rec, nil)
+				pw.CloseWithError(fmt.Errorf("dump stream panicked: %v", rec))
+			}
+		}()
 
 		// stderr is captured rather than streamed: it is the diagnosis attached to
 		// a failure, and it is bounded by the engine's own error output.
@@ -163,6 +172,7 @@ func (c *Client) ExecDatabaseRestore(ctx context.Context, containerID, engine, d
 
 	// Write data to stdin
 	go func() {
+		defer telemetry.Recover("snapshot.restore_stdin", nil)
 		defer resp.CloseWrite()
 		io.Copy(resp.Conn, data)
 	}()

@@ -40,6 +40,42 @@ func Load() *Config {
 	return cfg
 }
 
+// Monitor is the telemetry configuration. Unlike Load it never panics: it is
+// read before Load, so that a boot failing inside Load is itself reported.
+type Monitor struct {
+	IngestURL  string
+	APIKey     string
+	Zone       string
+	Env        string
+	SpoolDir   string
+	Debug      bool
+	Stdout     bool
+	WorkerName string
+}
+
+// DEFAULT_MONITOR_SPOOL_DIR is durable by default: Monitor may be a container
+// on this very worker, and its events have to wait somewhere while it restarts.
+// The install directory survives upgrades — install/runner.sh never removes it.
+const DEFAULT_MONITOR_SPOOL_DIR = "/opt/lattice-runner/monitor-spool"
+
+func LoadMonitor() Monitor {
+	m := Monitor{
+		IngestURL:  getEnv("MONITOR_INGEST_URL", ""),
+		APIKey:     getEnv("MONITOR_API_KEY", ""),
+		Zone:       getEnv("MONITOR_ZONE", "appleby"),
+		Env:        getEnv("MONITOR_ENV", "production"),
+		SpoolDir:   getEnv("MONITOR_SPOOL_DIR", DEFAULT_MONITOR_SPOOL_DIR),
+		Debug:      getEnv("MONITOR_DEBUG", "false") == "true",
+		Stdout:     getEnv("MONITOR_STDOUT", "false") == "true",
+		WorkerName: getEnv("WORKER_NAME", hostname()),
+	}
+	if m.IngestURL == "" {
+		// Nothing would ever drain it.
+		m.SpoolDir = ""
+	}
+	return m
+}
+
 func getEnv(key, fallback string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aidenappl/lattice-runner/telemetry"
 	"github.com/gorilla/websocket"
 )
 
@@ -163,13 +164,17 @@ func (c *WSClient) run(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// A pump panic still ends the process, as it always has — systemd restarts
+	// the runner clean. CrashGuard only makes sure the report leaves first.
 	go func() {
 		defer wg.Done()
+		defer telemetry.CrashGuard("ws.read_pump")
 		c.readPump(runCtx, cancel)
 	}()
 
 	go func() {
 		defer wg.Done()
+		defer telemetry.CrashGuard("ws.write_pump")
 		c.writePump(runCtx)
 	}()
 

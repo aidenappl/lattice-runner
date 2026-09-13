@@ -1,8 +1,9 @@
 module github.com/aidenappl/lattice-runner
 
-go 1.25.0
+go 1.25.5
 
 require (
+	github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.33
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.38

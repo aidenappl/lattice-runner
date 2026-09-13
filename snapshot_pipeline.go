@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/aidenappl/lattice-runner/backup"
+	"github.com/aidenappl/lattice-runner/telemetry"
 )
 
 // snapshotUploadBuffer sits between the compressor and the uploader.
@@ -56,6 +57,14 @@ func streamSnapshot(
 	pr, pw := io.Pipe()
 
 	go func() {
+		defer func() {
+			// As above: a panic must end the stream with an error, not strand
+			// the uploader on a pipe nobody will ever close.
+			if rec := recover(); rec != nil {
+				telemetry.ReportPanic("snapshot.compress", rec, nil)
+				pw.CloseWithError(fmt.Errorf("snapshot stream panicked: %v", rec))
+			}
+		}()
 		buffered := bufio.NewWriterSize(pw, snapshotUploadBuffer)
 		gz := gzip.NewWriter(buffered)
 
