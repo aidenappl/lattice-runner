@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Lattice Runner - Update Script
 # Fetches the latest GitHub release, rebuilds from that tag, and restarts the service.
+# Also repairs the systemd unit on every run, even when the binary is already current.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/aidenappl/lattice-runner/main/deploy/update.sh | bash
@@ -66,6 +67,52 @@ if ! command -v go >/dev/null 2>&1; then
     echo ""
 fi
 
+# Ensure the systemd unit exists and depends on Docker the right way.
+#
+# This runs BEFORE the "already on latest" exit below on purpose: the unit is
+# only ever written when it is missing, so a worker installed with an old unit
+# would otherwise keep it forever. Running this script on an up-to-date worker
+# still repairs it.
+#
+# The unit must not use Requires=docker.service — see serviceTemplate in
+# cmd/setup.go, which this heredoc must match byte-for-byte (enforced by
+# TestUpdateScriptUnitMatchesServiceTemplate). In short: one failed Docker start
+# job leaves a Requires= unit "Dependency failed" and never retried, and
+# Restart=always does not cover that.
+SERVICE_FILE="/etc/systemd/system/lattice-runner.service"
+if [ ! -f "$SERVICE_FILE" ]; then
+    log "Creating systemd service..."
+    sudo tee "$SERVICE_FILE" > /dev/null <<'EOF'
+[Unit]
+Description=Lattice Runner
+After=network.target docker.service
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lattice-runner
+EnvironmentFile=/opt/lattice-runner/.env
+ExecStart=/opt/lattice-runner/lattice-runner
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable lattice-runner
+    log "Created and enabled lattice-runner.service"
+elif grep -q '^Requires=docker\.service$' "$SERVICE_FILE"; then
+    # Rewrite only the dependency line so any local edits to the rest of the
+    # unit survive. daemon-reload applies the new dependency without restarting
+    # the runner.
+    log "Migrating lattice-runner.service off Requires=docker.service..."
+    sudo sed -i 's/^Requires=docker\.service$/Wants=docker.service\nPartOf=docker.service/' "$SERVICE_FILE"
+    sudo systemctl daemon-reload
+    log "lattice-runner.service now uses Wants= + PartOf=docker.service"
+fi
+
 # Resolve latest release tag
 CURRENT_VERSION=$($INSTALL_DIR/lattice-runner version 2>/dev/null || echo 'unknown')
 log "Current version: $CURRENT_VERSION"
@@ -115,32 +162,6 @@ sudo mv -f "$INSTALL_DIR/lattice-runner.new" "$INSTALL_DIR/lattice-runner"
 # Cleanup build dir (trap will also clean up on failure)
 rm -rf "$BUILD_DIR"
 BUILD_DIR=""
-
-# Ensure systemd service exists
-SERVICE_FILE="/etc/systemd/system/lattice-runner.service"
-if [ ! -f "$SERVICE_FILE" ]; then
-    log "Creating systemd service..."
-    sudo tee "$SERVICE_FILE" > /dev/null <<'EOF'
-[Unit]
-Description=Lattice Runner
-After=network.target docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/lattice-runner
-EnvironmentFile=/opt/lattice-runner/.env
-ExecStart=/opt/lattice-runner/lattice-runner
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable lattice-runner
-    log "Created and enabled lattice-runner.service"
-fi
 
 # Delay restart so the runner process that spawned this script can finish
 # reporting success before systemd kills it.

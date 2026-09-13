@@ -613,6 +613,16 @@ or `go-monitor`.
   (`/etc/systemd/system/lattice-runner.service`, `Restart=always`, `RestartSec=5`), working dir
   `/opt/lattice-runner`, config in `/opt/lattice-runner/.env` (mode 0600). It needs access to
   `/var/run/docker.sock`.
+- **The unit depends on Docker via `Wants=` + `After=` + `PartOf=docker.service` — never
+  `Requires=`.** Under `Requires=`, one failed Docker start job marks the runner "Dependency
+  failed" and systemd never tries it again; `Restart=always` only covers the process exiting.
+  That stranded trailblaze-prod-worker-1 offline for three days in September 2026 while its
+  containers kept serving. The unit is written in **four** places that must agree:
+  `cmd/setup.go` (`serviceTemplate`), `deploy/update.sh` (pinned byte-for-byte by
+  `TestUpdateScriptUnitMatchesServiceTemplate`), and both heredocs in lattice-api's
+  `install/runner.sh` (pinned by its `TestInstallScriptRunnerUnit`). `deploy/update.sh` and the
+  lattice-api upgrade path both rewrite an existing `Requires=` unit in place. `update.sh` does it
+  *before* its "already on latest" exit, so it repairs an up-to-date worker too.
 - **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host. Every log line, recovered
   panic, crash and boot failure also goes to **Monitor** (service `lattice-runner`, field `worker`)
   — see *Monitor telemetry* below. Centrally, the worker's
@@ -629,6 +639,13 @@ or `go-monitor`.
   - *Worker shows offline / reconnect loop* — bad or revoked `WORKER_TOKEN`, wrong `ORCHESTRATOR_URL`,
     or the TLS proxy in front of `lattice-api` has an expired cert. The runner keeps retrying every
     `RECONNECT_INTERVAL`; check journald for `ws: connection failed`.
+  - *Worker shows offline for days while its containers keep serving* — the runner is
+    `inactive (dead)` after `Dependency failed for Lattice Runner` in `systemctl status
+    lattice-runner`. That only happens on a unit still using `Requires=docker.service`, after a
+    Docker start failure (e.g. a slow containerd following an unclean reboot). Recover with
+    `sudo systemctl restart lattice-runner`; running `deploy/update.sh` or an `upgrade_runner`
+    repairs the unit. Until then, deploys to that worker fail with HTTP 400 "worker is not
+    connected" — and the CI deploy step hides that body, printing only `http=400`.
   - *Runner won't start* — `config.Load` panicked on a missing `ORCHESTRATOR_URL`/`WORKER_TOKEN`, or
     it exited after 30 failed Docker connects (`docker.sock` perms / daemon down). With telemetry
     configured these arrive in Monitor as `service.crashed` and

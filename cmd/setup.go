@@ -10,10 +10,25 @@ import (
 	"strings"
 )
 
+// serviceTemplate is the systemd unit for the runner. deploy/update.sh carries a
+// byte-identical copy (pinned by TestUpdateScriptUnitMatchesServiceTemplate).
+//
+// It deliberately does NOT use Requires=docker.service. Under Requires=, a single
+// failed Docker start job marks this unit "Dependency failed", and systemd never
+// tries it again — Restart=always only fires when the process exits, not when its
+// start job fails on a dependency. That is how trailblaze-prod-worker-1 sat
+// offline in Lattice for three days from 2026-09-10: after an unclean reboot
+// containerd took 53s to come up, Docker's first start timed out, and the runner
+// was never started, while every container on the host kept serving.
+//
+// Wants= still pulls Docker in at boot and After= keeps the ordering. PartOf=
+// restarts the runner whenever Docker is restarted or stopped. If the runner
+// comes up before the daemon is ready, Restart=always brings it back.
 const serviceTemplate = `[Unit]
 Description=Lattice Runner
 After=network.target docker.service
-Requires=docker.service
+Wants=docker.service
+PartOf=docker.service
 
 [Service]
 Type=simple
