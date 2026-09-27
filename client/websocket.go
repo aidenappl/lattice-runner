@@ -51,6 +51,11 @@ type WSClient struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// dropsMu guards drops: messages dropped for want of queue room, by
+	// message type, since the last TakeDrops.
+	dropsMu sync.Mutex
+	drops   map[string]int64
 }
 
 func NewWSClient(orchestratorURL, token string, reconnectInterval time.Duration) *WSClient {
@@ -79,8 +84,10 @@ func (c *WSClient) SendJSON(v any) error {
 	case c.send <- b:
 		return nil
 	default:
+		mt := messageType(b)
+		c.countDrop(mt)
 		slog.WarnContext(context.Background(), "ws send queue full, dropping message", "component", "ws",
-			"queue_len", len(c.send), "queue_cap", cap(c.send), "message_type", messageType(b))
+			"queue_len", len(c.send), "queue_cap", cap(c.send), "message_type", mt)
 		return ErrSendQueueFull
 	}
 }
@@ -120,11 +127,42 @@ func (c *WSClient) SendJSONReliable(v any) error {
 	case c.send <- b:
 		return nil
 	case <-time.After(reliableSendTimeout):
+		mt := messageType(b)
+		c.countDrop(mt)
 		slog.WarnContext(context.Background(), "ws reliable send timed out, dropping message", "component", "ws",
 			"timeout_ms", reliableSendTimeout.Milliseconds(), "queue_len", len(c.send), "queue_cap", cap(c.send),
-			"message_type", messageType(b))
+			"message_type", mt)
 		return fmt.Errorf("%w after %v", ErrSendQueueFull, reliableSendTimeout)
 	}
+}
+
+// countDrop records one message of type msgType dropped for want of queue room.
+func (c *WSClient) countDrop(msgType string) {
+	c.dropsMu.Lock()
+	defer c.dropsMu.Unlock()
+	if c.drops == nil {
+		c.drops = map[string]int64{}
+	}
+	c.drops[msgType]++
+}
+
+// TakeDrops returns the messages dropped since the last call, by message type,
+// and starts counting afresh. The map is never nil.
+func (c *WSClient) TakeDrops() map[string]int64 {
+	c.dropsMu.Lock()
+	defer c.dropsMu.Unlock()
+	d := c.drops
+	c.drops = nil
+	if d == nil {
+		d = map[string]int64{}
+	}
+	return d
+}
+
+// QueueStats reports how many messages are waiting in the send queue and its
+// capacity.
+func (c *WSClient) QueueStats() (length, capacity int) {
+	return len(c.send), cap(c.send)
 }
 
 // reliableSendTimeout bounds how long SendJSONReliable waits for queue room.

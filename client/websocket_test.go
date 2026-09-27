@@ -109,3 +109,35 @@ func TestSendJSONMarshalError(t *testing.T) {
 		t.Fatalf("queue length = %d, want 0", len(c.send))
 	}
 }
+
+func TestTakeDropsCountsByTypeAndResets(t *testing.T) {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&recordingHandler{}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	c := &WSClient{send: make(chan []byte, 1)}
+	if d := c.TakeDrops(); d == nil || len(d) != 0 {
+		t.Fatalf("TakeDrops before any drop = %v, want an empty map", d)
+	}
+	_ = c.SendJSON(OutgoingMessage{Type: "heartbeat"}) // fills the queue
+	for _, typ := range []string{"container_sync", "container_sync", "container_logs"} {
+		_ = c.SendJSON(OutgoingMessage{Type: typ})
+	}
+
+	got := c.TakeDrops()
+	want := map[string]int64{"container_sync": 2, "container_logs": 1}
+	if len(got) != len(want) {
+		t.Fatalf("TakeDrops = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("drops[%s] = %d, want %d", k, got[k], v)
+		}
+	}
+	if d := c.TakeDrops(); len(d) != 0 {
+		t.Errorf("TakeDrops after reset = %v, want empty", d)
+	}
+	if l, cp := c.QueueStats(); l != 1 || cp != 1 {
+		t.Errorf("QueueStats = (%d, %d), want (1, 1)", l, cp)
+	}
+}

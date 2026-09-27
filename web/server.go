@@ -56,7 +56,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	dockerVersion := ""
 	if s.Docker != nil {
-		v, _ := s.Docker.ServerVersion(r.Context())
+		v, err := s.Docker.ServerVersion(r.Context())
+		if err != nil {
+			slog.DebugContext(r.Context(), "dashboard docker version unavailable", "component", "dashboard", "error", err)
+		}
 		dockerVersion = v
 	}
 
@@ -138,13 +141,17 @@ func (s *Server) handleContainerLogs(w http.ResponseWriter, r *http.Request) {
 
 	reader, err := s.Docker.ContainerLogs(r.Context(), containerID, tail)
 	if err != nil {
+		slog.WarnContext(r.Context(), "dashboard container logs unavailable", "component", "dashboard", "container_id", containerID, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer reader.Close()
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	io.Copy(w, reader)
+	// Usually the browser went away mid-stream: debug, not a warning.
+	if _, err := io.Copy(w, reader); err != nil {
+		slog.DebugContext(r.Context(), "dashboard container logs stream ended early", "component", "dashboard", "container_id", containerID, "error", err)
+	}
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

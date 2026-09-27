@@ -675,13 +675,22 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 	if renameErr := c.cli.ContainerRename(ctx, containerID, retiredName); renameErr != nil {
 		slog.WarnContext(ctx, "graceful-recreate rename failed, falling back to stop+remove", "component", "graceful-recreate",
 			"container", originalName, "error", renameErr)
-		_ = c.StopContainer(ctx, containerID, 10)
-		_ = c.RemoveContainer(ctx, containerID, true)
+		if err := c.StopContainer(ctx, containerID, 10); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate fallback stop failed", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
+		if err := c.RemoveContainer(ctx, containerID, true); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate fallback remove failed", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 		// Wait briefly for name release
 		time.Sleep(2 * time.Second)
 	} else {
 		oldRetired = true
-		_ = c.StopContainer(ctx, containerID, 10)
+		if err := c.StopContainer(ctx, containerID, 10); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate failed to stop retired container", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 	}
 
 	// restoreOld brings the retired old container back under the original name.
@@ -694,7 +703,12 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 			slog.ErrorContext(ctx, "graceful-recreate rollback rename failed", "component", "graceful-recreate",
 				"container", originalName, "from", retiredName, "error", renameErr)
 		}
-		_ = c.StartContainer(ctx, containerID)
+		// A failure here leaves the old container stopped with nothing serving
+		// in its place.
+		if err := c.StartContainer(ctx, containerID); err != nil {
+			slog.ErrorContext(ctx, "graceful-recreate rollback failed to start old container", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 	}
 	// removeOld disposes of the retired old container once the swap succeeded.
 	removeOld := func() {

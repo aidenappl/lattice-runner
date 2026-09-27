@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
+	"github.com/aidenappl/lattice-runner/telemetry"
 )
 
 // shellMetaChars contains characters that could be used for shell injection.
@@ -165,10 +166,65 @@ func NewExecutor(docker *dockerclient.Client, progress ProgressCallback) *Execut
 	return &Executor{Docker: docker, Progress: progress}
 }
 
-// Execute runs a deployment according to the specified strategy.
+// Deployment lifecycle event names. Each deployment produces exactly one
+// deployment.started and then exactly one of deployment.succeeded or
+// deployment.failed, and deployment.failed is the only error-level event for
+// the failure itself: callers of Execute must not log the returned error at
+// error again.
+const (
+	EVENT_DEPLOYMENT_STARTED   = "deployment.started"
+	EVENT_DEPLOYMENT_SUCCEEDED = "deployment.succeeded"
+	EVENT_DEPLOYMENT_FAILED    = "deployment.failed"
+)
+
+// Steps a deployment can fail at, reported as failed_step.
+const (
+	STEP_VALIDATE  = "validate"
+	STEP_PREFLIGHT = "preflight"
+	STEP_STRATEGY  = "strategy"
+	STEP_VERIFY    = "verify"
+	// The runner fails these before Execute: the command's spec did not
+	// parse, or its stack already has a deployment in flight.
+	STEP_PARSE    = "parse"
+	STEP_CONFLICT = "conflict"
+)
+
+// Execute runs a deployment according to the specified strategy, and reports
+// its start and its outcome (with duration) as lifecycle events.
 func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
+	start := time.Now()
+	fields := []any{
+		"component", "deploy",
+		"deployment_id", spec.DeploymentID,
+		"stack", spec.StackName,
+		"strategy", spec.Strategy,
+		"container_count", len(spec.Containers),
+	}
+	slog.InfoContext(ctx, "deployment started", append(fields, "event", EVENT_DEPLOYMENT_STARTED)...)
+
+	step, err := e.execute(ctx, spec)
+	durationMS := time.Since(start).Milliseconds()
+	if err != nil {
+		slog.ErrorContext(ctx, "deployment failed", append(fields,
+			"event", EVENT_DEPLOYMENT_FAILED,
+			"duration_ms", durationMS,
+			"failed_step", step,
+			"error", err,
+		)...)
+		return err
+	}
+	slog.InfoContext(ctx, "deployment succeeded", append(fields,
+		"event", EVENT_DEPLOYMENT_SUCCEEDED,
+		"duration_ms", durationMS,
+	)...)
+	return nil
+}
+
+// execute is the body of Execute. On failure it also names the step that
+// failed.
+func (e *Executor) execute(ctx context.Context, spec DeploymentSpec) (string, error) {
 	if err := spec.Validate(); err != nil {
-		return fmt.Errorf("spec validation failed: %w", err)
+		return STEP_VALIDATE, fmt.Errorf("spec validation failed: %w", err)
 	}
 
 	// Pre-flight check: ensure sufficient disk space
@@ -176,11 +232,9 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 	if err := syscall.Statfs("/", &stat); err == nil {
 		availGB := float64(stat.Bavail*uint64(stat.Bsize)) / (1024 * 1024 * 1024)
 		if availGB < 1.0 {
-			return fmt.Errorf("insufficient disk space: %.1fGB available, need at least 1GB", availGB)
+			return STEP_PREFLIGHT, fmt.Errorf("insufficient disk space: %.1fGB available, need at least 1GB", availGB)
 		}
 	}
-
-	slog.InfoContext(ctx, "deploy starting deployment", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "strategy", spec.Strategy)
 
 	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting deployment: strategy=%s, containers=%d, networks=%d, volumes=%d",
 		spec.Strategy, len(spec.Containers), len(spec.Networks), len(spec.Volumes)), nil)
@@ -245,18 +299,30 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 
 	if err != nil {
 		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("deployment failed during %s: %v", strategyName, err), nil)
-		return err
+		return STEP_STRATEGY, err
 	}
 
 	// Post-deploy verification: check containers at intervals to ensure they
 	// stabilize and don't immediately crash-loop.
 	if verifyErr := e.postDeployVerify(ctx, spec); verifyErr != nil {
 		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("post-deploy verification failed: %v", verifyErr), nil)
-		return verifyErr
+		return STEP_VERIFY, verifyErr
 	}
 
 	e.reportProgress(spec.DeploymentID, "deployed", fmt.Sprintf("deployment completed successfully via %s strategy", strategyName), nil)
-	return nil
+	return "", nil
+}
+
+// logCleanupErr logs a best-effort step (stopping, killing or removing a
+// container) that failed. The deployment carries on either way, but what the
+// failure leaves behind — a container still running, or an orphan — must be
+// visible. It is attributed to its caller. A nil err logs nothing.
+func logCleanupErr(ctx context.Context, level slog.Level, err error, msg string, spec DeploymentSpec, args ...any) {
+	if err == nil {
+		return
+	}
+	attrs := append([]any{"component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err}, args...)
+	telemetry.LogAt(ctx, 1, level, msg, attrs...)
 }
 
 // cleanupDecision reports whether a container should be removed ahead of a

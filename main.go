@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -112,6 +111,104 @@ func wsSendReliableAt(ctx context.Context, skip int, ws *client.WSClient, msgTyp
 	}
 }
 
+// parseDeployCommand reads a deploy command's spec. A spec that does not parse
+// fails the deployment: it is reported as deployment.failed at step "parse"
+// and answered with a failed deployment_progress, and ok is false.
+func parseDeployCommand(ctx context.Context, ws *client.WSClient, env client.Envelope) (*deploy.DeploymentSpec, bool) {
+	spec, err := deploy.ParseDeploymentSpec(env.Payload)
+	if err == nil {
+		return spec, true
+	}
+	logDeployFailedAt(ctx, 0, deployFieldsFromPayload(env.Payload), deploy.STEP_PARSE, err)
+	wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
+		Type:      "deployment_progress",
+		CommandID: env.CommandID,
+		Status:    "failed",
+		Payload: map[string]any{
+			"deployment_id": env.Payload["deployment_id"],
+			"status":        "failed",
+			"message":       fmt.Sprintf("invalid spec: %v", err),
+		},
+	})
+	return nil, false
+}
+
+// stackConflict returns the id of another in-flight deployment on spec's
+// stack, or 0 when there is none. Deployments are serialized by stack.
+func stackConflict(states map[int]*deploymentRunState, spec deploy.DeploymentSpec) int {
+	if spec.StackName == "" {
+		return 0
+	}
+	for _, st := range states {
+		if st.InProgress && st.DeploymentID != spec.DeploymentID && st.StackName == spec.StackName {
+			return st.DeploymentID
+		}
+	}
+	return 0
+}
+
+// rejectDeployConflict fails a deployment whose stack already has conflict in
+// flight: it is reported as deployment.failed at step "conflict", attributed
+// to the caller, and answered with a failed deployment_progress.
+func rejectDeployConflict(ctx context.Context, ws *client.WSClient, env client.Envelope, spec deploy.DeploymentSpec, conflict int) {
+	err := fmt.Errorf("stack %s already has an in-flight deployment (%d)", spec.StackName, conflict)
+	fields := []any{
+		"component", "deploy",
+		"deployment_id", spec.DeploymentID,
+		"stack", spec.StackName,
+		"strategy", spec.Strategy,
+		"container_count", len(spec.Containers),
+		"conflicting_deployment_id", conflict,
+	}
+	logDeployFailedAt(ctx, 1, fields, deploy.STEP_CONFLICT, err)
+	wsSendAt(ctx, 1, ws, "deployment_progress", client.OutgoingMessage{
+		Type:      "deployment_progress",
+		CommandID: env.CommandID,
+		Status:    "failed",
+		Payload: map[string]any{
+			"deployment_id": spec.DeploymentID,
+			"status":        "failed",
+			"message":       err.Error(),
+		},
+	})
+}
+
+// logDeployFailedAt reports a deployment the runner fails before
+// Executor.Execute runs it, as the one error-level deployment.failed for that
+// failure, with Execute's fields. It is attributed skip frames above its
+// caller, as for telemetry.LogAt.
+func logDeployFailedAt(ctx context.Context, skip int, fields []any, step string, err error) {
+	attrs := make([]any, 0, len(fields)+8)
+	attrs = append(attrs, fields...)
+	attrs = append(attrs,
+		"event", deploy.EVENT_DEPLOYMENT_FAILED,
+		"duration_ms", int64(0),
+		"failed_step", step,
+		"error", err,
+	)
+	telemetry.LogAt(ctx, skip+1, slog.LevelError, "deployment failed", attrs...)
+}
+
+// deployFieldsFromPayload is what can be read of Execute's deployment fields
+// from a deploy payload that did not parse as a whole. Each is included only
+// when present with the expected type.
+func deployFieldsFromPayload(payload map[string]any) []any {
+	fields := []any{"component", "deploy"}
+	if v, ok := payload["deployment_id"].(float64); ok && v == float64(int(v)) {
+		fields = append(fields, "deployment_id", int(v))
+	}
+	if v, ok := payload["stack_name"].(string); ok {
+		fields = append(fields, "stack", v)
+	}
+	if v, ok := payload["strategy"].(string); ok {
+		fields = append(fields, "strategy", v)
+	}
+	if v, ok := payload["containers"].([]any); ok {
+		fields = append(fields, "container_count", len(v))
+	}
+	return fields
+}
+
 type deploymentRunState struct {
 	DeploymentID   int
 	StackName      string
@@ -182,7 +279,10 @@ func main() {
 	}
 	defer docker.Close()
 
-	dockerVersion, _ := docker.ServerVersion(ctx)
+	dockerVersion, err := docker.ServerVersion(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "docker server version unavailable", "component", "runner", "error", err)
+	}
 	fmt.Printf(" ✅ Done (Docker %s)\n", dockerVersion)
 
 	// Create WebSocket client
@@ -311,23 +411,12 @@ func main() {
 			})
 
 		case "deploy":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:deploy", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
-				spec, err := deploy.ParseDeploymentSpec(env.Payload)
-				if err != nil {
-					slog.WarnContext(ctx, "invalid deploy spec", "component", "runner", "command_id", env.CommandID, "error", err)
-					wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
-						Type:      "deployment_progress",
-						CommandID: env.CommandID,
-						Status:    "failed",
-						Payload: map[string]any{
-							"deployment_id": env.Payload["deployment_id"],
-							"status":        "failed",
-							"message":       fmt.Sprintf("invalid spec: %v", err),
-						},
-					})
+				defer releaseHandler()
+				spec, ok := parseDeployCommand(ctx, ws, env)
+				if !ok {
 					return
 				}
 
@@ -352,29 +441,10 @@ func main() {
 					slog.WarnContext(ctx, "deployment already in progress, ignoring duplicate", "component", "deploy", "deployment_id", spec.DeploymentID, "status", existing.Status)
 					return
 				}
-				if spec.StackName != "" {
-					conflict := 0
-					for _, st := range deploymentStates {
-						if st.InProgress && st.DeploymentID != spec.DeploymentID && st.StackName == spec.StackName {
-							conflict = st.DeploymentID
-							break
-						}
-					}
-					if conflict != 0 {
-						deploymentStatesMu.Unlock()
-						slog.WarnContext(ctx, "stack already has an in-flight deployment, rejecting deployment", "component", "deploy", "stack", spec.StackName, "deployment_id", spec.DeploymentID, "conflicting_deployment_id", conflict)
-						wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
-							Type:      "deployment_progress",
-							CommandID: env.CommandID,
-							Status:    "failed",
-							Payload: map[string]any{
-								"deployment_id": spec.DeploymentID,
-								"status":        "failed",
-								"message":       fmt.Sprintf("stack %s already has an in-flight deployment (%d)", spec.StackName, conflict),
-							},
-						})
-						return
-					}
+				if conflict := stackConflict(deploymentStates, *spec); conflict != 0 {
+					deploymentStatesMu.Unlock()
+					rejectDeployConflict(ctx, ws, env, *spec, conflict)
+					return
 				}
 				deploymentStates[spec.DeploymentID] = &deploymentRunState{
 					DeploymentID:   spec.DeploymentID,
@@ -404,7 +474,9 @@ func main() {
 				})
 
 				if err := executor.Execute(ctx, *spec); err != nil {
-					slog.ErrorContext(ctx, "deployment failed", "component", "runner", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err)
+					// Execute has already reported this failure once, as
+					// deployment.failed at error; this is only local detail.
+					slog.DebugContext(ctx, "deployment run ended with failure", "component", "runner", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err)
 					deploymentStatesMu.Lock()
 					if st, ok := deploymentStates[spec.DeploymentID]; ok {
 						st.Status = "failed"
@@ -463,12 +535,13 @@ func main() {
 			}()
 
 		case "stop":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:stop", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "stop", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -532,12 +605,13 @@ func main() {
 			}()
 
 		case "start":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:start", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "start", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -601,12 +675,13 @@ func main() {
 			}()
 
 		case "kill":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:kill", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "kill", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -670,12 +745,13 @@ func main() {
 			}()
 
 		case "pause":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:pause", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "pause", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -739,12 +815,13 @@ func main() {
 			}()
 
 		case "unpause":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:unpause", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "unpause", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -808,12 +885,13 @@ func main() {
 			}()
 
 		case "restart":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:restart", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "restart", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -877,12 +955,13 @@ func main() {
 			}()
 
 		case "remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "remove", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -950,12 +1029,13 @@ func main() {
 			}()
 
 		case "recreate":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:recreate", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "recreate", "command_id", env.CommandID)
 					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
@@ -985,12 +1065,7 @@ func main() {
 					if tag != "" {
 						fullRef = imageRef + ":" + tag
 					}
-					var regAuth *dockerclient.RegistryAuth
-					if authData, ok := env.Payload["auth"]; ok {
-						b, _ := json.Marshal(authData)
-						regAuth = &dockerclient.RegistryAuth{}
-						_ = json.Unmarshal(b, regAuth)
-					}
+					regAuth := parseRegistryAuth(ctx, env.Payload, fullRef)
 					authInfo := ""
 					if regAuth != nil && regAuth.Username != "" {
 						authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
@@ -1008,8 +1083,12 @@ func main() {
 
 				sendLifecycleLog(ctx, ws, containerName, "recreate", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil {
+					slog.WarnContext(ctx, "container lookup failed, trying canonical variants", "component", "recreate", "container", containerName, "error", err)
+				}
 				if err != nil || id == "" {
-					// Try canonical variants (suffixed names from deploys)
+					// Try canonical variants (suffixed names from deploys). A
+					// Docker failure in this lookup is logged by the executor.
 					id, _ = executor.FindCanonicalContainer(ctx, containerName)
 				}
 				if id == "" {
@@ -1064,20 +1143,16 @@ func main() {
 			}()
 
 		case "pull_image":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:pull_image", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				imageRef, _ := env.Payload["image"].(string)
 				if imageRef == "" {
+					slog.WarnContext(ctx, "pull_image command missing image", "component", "pull_image", "command_id", env.CommandID)
 					return
 				}
-				var regAuth *dockerclient.RegistryAuth
-				if authData, ok := env.Payload["auth"]; ok {
-					b, _ := json.Marshal(authData)
-					regAuth = &dockerclient.RegistryAuth{}
-					_ = json.Unmarshal(b, regAuth)
-				}
+				regAuth := parseRegistryAuth(ctx, env.Payload, imageRef)
 				authInfo := ""
 				if regAuth != nil && regAuth.Username != "" {
 					authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
@@ -1149,7 +1224,13 @@ func main() {
 		case "upgrade_runner":
 			go func() {
 				defer telemetry.Recover("handler:upgrade_runner", map[string]any{"command_id": env.CommandID})
-				slog.InfoContext(ctx, "upgrade runner command received", "component", "runner")
+				// The orchestrator does not send the target version today; it is
+				// reported when a payload carries one.
+				upgradeAttrs := []any{"component", "runner", "event", "runner.upgrade.started", "from_version", Version}
+				if to := payloadString(env.Payload, "to_version", "target_version", "version"); to != "" {
+					upgradeAttrs = append(upgradeAttrs, "to_version", to)
+				}
+				slog.InfoContext(ctx, "runner upgrade started", upgradeAttrs...)
 				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
@@ -1256,7 +1337,10 @@ func main() {
 				}
 
 				// Make executable and run
-				_ = os.Chmod(tmpFile, 0755)
+				if err := os.Chmod(tmpFile, 0755); err != nil {
+					// Not fatal: the script is run through bash, not exec'd.
+					slog.WarnContext(ctx, "upgrade script chmod failed", "component", "upgrade", "error", err)
+				}
 				out, err := exec.CommandContext(ctx, "bash", tmpFile).CombinedOutput()
 				if err != nil {
 					reportUpgradeFailure("runner.upgrade.failed", "upgrade failed", err, out)
@@ -1603,6 +1687,7 @@ func main() {
 					driver = "bridge"
 				}
 				if err := docker.CreateNetwork(ctx, name, driver); err != nil {
+					slog.WarnContext(ctx, "failed to create network", "component", "create_network", "network", name, "driver", driver, "error", err)
 					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
@@ -1642,6 +1727,7 @@ func main() {
 					return
 				}
 				if err := docker.RemoveNetwork(ctx, name); err != nil {
+					slog.WarnContext(ctx, "failed to remove network", "component", "remove_network", "network", name, "error", err)
 					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
@@ -1665,12 +1751,13 @@ func main() {
 			}()
 
 		case "force_remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:force_remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
+					slog.WarnContext(ctx, "command missing container_name", "component", "force_remove", "command_id", env.CommandID)
 					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
@@ -1691,6 +1778,7 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
+					slog.WarnContext(ctx, "container not found", "component", "force_remove", "container", containerName, "error", err)
 					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
@@ -1700,7 +1788,9 @@ func main() {
 					return
 				}
 				slog.InfoContext(ctx, "stopping and removing container", "component", "force_remove", "container", containerName, "container_id", id[:12])
-				_ = docker.StopContainer(ctx, id, 5)
+				if err := docker.StopContainer(ctx, id, 5); err != nil {
+					slog.WarnContext(ctx, "stop before force remove failed, removing anyway", "component", "force_remove", "container", containerName, "error", err)
+				}
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
 					slog.ErrorContext(ctx, "failed to remove container", "component", "force_remove", "container", containerName, "error", err)
 					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
@@ -1729,6 +1819,7 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				commandID := env.CommandID
 				if containerName == "" || commandID == "" {
+					slog.WarnContext(ctx, "exec_start command missing container_name or command_id", "component", "exec_start", "container", containerName)
 					return
 				}
 				if !validContainerName(containerName) {
@@ -1737,6 +1828,7 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
+					slog.WarnContext(ctx, "container not found", "component", "exec_start", "container", containerName, "error", err)
 					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
@@ -1753,6 +1845,7 @@ func main() {
 
 				execID, err := docker.ContainerExecCreate(ctx, id, cmd)
 				if err != nil {
+					slog.WarnContext(ctx, "exec create failed", "component", "exec_start", "container", containerName, "error", err)
 					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
@@ -1765,6 +1858,7 @@ func main() {
 
 				conn, err := docker.ContainerExecAttach(ctx, execID)
 				if err != nil {
+					slog.WarnContext(ctx, "exec attach failed", "component", "exec_start", "container", containerName, "error", err)
 					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
@@ -1840,9 +1934,12 @@ func main() {
 				}
 				data, err := base64.StdEncoding.DecodeString(dataB64)
 				if err != nil {
+					slog.WarnContext(ctx, "exec input is not valid base64", "component", "exec_input", "error", err)
 					return
 				}
-				_, _ = session.conn.Conn.Write(data)
+				if _, err := session.conn.Conn.Write(data); err != nil {
+					slog.WarnContext(ctx, "exec input write failed", "component", "exec_input", "exec_id", session.execID, "error", err)
+				}
 			}()
 
 		case "exec_resize":
@@ -1860,7 +1957,9 @@ func main() {
 				if !ok {
 					return
 				}
-				_ = docker.ContainerExecResize(ctx, session.execID, uint(heightF), uint(widthF))
+				if err := docker.ContainerExecResize(ctx, session.execID, uint(heightF), uint(widthF)); err != nil {
+					slog.WarnContext(ctx, "exec resize failed", "component", "exec_resize", "exec_id", session.execID, "error", err)
+				}
 			}()
 
 		case "exec_close":
@@ -1884,18 +1983,18 @@ func main() {
 			// state — sent on its reconcile tick and whenever this worker
 			// reconnects, so anything that changed while we were unreachable is
 			// corrected straight away.
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_sync_request", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				sendDatabaseSync(ctx, ws, docker)
 			}()
 
 		case "db_create":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_create", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_create", "container", containerName)
@@ -2006,10 +2105,10 @@ func main() {
 			}()
 
 		case "db_start":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_start", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_start", "container", containerName)
@@ -2067,10 +2166,10 @@ func main() {
 			}()
 
 		case "db_stop":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_stop", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_stop", "container", containerName)
@@ -2128,10 +2227,10 @@ func main() {
 			}()
 
 		case "db_restart":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_restart", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_restart", "container", containerName)
@@ -2189,10 +2288,10 @@ func main() {
 			}()
 
 		case "db_remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_remove", "container", containerName)
@@ -2301,10 +2400,10 @@ func main() {
 			}()
 
 		case "db_snapshot":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_snapshot", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
 				databaseName, _ := env.Payload["database_name"].(string)
@@ -2325,6 +2424,7 @@ func main() {
 					return
 				}
 				if engine == "" || databaseName == "" {
+					slog.WarnContext(ctx, "db_snapshot command missing engine or database_name", "component", "db_snapshot", "container", containerName, "engine", engine, "snapshot_id", snapshotID)
 					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
@@ -2412,10 +2512,10 @@ func main() {
 			}()
 
 		case "db_restore":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_restore", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
 				databaseName, _ := env.Payload["database_name"].(string)
@@ -2438,6 +2538,7 @@ func main() {
 					return
 				}
 				if engine == "" || databaseName == "" {
+					slog.WarnContext(ctx, "db_restore command missing engine or database_name", "component", "db_restore", "container", containerName, "engine", engine, "restore_id", restoreID)
 					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
@@ -2573,10 +2674,10 @@ func main() {
 			}()
 
 		case "db_update_schedule":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_update_schedule", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				instanceIDFloat, _ := env.Payload["instance_id"].(float64)
 				instanceID := int(instanceIDFloat)
 				enabled, _ := env.Payload["enabled"].(bool)
@@ -2629,10 +2730,10 @@ func main() {
 			}()
 
 		case "backup_dest_test":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:backup_dest_test", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				destType, _ := env.Payload["dest_type"].(string)
 				destConfig, _ := env.Payload["dest_config"].(map[string]any)
 
@@ -2675,10 +2776,10 @@ func main() {
 			}()
 
 		case "db_mirror_snapshot":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_mirror_snapshot", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 
 				filename := payloadString(env.Payload, "filename", "remote_path")
 				sourceRaw, _ := env.Payload["source_destination"].(map[string]any)
@@ -2753,10 +2854,10 @@ func main() {
 			}()
 
 		case "db_delete_snapshot_file":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_delete_snapshot_file", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				destType, destConfig := backupDestinationFrom(env.Payload)
 				remotePath := payloadString(env.Payload, "remote_path", "filename")
 				snapshotID := payloadString(env.Payload, "snapshot_id")
@@ -2856,6 +2957,12 @@ func main() {
 		})
 	})
 
+	// runner.stats: queue depth, drops by type, handler pool and SDK health.
+	safeGoResilient("runner-stats", func() { runRunnerStats(ctx, ws, RUNNER_STATS_INTERVAL) })
+
+	// Last health reported per container, so only transitions are logged.
+	health := newHealthTracker()
+
 	// Heartbeat ticker — also pushes live container states each tick
 	safeGoResilient("heartbeat", func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
@@ -2900,7 +3007,10 @@ func main() {
 
 				// Collect per-container resource stats every 3rd heartbeat (expensive)
 				if heartbeatCount%3 == 0 {
-					if containerStats, err := docker.ContainerStats(ctx); err == nil && len(containerStats) > 0 {
+					containerStats, err := docker.ContainerStats(ctx)
+					if err != nil {
+						slog.WarnContext(ctx, "container stats collection failed", "component", "heartbeat", "error", err)
+					} else if len(containerStats) > 0 {
 						payload["container_stats"] = containerStats
 					}
 				}
@@ -2921,7 +3031,11 @@ func main() {
 
 				// Push live container state snapshot so the orchestrator stays in sync
 				// even when containers are stopped/started outside of Lattice.
-				if containers, err := docker.ListContainers(ctx, ""); err == nil {
+				containers, err := docker.ListContainers(ctx, "")
+				if err != nil {
+					slog.WarnContext(ctx, "container sync skipped, failed to list containers", "component", "heartbeat", "error", err)
+				} else {
+					withHealth := make(map[string]bool, len(containers))
 					for _, c := range containers {
 						name := ""
 						for _, n := range c.Names {
@@ -2970,6 +3084,8 @@ func main() {
 								healthStatus = "starting"
 							}
 							if healthStatus != "" {
+								withHealth[name] = true
+								health.observe(ctx, name, healthStatus)
 								statePayload["health_status"] = healthStatus
 								_ = ws.SendJSON(client.OutgoingMessage{
 									Type: "container_health_status",
@@ -2986,6 +3102,7 @@ func main() {
 							Payload: statePayload,
 						})
 					}
+					health.retain(withHealth)
 				}
 			}
 		}
@@ -3000,7 +3117,7 @@ func main() {
 		Port:       cfg.DashboardPort,
 		LatticeURL: cfg.LatticeURL,
 	}
-	go dashboard.Start()
+	safeGoResilient("dashboard", dashboard.Start)
 
 	fmt.Println()
 	fmt.Println("Lattice Runner ready")

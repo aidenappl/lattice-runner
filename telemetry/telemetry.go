@@ -19,6 +19,22 @@ import (
 	"github.com/aidenappl/lattice-runner/config"
 )
 
+// sdkDropTotal is the shipper's running drop total, as last reported to
+// OnDrop. OnDrop runs on the goroutine that hit the drop — for a full buffer,
+// whoever called Emit — so it only stores a number.
+var sdkDropTotal atomic.Int64
+
+func recordSDKDrops(total int64) {
+	sdkDropTotal.Store(total)
+}
+
+// SDKStats reports go-monitor's shipper counters and the drop total OnDrop last
+// saw. The two drop counts agree; OnDrop's is kept because it is what is
+// reported the moment a drop happens.
+func SDKStats() (monitor.ShipperStats, int64) {
+	return monitor.Stats(), sdkDropTotal.Load()
+}
+
 // Service is the name every runner event is filed under. Which worker sent it
 // is the "worker" field: one failure on two workers is one issue.
 const Service = "lattice-runner"
@@ -49,6 +65,7 @@ func Init(version string, cfg config.Monitor) {
 		Debug:         cfg.Debug,
 		DisableStdout: !cfg.Stdout,
 		GzipEnabled:   true,
+		OnDrop:        recordSDKDrops,
 	})
 	if err != nil {
 		log.Printf("telemetry: Monitor disabled: %v", err)
