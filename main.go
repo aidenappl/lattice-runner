@@ -90,7 +90,8 @@ func wsSend(ctx context.Context, ws *client.WSClient, msgType string, payload in
 func wsSendAt(ctx context.Context, skip int, ws *client.WSClient, msgType string, payload interface{}) {
 	// A queue-full drop is already logged once, at warn, with its type by
 	// SendJSON; only other failures (e.g. marshal errors) are logged here.
-	if err := ws.SendJSON(payload); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
+	// A reply sent under a command context is stamped with that command's ids.
+	if err := ws.SendJSON(stampPayload(ctx, payload)); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
 		telemetry.LogAt(ctx, skip+1, slog.LevelError, "ws send failed", "component", "runner", "message_type", msgType, "error", err)
 	}
 }
@@ -106,7 +107,7 @@ func wsSendReliable(ctx context.Context, ws *client.WSClient, msgType string, pa
 func wsSendReliableAt(ctx context.Context, skip int, ws *client.WSClient, msgType string, payload interface{}) {
 	// The timeout drop is already logged once, at warn, with its type by
 	// SendJSONReliable; only other failures are logged here.
-	if err := ws.SendJSONReliable(payload); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
+	if err := ws.SendJSONReliable(stampPayload(ctx, payload)); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
 		telemetry.LogAt(ctx, skip+1, slog.LevelError, "ws reliable send failed", "component", "runner", "message_type", msgType, "error", err)
 	}
 }
@@ -122,6 +123,10 @@ type deploymentRunState struct {
 	LastProgressAt time.Time
 	StartedAt      time.Time
 	InProgress     bool
+	// Ctx is the context of the deploy command that started this run, so
+	// executor progress is logged and replied under that command's ids.
+	// Nil for a run the runner did not start from a command.
+	Ctx context.Context
 }
 
 func main() {
@@ -211,6 +216,10 @@ func main() {
 		}
 		attempt := st.Attempt
 		maxRetries := st.MaxRetries
+		sendCtx := ctx
+		if st.Ctx != nil {
+			sendCtx = st.Ctx
+		}
 		deploymentStatesMu.Unlock()
 
 		out := make(map[string]any, len(payload)+3)
@@ -221,7 +230,7 @@ func main() {
 		out["max_retries"] = maxRetries
 		out["last_progress_at"] = time.Now().UTC().Format(time.RFC3339)
 
-		wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
+		wsSend(sendCtx, ws, "deployment_progress", client.OutgoingMessage{
 			Type:    "deployment_progress",
 			Payload: out,
 		})
@@ -247,10 +256,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				cycleCtx := cycleContext(ctx)
 				execMu.Lock()
 				for id, s := range execSessions {
 					if time.Since(s.createdAt) > 30*time.Minute {
-						slog.WarnContext(ctx, "removing orphaned exec session", "component", "runner", "command_id", id, "duration_ms", time.Since(s.createdAt).Milliseconds())
+						slog.WarnContext(cycleCtx, "removing orphaned exec session", "component", "runner", "command_id", id, "duration_ms", time.Since(s.createdAt).Milliseconds())
 						s.cancel()
 						delete(execSessions, id)
 					}
@@ -262,12 +272,17 @@ func main() {
 
 	// Create snapshot scheduler
 	snapshotScheduler := scheduler.New(func(job scheduler.Job) {
-		handleScheduledSnapshot(ctx, ws, docker, job)
+		// Each scheduled run is its own unit of work in Monitor.
+		handleScheduledSnapshot(cycleContext(ctx), ws, docker, job)
 	})
 	safeGoResilient("snapshot-scheduler", func() { snapshotScheduler.Run(ctx) })
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
+		// Every handler below logs and replies under this command context:
+		// request_id/trace_id/job_id for its events, and the ids its replies
+		// echo. It derives from the root ctx, so shutdown still cancels it.
+		ctx := dispatchContext(ctx, env)
 		// Recover from any panic in a message handler so the WS read-pump stays
 		// alive rather than crashing the whole process.
 		defer func() {
@@ -372,6 +387,7 @@ func main() {
 					LastProgressAt: time.Now().UTC(),
 					StartedAt:      time.Now().UTC(),
 					InProgress:     true,
+					Ctx:            ctx,
 				}
 				deploymentStatesMu.Unlock()
 
@@ -591,7 +607,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -602,7 +618,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "kill", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -616,7 +632,7 @@ func main() {
 				if err != nil || id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "kill")
 					sendLifecycleLog(ctx, ws, containerName, "kill", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -631,7 +647,7 @@ func main() {
 				if err := docker.KillContainer(ctx, id); err != nil {
 					slog.ErrorContext(ctx, "failed to kill container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "kill", fmt.Sprintf("failed to kill: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -642,7 +658,7 @@ func main() {
 					})
 				} else {
 					slog.InfoContext(ctx, "killed container", "component", "runner", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -660,7 +676,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -671,7 +687,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "pause", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -685,7 +701,7 @@ func main() {
 				if err != nil || id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "pause")
 					sendLifecycleLog(ctx, ws, containerName, "pause", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -700,7 +716,7 @@ func main() {
 				if err := docker.PauseContainer(ctx, id); err != nil {
 					slog.ErrorContext(ctx, "failed to pause container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "pause", fmt.Sprintf("failed to pause: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -711,7 +727,7 @@ func main() {
 					})
 				} else {
 					slog.InfoContext(ctx, "paused container", "component", "runner", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -729,7 +745,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -740,7 +756,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "unpause", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -754,7 +770,7 @@ func main() {
 				if err != nil || id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "unpause")
 					sendLifecycleLog(ctx, ws, containerName, "unpause", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -769,7 +785,7 @@ func main() {
 				if err := docker.UnpauseContainer(ctx, id); err != nil {
 					slog.ErrorContext(ctx, "failed to unpause container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "unpause", fmt.Sprintf("failed to resume: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -780,7 +796,7 @@ func main() {
 					})
 				} else {
 					slog.InfoContext(ctx, "unpaused container", "component", "runner", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -798,7 +814,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -809,7 +825,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "restart", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -823,7 +839,7 @@ func main() {
 				if err != nil || id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "restart")
 					sendLifecycleLog(ctx, ws, containerName, "restart", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -838,7 +854,7 @@ func main() {
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
 					slog.ErrorContext(ctx, "failed to restart container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "restart", fmt.Sprintf("failed to restart: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -849,7 +865,7 @@ func main() {
 					})
 				} else {
 					slog.InfoContext(ctx, "restarted container", "component", "runner", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -867,7 +883,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -878,7 +894,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "remove", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -891,7 +907,7 @@ func main() {
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					sendLifecycleWarn(ctx, ws, containerName, "remove", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -911,7 +927,7 @@ func main() {
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
 					slog.ErrorContext(ctx, "failed to remove container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "remove", fmt.Sprintf("failed to remove: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -922,7 +938,7 @@ func main() {
 					})
 				} else {
 					slog.InfoContext(ctx, "removed container", "component", "runner", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -940,7 +956,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -951,7 +967,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "recreate", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -999,7 +1015,7 @@ func main() {
 				if id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "recreate")
 					sendLifecycleLog(ctx, ws, containerName, "recreate", "container not found — run a stack deploy to create it")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -1025,7 +1041,7 @@ func main() {
 				if err != nil {
 					slog.ErrorContext(ctx, "failed to recreate container", "component", "runner", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("failed to recreate: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -1037,7 +1053,7 @@ func main() {
 					return
 				}
 				slog.InfoContext(ctx, "recreated container", "component", "runner", "container", containerName, "container_id", newID)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 					Type: "container_status",
 					Payload: map[string]any{
 						"container_name": containerName,
@@ -1070,7 +1086,7 @@ func main() {
 				if err := docker.PullImage(ctx, imageRef, regAuth); err != nil {
 					slog.ErrorContext(ctx, "failed to pull image", "component", "runner", "image", imageRef, "error", err)
 					sendLifecycleLog(ctx, ws, imageRef, "pull_image", fmt.Sprintf("pull failed: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": imageRef,
@@ -1082,7 +1098,7 @@ func main() {
 				} else {
 					slog.InfoContext(ctx, "pulled image", "component", "runner", "image", imageRef)
 					sendLifecycleLog(ctx, ws, imageRef, "pull_image", fmt.Sprintf("image %s pulled successfully", imageRef))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": imageRef,
@@ -1283,7 +1299,7 @@ func main() {
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
 					slog.ErrorContext(ctx, "failed to list containers", "component", "runner", "action", "stop_all", "error", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "stop_all",
@@ -1331,7 +1347,7 @@ func main() {
 				} else {
 					slog.WarnContext(ctx, "stop_all complete, some containers could not be stopped", "component", "runner", "stopped", stopped, "failed", failed)
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "stop_all",
@@ -1348,7 +1364,7 @@ func main() {
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
 					slog.ErrorContext(ctx, "failed to list containers", "component", "runner", "action", "start_all", "error", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "start_all",
@@ -1394,7 +1410,7 @@ func main() {
 				} else {
 					slog.WarnContext(ctx, "start_all complete, some containers could not be started", "component", "runner", "started", started, "failed", failed)
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "start_all",
@@ -1410,7 +1426,7 @@ func main() {
 				volumes, err := docker.ListVolumes(ctx)
 				if err != nil {
 					slog.ErrorContext(ctx, "failed to list volumes", "component", "runner", "error", err)
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					wsSendReliable(ctx, ws, "list_volumes_response", client.OutgoingMessage{
 						Type: "list_volumes_response",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1431,7 +1447,7 @@ func main() {
 						"labels":     v.Labels,
 					})
 				}
-				_ = ws.SendJSONReliable(client.OutgoingMessage{
+				wsSendReliable(ctx, ws, "list_volumes_response", client.OutgoingMessage{
 					Type: "list_volumes_response",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1447,7 +1463,7 @@ func main() {
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1462,7 +1478,7 @@ func main() {
 					driver = "local"
 				}
 				if err := docker.CreateVolume(ctx, name, driver); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1473,7 +1489,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1489,7 +1505,7 @@ func main() {
 				defer telemetry.Recover("handler:remove_volume", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1502,7 +1518,7 @@ func main() {
 				}
 				force, _ := env.Payload["force"].(bool)
 				if err := docker.RemoveVolume(ctx, name, force); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1513,7 +1529,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1530,7 +1546,7 @@ func main() {
 				networks, err := docker.ListNetworks(ctx)
 				if err != nil {
 					slog.ErrorContext(ctx, "failed to list networks", "component", "runner", "error", err)
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					wsSendReliable(ctx, ws, "list_networks_response", client.OutgoingMessage{
 						Type: "list_networks_response",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1556,7 +1572,7 @@ func main() {
 						"created":    n.Created,
 					})
 				}
-				_ = ws.SendJSONReliable(client.OutgoingMessage{
+				wsSendReliable(ctx, ws, "list_networks_response", client.OutgoingMessage{
 					Type: "list_networks_response",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1572,7 +1588,7 @@ func main() {
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1587,7 +1603,7 @@ func main() {
 					driver = "bridge"
 				}
 				if err := docker.CreateNetwork(ctx, name, driver); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1598,7 +1614,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1614,7 +1630,7 @@ func main() {
 				defer telemetry.Recover("handler:remove_network", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1626,7 +1642,7 @@ func main() {
 					return
 				}
 				if err := docker.RemoveNetwork(ctx, name); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1637,7 +1653,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1655,7 +1671,7 @@ func main() {
 				defer func() { <-handlerSem }()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "missing container_name",
@@ -1665,7 +1681,7 @@ func main() {
 				}
 				if !validContainerName(containerName) {
 					slog.WarnContext(ctx, "invalid container name rejected", "component", "force_remove", "container", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "invalid container_name",
@@ -1675,7 +1691,7 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "container not found",
@@ -1687,7 +1703,7 @@ func main() {
 				_ = docker.StopContainer(ctx, id, 5)
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
 					slog.ErrorContext(ctx, "failed to remove container", "component", "force_remove", "container", containerName, "error", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "failed", "message": fmt.Sprintf("failed to remove: %v", err),
@@ -1696,7 +1712,7 @@ func main() {
 					return
 				}
 				slog.InfoContext(ctx, "removed container", "component", "force_remove", "container", containerName)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":         "force_remove",
@@ -1721,7 +1737,7 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1737,7 +1753,7 @@ func main() {
 
 				execID, err := docker.ContainerExecCreate(ctx, id, cmd)
 				if err != nil {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1749,7 +1765,7 @@ func main() {
 
 				conn, err := docker.ContainerExecAttach(ctx, execID)
 				if err != nil {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1773,7 +1789,7 @@ func main() {
 						execMu.Lock()
 						delete(execSessions, commandID)
 						execMu.Unlock()
-						_ = ws.SendJSONReliable(client.OutgoingMessage{
+						wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 							Type: "exec_output",
 							Payload: map[string]any{
 								"command_id": commandID,
@@ -1790,7 +1806,7 @@ func main() {
 						}
 						n, err := conn.Reader.Read(buf)
 						if n > 0 {
-							_ = ws.SendJSONReliable(client.OutgoingMessage{
+							wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 								Type: "exec_output",
 								Payload: map[string]any{
 									"command_id": commandID,
@@ -2851,6 +2867,9 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// One job id per heartbeat/container-sync cycle. Not a command
+				// context, so the heartbeat and sync messages carry no ids.
+				ctx := cycleContext(ctx)
 				heartbeatCount++
 				m := metrics.Collect(ctx, docker)
 				runnerMetrics := metrics.CollectRunnerMetrics()

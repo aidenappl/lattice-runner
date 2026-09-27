@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	monitor "github.com/aidenappl/go-monitor"
 )
 
 // NetworkDiagnostic describes a network issue detected on a container.
@@ -69,7 +71,8 @@ func (nm *NetMonitor) Run(ctx context.Context, restartCb RestartLoopCallback) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			nm.check(ctx, restartCb)
+			// One job id per check cycle so its logs group in Monitor.
+			nm.check(monitor.WithJobID(ctx, monitor.NewJobID()), restartCb)
 		}
 	}
 }

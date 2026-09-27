@@ -16,8 +16,13 @@ import (
 
 // Envelope is the standard message format from the orchestrator.
 type Envelope struct {
-	Type      string         `json:"type"`
-	CommandID string         `json:"command_id,omitempty"`
+	Type      string `json:"type"`
+	CommandID string `json:"command_id,omitempty"`
+	// RequestID and TraceID carry the orchestrator's correlation ids for the
+	// command. An older orchestrator omits them; the runner then behaves as
+	// it always has.
+	RequestID string         `json:"request_id,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
 	WorkerID  string         `json:"worker_id,omitempty"`
 	IssuedAt  *time.Time     `json:"issued_at,omitempty"`
 	Payload   map[string]any `json:"payload,omitempty"`
@@ -25,8 +30,13 @@ type Envelope struct {
 
 // OutgoingMessage is sent from the runner to the orchestrator.
 type OutgoingMessage struct {
-	Type      string         `json:"type"`
-	CommandID string         `json:"command_id,omitempty"`
+	Type      string `json:"type"`
+	CommandID string `json:"command_id,omitempty"`
+	// RequestID and TraceID echo the ids of the command a reply belongs to.
+	// Unsolicited messages (heartbeat, container_sync, metrics, logs) leave
+	// them empty.
+	RequestID string         `json:"request_id,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
 	Status    string         `json:"status,omitempty"`
 	Payload   map[string]any `json:"payload,omitempty"`
 }

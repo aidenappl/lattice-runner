@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"github.com/aidenappl/lattice-runner/telemetry"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+
+	monitor "github.com/aidenappl/go-monitor"
+	"github.com/aidenappl/lattice-runner/telemetry"
 )
 
 // LogLine represents a single log line from a container.
@@ -89,7 +91,8 @@ func (ls *LogStreamer) Run(ctx context.Context) {
 			ls.stopAll()
 			return
 		case <-ticker.C:
-			ls.sync(ctx)
+			// One job id per sync cycle; a stream it starts keeps that id.
+			ls.sync(monitor.WithJobID(ctx, monitor.NewJobID()))
 		}
 	}
 }

@@ -116,14 +116,14 @@ func startDatabaseObserver(ctx context.Context, ws *client.WSClient, docker *doc
 	// Report immediately on start rather than waiting a full interval — a
 	// runner that just restarted is exactly when the orchestrator's view is
 	// most likely to be stale.
-	sendDatabaseSync(ctx, ws, docker)
+	sendDatabaseSync(cycleContext(ctx), ws, docker)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sendDatabaseSync(ctx, ws, docker)
+			sendDatabaseSync(cycleContext(ctx), ws, docker)
 		}
 	}
 }
