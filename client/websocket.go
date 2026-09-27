@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"sync"
 	"time"
@@ -69,7 +69,8 @@ func (c *WSClient) SendJSON(v any) error {
 	case c.send <- b:
 		return nil
 	default:
-		log.Printf("ws: send queue full (%d/%d), dropping %s message", len(c.send), cap(c.send), messageType(b))
+		slog.WarnContext(context.Background(), "ws send queue full, dropping message", "component", "ws",
+			"queue_len", len(c.send), "queue_cap", cap(c.send), "message_type", messageType(b))
 		return ErrSendQueueFull
 	}
 }
@@ -109,7 +110,9 @@ func (c *WSClient) SendJSONReliable(v any) error {
 	case c.send <- b:
 		return nil
 	case <-time.After(reliableSendTimeout):
-		log.Printf("ws: reliable send timed out after %v (queue %d/%d), dropping %s message", reliableSendTimeout, len(c.send), cap(c.send), messageType(b))
+		slog.WarnContext(context.Background(), "ws reliable send timed out, dropping message", "component", "ws",
+			"timeout_ms", reliableSendTimeout.Milliseconds(), "queue_len", len(c.send), "queue_cap", cap(c.send),
+			"message_type", messageType(b))
 		return fmt.Errorf("%w after %v", ErrSendQueueFull, reliableSendTimeout)
 	}
 }
@@ -127,8 +130,8 @@ func (c *WSClient) Connect(ctx context.Context) {
 		}
 
 		if err := c.dial(ctx); err != nil {
-			log.Printf("ws: connection failed, will reconnect: %v", err)
-			log.Printf("ws: reconnecting in %v...", c.reconnectInterval)
+			slog.WarnContext(ctx, "ws connection failed, will reconnect", "component", "ws", "error", err)
+			slog.InfoContext(ctx, "ws reconnecting", "component", "ws", "backoff", c.reconnectInterval.String())
 			select {
 			case <-time.After(c.reconnectInterval):
 			case <-ctx.Done():
@@ -137,9 +140,14 @@ func (c *WSClient) Connect(ctx context.Context) {
 			continue
 		}
 
-		log.Println("ws: connected to orchestrator")
+		slog.InfoContext(ctx, "ws connected to orchestrator", "component", "ws")
 		c.run(ctx)
-		log.Println("ws: disconnected from orchestrator")
+		// A disconnect caused by shutdown is expected; any other is a warning.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "ws disconnected from orchestrator", "component", "ws")
+		} else {
+			slog.WarnContext(ctx, "ws disconnected from orchestrator", "component", "ws")
+		}
 
 		select {
 		case <-time.After(c.reconnectInterval):
@@ -223,14 +231,14 @@ func (c *WSClient) readPump(ctx context.Context, cancel context.CancelFunc) {
 		_, payload, err := c.conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("ws: read error, will reconnect: %v", err)
+				slog.WarnContext(ctx, "ws read error, will reconnect", "component", "ws", "error", err)
 			}
 			return
 		}
 
 		var env Envelope
 		if err := json.Unmarshal(payload, &env); err != nil {
-			log.Printf("ws: invalid json from orchestrator: %v", err)
+			slog.WarnContext(ctx, "ws invalid json from orchestrator", "component", "ws", "error", err)
 			continue
 		}
 
@@ -259,7 +267,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.TextMessage, msg)
 			c.mu.Unlock()
 			if err != nil {
-				log.Printf("ws: write error, will reconnect: %v", err)
+				slog.WarnContext(ctx, "ws write error, will reconnect", "component", "ws", "error", err)
 				return
 			}
 
@@ -273,7 +281,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.PingMessage, nil)
 			c.mu.Unlock()
 			if err != nil {
-				log.Printf("ws: ping write error, will reconnect: %v", err)
+				slog.WarnContext(ctx, "ws ping write error, will reconnect", "component", "ws", "error", err)
 				return
 			}
 		}

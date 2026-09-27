@@ -81,7 +81,9 @@ defers `telemetry.Recover`. ~2,978 lines. |
 | `validate.go` | `validContainerName` — the allow-list guard applied to every container name arriving from the orchestrator (alphanumeric + `-_./`, ≤128 chars). |
 | `validate_test.go` | Table-driven tests for `validContainerName` (accepts normal names, rejects spaces and shell metacharacters `;$&\`|`). |
 | `config/config.go` | `Config` struct + `Load()`. Reads env vars, **enforces `wss://`** unless `ALLOW_INSECURE=true`, panics on missing required vars. `LoadMonitor()` reads the `MONITOR_*` block and never panics — it runs first, so a failing `Load` is reported. |
-| `telemetry/telemetry.go` | Monitor wiring: `Init` (never fails or blocks), the standard-logger tee (`parseLine`/`classify` → `<component>.log.<level>`), `Recover` / `ReportPanic` / `ReportCrash` / `CrashGuard`, `Fatal`, `Shutdown`. Every event carries `worker`. See *Operations → Monitor telemetry*. |
+| `telemetry/telemetry.go` | Monitor wiring: `Init` (never fails or blocks; installs the slog handler), `Event`, `Recover` / `ReportPanic` / `ReportCrash` / `CrashGuard`, `Fatal`, `Shutdown`, and the `classify` fallback for level-less stdlib `log` lines. Every event carries `worker`. See *Operations → Monitor telemetry*. |
+| `telemetry/handler.go` | The default slog handler: `installLogBridge` (stdlib `log` → slog), `runnerHandler` (stderr line + Monitor `<component>.log.<level>` event, `worker` stamp, warn limiter), `lineHandler` (the journald line format). |
+| `telemetry/caller.go` | `LogAt` — log on behalf of a caller, so `source_*` names the call site rather than the helper. |
 | `client/websocket.go` | The WebSocket client: `Envelope` (inbound) and `OutgoingMessage` (outbound) types, auto-reconnect loop, read/write pumps, ping/pong keepalive, buffered send channel with drop-on-full, `Drain`/`Close`. |
 | `cmd/setup.go` | `RunSetup()` — interactive install wizard. Prompts for URL/token/name, writes `.env` (mode 0600), installs the `systemd` unit on Linux. |
 | `deploy/executor.go` | `Executor`, `DeploymentSpec` + all nested spec types, `Validate()`, spec parsing, network/volume creation, stale-container cleanup, force-remove, `postDeployVerify`, strategy dispatch. |
@@ -623,9 +625,11 @@ or `go-monitor`.
   `install/runner.sh` (pinned by its `TestInstallScriptRunnerUnit`). `deploy/update.sh` and the
   lattice-api upgrade path both rewrite an existing `Requires=` unit in place. `update.sh` does it
   *before* its "already on latest" exit, so it repairs an up-to-date worker too.
-- **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host. Every log line, recovered
-  panic, crash and boot failure also goes to **Monitor** (service `lattice-runner`, field `worker`)
-  — see *Monitor telemetry* below. Centrally, the worker's
+- **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host. Lines read
+  `file.go:NN: [LEVEL ]message key=value…` (no level word for info), e.g.
+  `websocket.go:133: WARN ws connection failed, will reconnect component=ws error="…"`. Every log
+  line, recovered panic, crash and boot failure also goes to **Monitor** (service `lattice-runner`,
+  field `worker`) — see *Monitor telemetry* below. Centrally, the worker's
   heartbeats/lifecycle logs/deploy progress show up in `lattice-web` and via the Lattice MCP
   (`mcp__lattice__lattice_get_worker`, `lattice_get_container_logs`, `lattice_get_deployment_logs`,
   `lattice_get_anomalies`). The local dashboard (`http://127.0.0.1:9100`) is a last-resort on-host view.
@@ -638,7 +642,7 @@ or `go-monitor`.
 - **Common failure modes:**
   - *Worker shows offline / reconnect loop* — bad or revoked `WORKER_TOKEN`, wrong `ORCHESTRATOR_URL`,
     or the TLS proxy in front of `lattice-api` has an expired cert. The runner keeps retrying every
-    `RECONNECT_INTERVAL`; check journald for `ws: connection failed`.
+    `RECONNECT_INTERVAL`; check journald for `ws connection failed`.
   - *Worker shows offline for days while its containers keep serving* — the runner is
     `inactive (dead)` after `Dependency failed for Lattice Runner` in `systemctl status
     lattice-runner`. That only happens on a unit still using `Requires=docker.service`, after a
@@ -664,10 +668,10 @@ or `go-monitor`.
   - *Container "not found" on a lifecycle action after a deploy* — likely still under a suffixed
     name; `recreate` handles this via the canonical fallback, but plain start/stop/restart use exact
     lookup only.
-  - *Dropped telemetry* — the 256-deep send queue overflowed under a burst (`ws: send queue full`);
+  - *Dropped telemetry* — the 256-deep send queue overflowed under a burst (`ws send queue full`, with `message_type`);
     pure telemetry is best-effort by design. Command_id-correlated replies use `SendJSONReliable`
     (blocking with a 10s deadline) so they are not dropped on a transient full queue; a
-    `ws: reliable send timed out` log means the socket was genuinely stuck for 10s.
+    `ws reliable send timed out` log means the socket was genuinely stuck for 10s.
 
 ### Monitor telemetry
 
@@ -679,7 +683,7 @@ outage, a runner restart, or the redeploy of the very container that hosts Monit
 
 | Event | Level | What |
 |-------|-------|------|
-| `<component>.log.<level>` | inferred | Every standard-library `log` line, through a tee on the standard logger. `caller` is the file:line (`log.Lshortfile` is on, so journald shows it too), `component` comes from a `[name] ` or `name: ` prefix (else the event is `runner.log.*`). The level is read from the wording: handled failures (`retrying`, `attempt N`, `falling back`, `trying kill`, `may already exist`, …) → warn; `failed` / `error` / `cannot` / `unable` → **error, which makes it an issue**; `invalid` / `not found` / `timeout` / `full` / … → warn; anything else info. `PANIC` lines are skipped: the panic event already carries them, with the stack. |
+| `<component>.log.<level>` | explicit | Every `slog` record, through the default handler (`telemetry/handler.go`). The runner logs with `slog.{Info,Warn,Error}Context(ctx, "static message", "component", "<name>", …fields)`; the level is the call's, `component` names the event (else `runner.log.*`), and the other attrs ride along as fields. `source_file`/`source_func`/`source_line` are the real call site (helpers that log for a caller use `telemetry.LogAt`), `worker` is stamped automatically, and each warn with the same component + message is limited to `WARN_LIMIT` (20) per minute, the next one through carrying `suppressed=<n>`. Stdlib `log.Printf` is still bridged into slog: those lines — only leftovers and third-party code — get a component from a `[name] `/`name: ` prefix and a level from `classify` (handled failures → warn, `failed`/`error` → error, `invalid`/`not found`/… → warn, else info). `PANIC` lines stay on `log.Printf` on purpose and are dropped from Monitor: the panic event already carries them, with the stack. |
 | `panic.recovered` | error | Every recovered panic, with its stack: the message handler, every command goroutine (`handler:<type>`, with `command_id`), `safeGoResilient` loops (`restarting: true`), the snapshot scheduler, snapshot pipe writers, log streams. |
 | `service.crashed` | fatal | A panic the runner exits over — `safeGo` (ws-connect), the WebSocket pumps, `main` (including a `config.Load` panic). Flushed before the exit. |
 | `service.startup.docker_unreachable` | fatal | 30 failed Docker connects. |
@@ -712,10 +716,13 @@ writes these.
   goroutines whose panic should end the process go through `safeGo` / `telemetry.CrashGuard`, so it
   is reported (`service.crashed`, `worker_crash`) before exit. A goroutine feeding an `io.Pipe` must
   `CloseWithError` on panic, or its reader waits forever.
-- **Log with a component prefix and plain words.** `log.Printf("deploy: … failed: %v", err)` — the
-  Monitor tee names the event from the prefix and picks the level from the wording, so a handled
-  failure should say how it was handled ("retrying", "falling back"). Never make Monitor a boot
-  requirement.
+- **Log through slog, at an explicit level, with a static message.**
+  `slog.ErrorContext(ctx, "deployment failed", "component", "deploy", "stack", name, "error", err)`
+  — variable data goes in fields, never the message (the message is what groups an issue and keys
+  the warn limiter). Error makes an issue; a handled failure (retry, fallback) is warn. Pass the
+  caller's `ctx`; a helper that logs on its caller's behalf takes a `ctx` and uses
+  `telemetry.LogAt` with the right skip. Don't add new `log.Printf` calls — only `PANIC` lines use
+  it. Never make Monitor a boot requirement.
 - **Don't log secrets.** Deploy specs, `recreate`/`pull_image` `auth`, and db handlers carry
   registry passwords and database credentials. Log names and outcomes, not payloads — every log
   line also reaches Monitor. The SDK redacts credential-shaped values; don't rely on it.

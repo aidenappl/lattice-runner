@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"github.com/aidenappl/lattice-runner/telemetry"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -97,7 +97,7 @@ func (ls *LogStreamer) Run(ctx context.Context) {
 func (ls *LogStreamer) sync(ctx context.Context) {
 	containers, err := ls.docker.ListContainers(ctx, "")
 	if err != nil {
-		log.Printf("logstreamer: failed to list containers: %v", err)
+		slog.WarnContext(ctx, "logstreamer failed to list containers, will retry next tick", "component", "logstreamer", "error", err)
 		return
 	}
 
@@ -126,7 +126,7 @@ func (ls *LogStreamer) sync(ctx context.Context) {
 	for id, entry := range ls.tracked {
 		select {
 		case <-entry.done:
-			log.Printf("logstreamer: detected dead stream for %s, will restart", id)
+			slog.InfoContext(ctx, "logstreamer detected dead stream, will restart", "component", "logstreamer", "container_id", id)
 			delete(ls.tracked, id)
 		default:
 		}
@@ -178,7 +178,8 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 
 		// Stream ended for another reason (container restart / flap).
 		// Wait with exponential backoff so the container has time to come back up.
-		log.Printf("logstreamer: stream ended for %s, reconnecting in %v…", containerName, backoff)
+		slog.InfoContext(ctx, "log stream ended, reconnecting", "component", "logstreamer",
+			"container", containerName, "backoff", backoff.String())
 		select {
 		case <-ctx.Done():
 			return
@@ -200,7 +201,8 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 	reader, err := ls.docker.StreamContainerLogs(ctx, containerID, since)
 	if err != nil {
 		if ctx.Err() == nil {
-			log.Printf("logstreamer: failed to open log stream for %s: %v", containerName, err)
+			slog.WarnContext(ctx, "logstreamer failed to open log stream, will retry", "component", "logstreamer",
+				"container", containerName, "error", err)
 		}
 		return
 	}
@@ -222,7 +224,8 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 		_, err := io.ReadFull(bufReader, header)
 		if err != nil {
 			if err != io.EOF && ctx.Err() == nil {
-				log.Printf("logstreamer: read header error for %s: %v", containerName, err)
+				slog.WarnContext(ctx, "logstreamer read header error, will retry", "component", "logstreamer",
+					"container", containerName, "error", err)
 			}
 			return
 		}
@@ -250,7 +253,8 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 		_, err = io.ReadFull(bufReader, payload)
 		if err != nil {
 			if err != io.EOF && ctx.Err() == nil {
-				log.Printf("logstreamer: read payload error for %s: %v", containerName, err)
+				slog.WarnContext(ctx, "logstreamer read payload error, will retry", "component", "logstreamer",
+					"container", containerName, "error", err)
 			}
 			return
 		}

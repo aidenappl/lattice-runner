@@ -10,12 +10,9 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
 	"regexp"
 	"runtime/debug"
-	"strings"
 	"sync/atomic"
 
 	monitor "github.com/aidenappl/go-monitor"
@@ -35,7 +32,8 @@ func workerName() string {
 	return ""
 }
 
-// Init configures Monitor and tees the standard logger into it. It never
+// Init configures Monitor and routes the standard logger into it through
+// slog (see installLogBridge). It never
 // returns an error: a misconfiguration is logged and the runner carries on.
 func Init(version string, cfg config.Monitor) {
 	w := cfg.WorkerName
@@ -56,7 +54,7 @@ func Init(version string, cfg config.Monitor) {
 		log.Printf("telemetry: Monitor disabled: %v", err)
 		return
 	}
-	InstallLogTee()
+	installLogBridge(cfg.Debug)
 	if cfg.IngestURL == "" {
 		log.Printf("telemetry: MONITOR_INGEST_URL is not set; events are not being shipped")
 	}
@@ -66,48 +64,10 @@ func Init(version string, cfg config.Monitor) {
 	})
 }
 
-// InstallLogTee sends every standard-library log line to Monitor as well as to
-// stderr, and adds the file:line of each call. The runner logs through the
-// standard logger everywhere, so this is what makes "every error" true without
-// rewriting two hundred call sites.
-func InstallLogTee() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetOutput(io.MultiWriter(os.Stderr, logTee{}))
-}
-
-type logTee struct{}
-
-// Write receives one log entry per call — the log package serialises them. It
-// never fails: a telemetry problem must not become a logging problem.
-func (logTee) Write(p []byte) (int, error) {
-	emitLogLine(string(p))
-	return len(p), nil
-}
-
 var (
-	stdPrefix        = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? `)
-	callerPrefix     = regexp.MustCompile(`^([\w.-]+\.go:\d+): `)
 	bracketComponent = regexp.MustCompile(`^\[([A-Za-z0-9_-]+)\] ?`)
 	colonComponent   = regexp.MustCompile(`^([a-z][a-z0-9_-]*): `)
 )
-
-// parseLine splits a formatted log line into the call site, a component taken
-// from the runner's "[name] …" or "name: …" conventions, and the message.
-func parseLine(line string) (caller, component, msg string) {
-	msg = strings.TrimRight(line, "\n")
-	msg = stdPrefix.ReplaceAllString(msg, "")
-	if m := callerPrefix.FindStringSubmatch(msg); m != nil {
-		caller = m[1]
-		msg = msg[len(m[0]):]
-	}
-	if m := bracketComponent.FindStringSubmatch(msg); m != nil {
-		component = m[1]
-		msg = msg[len(m[0]):]
-	} else if m := colonComponent.FindStringSubmatch(msg); m != nil {
-		component = m[1]
-	}
-	return caller, component, msg
-}
 
 var (
 	// softFailure is an error the code already handles — a retry, a fallback.
@@ -148,25 +108,6 @@ func classify(msg string) string {
 // and is a real log line that must still be emitted.
 var panicReportLine = regexp.MustCompile(`(?s)^(?:\[[^\]\n]+\] )?PANIC\b.*?\ngoroutine \d+ \[`)
 
-func emitLogLine(line string) {
-	caller, component, msg := parseLine(line)
-	// Panics are reported with their stack by ReportPanic; the log line that
-	// accompanies one would be a second, poorer copy.
-	if strings.TrimSpace(msg) == "" || panicReportLine.MatchString(msg) {
-		return
-	}
-	level := classify(msg)
-	name := component
-	if name == "" {
-		name = "runner"
-	}
-	emit(level, name+".log."+level, map[string]any{
-		"message":   msg,
-		"component": component,
-		"caller":    caller,
-	})
-}
-
 // Event sends one event at an explicit level, stamped with the worker like
 // every other runner event. Use it where a log line would be misclassified or
 // would carry data (script output, IDs) that belongs in a field.
@@ -178,6 +119,11 @@ func Event(level, name string, data map[string]any) {
 }
 
 // emit stamps the worker on every event the runner sends.
+//
+// Explicit events keep going straight to monitor.Emit. Its source_* fields are
+// the frame two above it, which is this function (telemetry.go, emit), not the
+// caller of Event or ReportPanic; log lines get their true call site through
+// the slog bridge instead (see installLogBridge).
 func emit(level, name string, data map[string]any) {
 	data["worker"] = workerName()
 	monitor.Emit(context.Background(), name, data, monitor.WithLevel(level))

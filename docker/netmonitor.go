@@ -3,7 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -77,7 +77,7 @@ func (nm *NetMonitor) Run(ctx context.Context, restartCb RestartLoopCallback) {
 func (nm *NetMonitor) check(ctx context.Context, restartCb RestartLoopCallback) {
 	containers, err := nm.docker.ListContainers(ctx, "")
 	if err != nil {
-		log.Printf("netmonitor: failed to list containers: %v", err)
+		slog.WarnContext(ctx, "netmonitor failed to list containers, will retry next tick", "component", "netmonitor", "error", err)
 		return
 	}
 
@@ -252,11 +252,13 @@ func (nm *NetMonitor) attemptNetworkRepair(ctx context.Context, containerID, nam
 	}
 
 	if err := nm.docker.ConnectNetwork(ctx, bestNet, containerID); err != nil {
-		log.Printf("netmonitor: failed to connect %s to network %s: %v", name, bestNet, err)
+		slog.ErrorContext(ctx, "netmonitor failed to connect container to network", "component", "netmonitor",
+			"container", name, "network", bestNet, "error", err)
 		return ""
 	}
 
-	log.Printf("netmonitor: connected %s to network %s (was bridge-only)", name, bestNet)
+	slog.InfoContext(ctx, "netmonitor connected bridge-only container to network", "component", "netmonitor",
+		"container", name, "network", bestNet)
 	return bestNet
 }
 

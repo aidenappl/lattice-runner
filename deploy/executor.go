@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"syscall"
 	"time"
@@ -180,7 +180,7 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		}
 	}
 
-	log.Printf("deploy: starting deployment=%d strategy=%s stack=%s", spec.DeploymentID, spec.Strategy, spec.StackName)
+	slog.InfoContext(ctx, "deploy starting deployment", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "strategy", spec.Strategy)
 
 	e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("starting deployment: strategy=%s, containers=%d, networks=%d, volumes=%d",
 		spec.Strategy, len(spec.Containers), len(spec.Networks), len(spec.Volumes)), nil)
@@ -194,7 +194,8 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("ensuring network: %s (driver=%s)", net.Name, driver),
 			map[string]any{"step": "network"})
 		if err := e.Docker.CreateNetwork(ctx, net.Name, driver); err != nil {
-			log.Printf("deploy: network %s may already exist: %v", net.Name, err)
+			slog.WarnContext(ctx, "deploy network create failed, may already exist", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"network", net.Name, "error", err)
 		}
 	}
 
@@ -207,7 +208,8 @@ func (e *Executor) Execute(ctx context.Context, spec DeploymentSpec) error {
 		e.reportProgress(spec.DeploymentID, "deploying", fmt.Sprintf("ensuring volume: %s (driver=%s)", vol.Name, driver),
 			map[string]any{"step": "volume"})
 		if err := e.Docker.CreateVolume(ctx, vol.Name, driver); err != nil {
-			log.Printf("deploy: volume %s may already exist: %v", vol.Name, err)
+			slog.WarnContext(ctx, "deploy volume create failed, may already exist", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"volume", vol.Name, "error", err)
 		}
 	}
 
@@ -344,7 +346,7 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 
 	containers, err := e.Docker.ListContainers(ctx, "")
 	if err != nil {
-		log.Printf("deploy: cleanup: failed to list containers: %v", err)
+		slog.ErrorContext(ctx, "deploy cleanup failed to list containers", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err)
 		return
 	}
 
@@ -367,12 +369,14 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 		shouldRemove, reason := cleanupDecision(c.Labels, name, publicPorts, spec.StackName, specNames, neededPorts)
 
 		if shouldRemove {
-			log.Printf("deploy: cleanup: removing %s (%s)", name, reason)
+			slog.InfoContext(ctx, "deploy cleanup removing container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", name, "reason", reason)
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("removing stale container %s (%s)", name, reason),
 				map[string]any{"step": "cleanup"})
 			if err := e.Docker.StopAndRemoveContainer(ctx, c.ID, 10); err != nil {
-				log.Printf("deploy: cleanup: failed to remove %s: %v", name, err)
+				slog.ErrorContext(ctx, "deploy cleanup failed to remove container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+					"container", name, "error", err)
 			}
 		}
 	}
@@ -384,7 +388,7 @@ func (e *Executor) cleanupStaleContainers(ctx context.Context, spec DeploymentSp
 func (e *Executor) forceRemoveAllStackContainers(ctx context.Context, spec DeploymentSpec) {
 	containers, err := e.Docker.ListContainers(ctx, "")
 	if err != nil {
-		log.Printf("deploy: force cleanup: failed to list containers: %v", err)
+		slog.ErrorContext(ctx, "deploy force cleanup failed to list containers", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err)
 		return
 	}
 
@@ -409,12 +413,13 @@ func (e *Executor) forceRemoveAllStackContainers(ctx context.Context, spec Deplo
 			name = c.ID[:12]
 		}
 
-		log.Printf("deploy: force cleanup: removing %s", name)
+		slog.InfoContext(ctx, "deploy force cleanup removing container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "container", name)
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("force removing container %s", name),
 			map[string]any{"step": "force_cleanup"})
 		if err := e.Docker.StopAndRemoveContainer(ctx, c.ID, 10); err != nil {
-			log.Printf("deploy: force cleanup: failed to remove %s: %v", name, err)
+			slog.ErrorContext(ctx, "deploy force cleanup failed to remove container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", name, "error", err)
 		}
 	}
 }
@@ -458,7 +463,8 @@ func (e *Executor) postDeployVerify(ctx context.Context, spec DeploymentSpec) er
 
 		containers, err := e.Docker.ListContainers(ctx, "")
 		if err != nil {
-			log.Printf("deploy: verify: failed to list containers: %v", err)
+			slog.WarnContext(ctx, "deploy verify failed to list containers, will retry next check", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"attempt", check, "error", err)
 			continue
 		}
 

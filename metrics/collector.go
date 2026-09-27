@@ -2,7 +2,7 @@ package metrics
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"runtime"
@@ -123,7 +123,7 @@ func Collect(ctx context.Context, docker *dockerclient.Client) SystemMetrics {
 				}
 			}
 		} else {
-			log.Printf("metrics: failed to list containers: %v", err)
+			slog.WarnContext(ctx, "metrics failed to list containers, container counts omitted", "component", "metrics", "error", err)
 		}
 	}
 

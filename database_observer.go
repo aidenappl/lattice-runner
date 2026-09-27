@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -166,9 +166,10 @@ func cachedVolumeSize(ctx context.Context, docker *dockerclient.Client, containe
 
 	size, err := docker.VolumeSize(ctx, volumeName)
 	if err != nil {
-		log.Printf("db_sync: failed to measure volume %s: %v", volumeName, err)
 		// Keep serving the stale figure rather than reporting nothing: an old
 		// size is far more useful than a blank where a growth trend should be.
+		// Handled, so a warning.
+		slog.WarnContext(ctx, "failed to measure volume size", "component", "db_sync", "volume", volumeName, "serving_stale", ok, "error", err)
 		return entry.bytes, ok
 	}
 
@@ -183,7 +184,7 @@ func cachedVolumeSize(ctx context.Context, docker *dockerclient.Client, containe
 func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockerclient.Client) {
 	observed, err := docker.ListDatabaseContainers(ctx)
 	if err != nil {
-		log.Printf("db_sync: failed to list database containers: %v", err)
+		slog.ErrorContext(ctx, "failed to list database containers", "component", "db_sync", "error", err)
 		return
 	}
 
@@ -218,7 +219,7 @@ func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockercl
 		entries = append(entries, entry)
 	}
 
-	wsSendReliable(ws, "db_sync", client.OutgoingMessage{
+	wsSendReliable(ctx, ws, "db_sync", client.OutgoingMessage{
 		Type: "db_sync",
 		Payload: map[string]any{
 			"containers": entries,

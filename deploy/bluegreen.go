@@ -3,7 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -39,7 +39,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			fmt.Sprintf("[%d/%d] pulling image %s for green containers", i+1, len(spec.Containers), imageRef),
 			map[string]any{"container_name": cSpec.Name, "step": "pulling"})
 
-		log.Printf("deploy: pulling image %s for green", imageRef)
+		slog.InfoContext(ctx, "deploy pulling image for green", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "image", imageRef)
 		if err := e.Docker.PullImage(ctx, imageRef, regAuth); err != nil {
 			e.cleanupGreen(ctx, greenIDs)
 			return fmt.Errorf("pull image %s: %w", imageRef, err)
@@ -167,7 +167,8 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				if renameErr := e.Docker.RenameContainer(ctx, id, retiredName); renameErr != nil {
 					// Rename failed — fall back to stop only so the port frees;
 					// record the id under its canonical name for restart-based rollback.
-					log.Printf("deploy: blue-green retire rename failed for %s: %v (stopping in place)", canonicalName, renameErr)
+					slog.WarnContext(ctx, "deploy blue-green retire rename failed (stopping in place)", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+						"container", canonicalName, "error", renameErr)
 					_ = e.Docker.StopContainer(ctx, id, 30)
 					blueBackups = append(blueBackups, blueBackup{canonicalName: canonicalName, id: id, retiredName: ""})
 				} else {
@@ -232,7 +233,8 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 
 	// If swap failed, restore blue containers as rollback, then surface the error.
 	if swapErr != nil {
-		log.Printf("deploy: blue-green swap failed, restoring blue containers: %v", swapErr)
+		slog.ErrorContext(ctx, "deploy blue-green swap failed, restoring blue containers", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+			"error", swapErr)
 		for _, bb := range blueBackups {
 			// Remove any partially-created final now occupying the canonical name.
 			if id, err := e.Docker.FindContainerByName(ctx, bb.canonicalName); err == nil && id != "" && id != bb.id {
@@ -241,12 +243,14 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			// Rename the retired blue back to its canonical name (if it was renamed).
 			if bb.retiredName != "" {
 				if renameErr := e.Docker.RenameContainer(ctx, bb.id, bb.canonicalName); renameErr != nil {
-					log.Printf("deploy: rollback rename %s -> %s failed: %v", bb.retiredName, bb.canonicalName, renameErr)
+					slog.ErrorContext(ctx, "deploy rollback rename failed", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+						"container", bb.canonicalName, "from", bb.retiredName, "error", renameErr)
 				}
 			}
 			// Start blue back up.
 			if startErr := e.Docker.StartContainer(ctx, bb.id); startErr != nil {
-				log.Printf("deploy: rollback failed to start blue %s: %v", bb.canonicalName, startErr)
+				slog.ErrorContext(ctx, "deploy rollback failed to start blue container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+					"container", bb.canonicalName, "container_id", bb.id, "error", startErr)
 			}
 		}
 		// Clean up any green containers left from un-swapped services.
@@ -264,7 +268,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 
 func (e *Executor) cleanupGreen(ctx context.Context, greenIDs map[string]string) {
 	for name, id := range greenIDs {
-		log.Printf("deploy: cleaning up green container %s-green", name)
+		slog.InfoContext(ctx, "deploy cleaning up green container", "component", "deploy", "container", name+"-green", "container_id", id)
 		_ = e.Docker.StopContainer(ctx, id, 10)
 		_ = e.Docker.RemoveContainer(ctx, id, true)
 	}

@@ -1,10 +1,11 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"runtime"
@@ -37,7 +38,7 @@ func (s *Server) Start() {
 		bind = "127.0.0.1"
 	}
 	addr := bind + ":" + s.Port
-	log.Printf("dashboard: http://%s", addr)
+	slog.InfoContext(context.Background(), "dashboard listening", "component", "dashboard", "url", "http://"+addr)
 
 	server := &http.Server{
 		Addr:         addr,
@@ -46,7 +47,7 @@ func (s *Server) Start() {
 		WriteTimeout: 30 * time.Second,
 	}
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("dashboard: failed to start: %v", err)
+		slog.ErrorContext(context.Background(), "dashboard failed to start", "component", "dashboard", "addr", addr, "error", err)
 	}
 }
 
