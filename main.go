@@ -5,10 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	monitor "github.com/aidenappl/go-monitor"
 	"github.com/aidenappl/lattice-runner/backup"
 	"github.com/aidenappl/lattice-runner/client"
 	"github.com/aidenappl/lattice-runner/cmd"
@@ -47,20 +49,164 @@ var (
 	lastRebootMu   sync.Mutex
 )
 
-// wsSend sends a JSON message over the WebSocket and logs any failure.
-func wsSend(ws *client.WSClient, msgType string, payload interface{}) {
-	if err := ws.SendJSON(payload); err != nil {
-		log.Printf("ws send [%s] failed: %v", msgType, err)
+// upgradeOutputTailBytes bounds the script/curl output kept with an upgrade
+// failure, in the Monitor event and in the stderr copy.
+const upgradeOutputTailBytes = 4096
+
+// outputTail returns at most the last n bytes of b.
+func outputTail(b []byte, n int) []byte {
+	if len(b) > n {
+		return b[len(b)-n:]
+	}
+	return b
+}
+
+// reportUpgradeFailure records an upgrade failure exactly once in Monitor: one
+// error event with fixed text and the output tail in a field. The human-readable
+// line goes straight to stderr (journald) rather than through log.Printf, because
+// the log tee would turn it into a second error event — a second issue — without
+// the output.
+func reportUpgradeFailure(event, msg string, err error, out []byte) {
+	tail := outputTail(out, upgradeOutputTailBytes)
+	fmt.Fprintf(os.Stderr, "%s %s: %v (output %d bytes)\n%s\n", time.Now().Format("2006/01/02 15:04:05"), msg, err, len(out), tail)
+	telemetry.Event(monitor.LevelError, event, map[string]any{
+		"message":      msg,
+		"error":        err.Error(),
+		"output":       string(tail),
+		"output_bytes": len(out),
+	})
+}
+
+// wsSend sends a JSON message over the WebSocket and logs any failure. The log
+// is attributed to wsSend's caller.
+func wsSend(ctx context.Context, ws *client.WSClient, msgType string, payload interface{}) {
+	wsSendAt(ctx, 1, ws, msgType, payload)
+}
+
+// wsSendAt is wsSend for a helper that sends on behalf of its own caller: a
+// failure is attributed skip frames above wsSendAt's caller (skip 0 is the
+// function that called wsSendAt), as for telemetry.LogAt.
+func wsSendAt(ctx context.Context, skip int, ws *client.WSClient, msgType string, payload interface{}) {
+	// A queue-full drop is already logged once, at warn, with its type by
+	// SendJSON; only other failures (e.g. marshal errors) are logged here.
+	// A reply sent under a command context is stamped with that command's ids.
+	if err := ws.SendJSON(stampPayload(ctx, payload)); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
+		telemetry.LogAt(ctx, skip+1, slog.LevelError, "ws send failed", "component", "runner", "message_type", msgType, "error", err)
 	}
 }
 
 // wsSendReliable sends a command_id-correlated reply that the orchestrator blocks
 // on. Unlike wsSend it waits for queue room (up to the timeout) instead of
 // dropping immediately when the queue is momentarily full under a telemetry burst.
-func wsSendReliable(ws *client.WSClient, msgType string, payload interface{}) {
-	if err := ws.SendJSONReliable(payload); err != nil {
-		log.Printf("ws reliable send [%s] failed: %v", msgType, err)
+func wsSendReliable(ctx context.Context, ws *client.WSClient, msgType string, payload interface{}) {
+	wsSendReliableAt(ctx, 1, ws, msgType, payload)
+}
+
+// wsSendReliableAt is wsSendReliable with a caller skip, as for wsSendAt.
+func wsSendReliableAt(ctx context.Context, skip int, ws *client.WSClient, msgType string, payload interface{}) {
+	// The timeout drop is already logged once, at warn, with its type by
+	// SendJSONReliable; only other failures are logged here.
+	if err := ws.SendJSONReliable(stampPayload(ctx, payload)); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
+		telemetry.LogAt(ctx, skip+1, slog.LevelError, "ws reliable send failed", "component", "runner", "message_type", msgType, "error", err)
 	}
+}
+
+// parseDeployCommand reads a deploy command's spec. A spec that does not parse
+// fails the deployment: it is reported as deployment.failed at step "parse"
+// and answered with a failed deployment_progress, and ok is false.
+func parseDeployCommand(ctx context.Context, ws *client.WSClient, env client.Envelope) (*deploy.DeploymentSpec, bool) {
+	spec, err := deploy.ParseDeploymentSpec(env.Payload)
+	if err == nil {
+		return spec, true
+	}
+	logDeployFailedAt(ctx, 0, deployFieldsFromPayload(env.Payload), deploy.STEP_PARSE, err)
+	wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
+		Type:      "deployment_progress",
+		CommandID: env.CommandID,
+		Status:    "failed",
+		Payload: map[string]any{
+			"deployment_id": env.Payload["deployment_id"],
+			"status":        "failed",
+			"message":       fmt.Sprintf("invalid spec: %v", err),
+		},
+	})
+	return nil, false
+}
+
+// stackConflict returns the id of another in-flight deployment on spec's
+// stack, or 0 when there is none. Deployments are serialized by stack.
+func stackConflict(states map[int]*deploymentRunState, spec deploy.DeploymentSpec) int {
+	if spec.StackName == "" {
+		return 0
+	}
+	for _, st := range states {
+		if st.InProgress && st.DeploymentID != spec.DeploymentID && st.StackName == spec.StackName {
+			return st.DeploymentID
+		}
+	}
+	return 0
+}
+
+// rejectDeployConflict fails a deployment whose stack already has conflict in
+// flight: it is reported as deployment.failed at step "conflict", attributed
+// to the caller, and answered with a failed deployment_progress.
+func rejectDeployConflict(ctx context.Context, ws *client.WSClient, env client.Envelope, spec deploy.DeploymentSpec, conflict int) {
+	err := fmt.Errorf("stack %s already has an in-flight deployment (%d)", spec.StackName, conflict)
+	fields := []any{
+		"component", "deploy",
+		"deployment_id", spec.DeploymentID,
+		"stack", spec.StackName,
+		"strategy", spec.Strategy,
+		"container_count", len(spec.Containers),
+		"conflicting_deployment_id", conflict,
+	}
+	logDeployFailedAt(ctx, 1, fields, deploy.STEP_CONFLICT, err)
+	wsSendAt(ctx, 1, ws, "deployment_progress", client.OutgoingMessage{
+		Type:      "deployment_progress",
+		CommandID: env.CommandID,
+		Status:    "failed",
+		Payload: map[string]any{
+			"deployment_id": spec.DeploymentID,
+			"status":        "failed",
+			"message":       err.Error(),
+		},
+	})
+}
+
+// logDeployFailedAt reports a deployment the runner fails before
+// Executor.Execute runs it, as the one error-level deployment.failed for that
+// failure, with Execute's fields. It is attributed skip frames above its
+// caller, as for telemetry.LogAt.
+func logDeployFailedAt(ctx context.Context, skip int, fields []any, step string, err error) {
+	attrs := make([]any, 0, len(fields)+8)
+	attrs = append(attrs, fields...)
+	attrs = append(attrs,
+		"event", deploy.EVENT_DEPLOYMENT_FAILED,
+		"duration_ms", int64(0),
+		"failed_step", step,
+		"error", err,
+	)
+	telemetry.LogAt(ctx, skip+1, slog.LevelError, "deployment failed", attrs...)
+}
+
+// deployFieldsFromPayload is what can be read of Execute's deployment fields
+// from a deploy payload that did not parse as a whole. Each is included only
+// when present with the expected type.
+func deployFieldsFromPayload(payload map[string]any) []any {
+	fields := []any{"component", "deploy"}
+	if v, ok := payload["deployment_id"].(float64); ok && v == float64(int(v)) {
+		fields = append(fields, "deployment_id", int(v))
+	}
+	if v, ok := payload["stack_name"].(string); ok {
+		fields = append(fields, "stack", v)
+	}
+	if v, ok := payload["strategy"].(string); ok {
+		fields = append(fields, "strategy", v)
+	}
+	if v, ok := payload["containers"].([]any); ok {
+		fields = append(fields, "container_count", len(v))
+	}
+	return fields
 }
 
 type deploymentRunState struct {
@@ -74,6 +220,10 @@ type deploymentRunState struct {
 	LastProgressAt time.Time
 	StartedAt      time.Time
 	InProgress     bool
+	// Ctx is the context of the deploy command that started this run, so
+	// executor progress is logged and replied under that command's ids.
+	// Nil for a run the runner did not start from a command.
+	Ctx context.Context
 }
 
 func main() {
@@ -117,10 +267,10 @@ func main() {
 			} else {
 				docker.Close()
 				docker = nil
-				log.Printf("docker connect attempt %d/30 failed: %v", i+1, pingErr)
+				slog.WarnContext(ctx, "docker connect attempt failed", "component", "runner", "attempt", i+1, "error", pingErr)
 			}
 		} else {
-			log.Printf("docker connect attempt %d/30 failed: %v", i+1, err)
+			slog.WarnContext(ctx, "docker connect attempt failed", "component", "runner", "attempt", i+1, "error", err)
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -129,7 +279,10 @@ func main() {
 	}
 	defer docker.Close()
 
-	dockerVersion, _ := docker.ServerVersion(ctx)
+	dockerVersion, err := docker.ServerVersion(ctx)
+	if err != nil {
+		slog.WarnContext(ctx, "docker server version unavailable", "component", "runner", "error", err)
+	}
 	fmt.Printf(" ✅ Done (Docker %s)\n", dockerVersion)
 
 	// Create WebSocket client
@@ -163,6 +316,10 @@ func main() {
 		}
 		attempt := st.Attempt
 		maxRetries := st.MaxRetries
+		sendCtx := ctx
+		if st.Ctx != nil {
+			sendCtx = st.Ctx
+		}
 		deploymentStatesMu.Unlock()
 
 		out := make(map[string]any, len(payload)+3)
@@ -173,7 +330,7 @@ func main() {
 		out["max_retries"] = maxRetries
 		out["last_progress_at"] = time.Now().UTC().Format(time.RFC3339)
 
-		wsSend(ws, "deployment_progress", client.OutgoingMessage{
+		wsSend(sendCtx, ws, "deployment_progress", client.OutgoingMessage{
 			Type:    "deployment_progress",
 			Payload: out,
 		})
@@ -199,10 +356,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				cycleCtx := cycleContext(ctx)
 				execMu.Lock()
 				for id, s := range execSessions {
 					if time.Since(s.createdAt) > 30*time.Minute {
-						log.Printf("exec session cleanup: removing orphaned session %s (age=%v)", id, time.Since(s.createdAt))
+						slog.WarnContext(cycleCtx, "removing orphaned exec session", "component", "runner", "command_id", id, "duration_ms", time.Since(s.createdAt).Milliseconds())
 						s.cancel()
 						delete(execSessions, id)
 					}
@@ -214,12 +372,17 @@ func main() {
 
 	// Create snapshot scheduler
 	snapshotScheduler := scheduler.New(func(job scheduler.Job) {
-		handleScheduledSnapshot(ws, docker, job)
+		// Each scheduled run is its own unit of work in Monitor.
+		handleScheduledSnapshot(cycleContext(ctx), ws, docker, job)
 	})
 	safeGoResilient("snapshot-scheduler", func() { snapshotScheduler.Run(ctx) })
 
 	// Handle incoming messages from orchestrator
 	ws.OnMessage(func(env client.Envelope) {
+		// Every handler below logs and replies under this command context:
+		// request_id/trace_id/job_id for its events, and the ids its replies
+		// echo. It derives from the root ctx, so shutdown still cancels it.
+		ctx := dispatchContext(ctx, env)
 		// Recover from any panic in a message handler so the WS read-pump stays
 		// alive rather than crashing the whole process.
 		defer func() {
@@ -232,9 +395,9 @@ func main() {
 		}()
 		switch env.Type {
 		case "connected":
-			log.Println("connected to orchestrator")
+			slog.InfoContext(ctx, "connected to orchestrator", "component", "runner")
 			// Send registration info
-			wsSend(ws, "registration", client.OutgoingMessage{
+			wsSend(ctx, ws, "registration", client.OutgoingMessage{
 				Type: "registration",
 				Payload: map[string]any{
 					"name":           cfg.WorkerName,
@@ -248,23 +411,12 @@ func main() {
 			})
 
 		case "deploy":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:deploy", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
-				spec, err := deploy.ParseDeploymentSpec(env.Payload)
-				if err != nil {
-					log.Printf("invalid deploy spec: %v", err)
-					wsSend(ws, "deployment_progress", client.OutgoingMessage{
-						Type:      "deployment_progress",
-						CommandID: env.CommandID,
-						Status:    "failed",
-						Payload: map[string]any{
-							"deployment_id": env.Payload["deployment_id"],
-							"status":        "failed",
-							"message":       fmt.Sprintf("invalid spec: %v", err),
-						},
-					})
+				defer releaseHandler()
+				spec, ok := parseDeployCommand(ctx, ws, env)
+				if !ok {
 					return
 				}
 
@@ -286,32 +438,13 @@ func main() {
 				deploymentStatesMu.Lock()
 				if existing, ok := deploymentStates[spec.DeploymentID]; ok && existing.InProgress {
 					deploymentStatesMu.Unlock()
-					log.Printf("deploy: deployment %d already in progress (%s), ignoring duplicate", spec.DeploymentID, existing.Status)
+					slog.WarnContext(ctx, "deployment already in progress, ignoring duplicate", "component", "deploy", "deployment_id", spec.DeploymentID, "status", existing.Status)
 					return
 				}
-				if spec.StackName != "" {
-					conflict := 0
-					for _, st := range deploymentStates {
-						if st.InProgress && st.DeploymentID != spec.DeploymentID && st.StackName == spec.StackName {
-							conflict = st.DeploymentID
-							break
-						}
-					}
-					if conflict != 0 {
-						deploymentStatesMu.Unlock()
-						log.Printf("deploy: stack %q already has in-flight deployment %d, rejecting deployment %d", spec.StackName, conflict, spec.DeploymentID)
-						wsSend(ws, "deployment_progress", client.OutgoingMessage{
-							Type:      "deployment_progress",
-							CommandID: env.CommandID,
-							Status:    "failed",
-							Payload: map[string]any{
-								"deployment_id": spec.DeploymentID,
-								"status":        "failed",
-								"message":       fmt.Sprintf("stack %s already has an in-flight deployment (%d)", spec.StackName, conflict),
-							},
-						})
-						return
-					}
+				if conflict := stackConflict(deploymentStates, *spec); conflict != 0 {
+					deploymentStatesMu.Unlock()
+					rejectDeployConflict(ctx, ws, env, *spec, conflict)
+					return
 				}
 				deploymentStates[spec.DeploymentID] = &deploymentRunState{
 					DeploymentID:   spec.DeploymentID,
@@ -324,10 +457,11 @@ func main() {
 					LastProgressAt: time.Now().UTC(),
 					StartedAt:      time.Now().UTC(),
 					InProgress:     true,
+					Ctx:            ctx,
 				}
 				deploymentStatesMu.Unlock()
 
-				wsSend(ws, "deployment_progress", client.OutgoingMessage{
+				wsSend(ctx, ws, "deployment_progress", client.OutgoingMessage{
 					Type: "deployment_progress",
 					Payload: map[string]any{
 						"deployment_id": spec.DeploymentID,
@@ -340,7 +474,9 @@ func main() {
 				})
 
 				if err := executor.Execute(ctx, *spec); err != nil {
-					log.Printf("deployment failed: %v", err)
+					// Execute has already reported this failure once, as
+					// deployment.failed at error; this is only local detail.
+					slog.DebugContext(ctx, "deployment run ended with failure", "component", "runner", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "error", err)
 					deploymentStatesMu.Lock()
 					if st, ok := deploymentStates[spec.DeploymentID]; ok {
 						st.Status = "failed"
@@ -371,7 +507,7 @@ func main() {
 				deploymentStatesMu.RUnlock()
 
 				if !ok {
-					wsSend(ws, "deployment_status", client.OutgoingMessage{
+					wsSend(ctx, ws, "deployment_status", client.OutgoingMessage{
 						Type: "deployment_status",
 						Payload: map[string]any{
 							"deployment_id": depID,
@@ -383,7 +519,7 @@ func main() {
 					return
 				}
 
-				wsSend(ws, "deployment_status", client.OutgoingMessage{
+				wsSend(ctx, ws, "deployment_status", client.OutgoingMessage{
 					Type: "deployment_status",
 					Payload: map[string]any{
 						"deployment_id":    st.DeploymentID,
@@ -399,13 +535,14 @@ func main() {
 			}()
 
 		case "stop":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:stop", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "stop", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -415,8 +552,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("stop: invalid container name rejected: %q", containerName)
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "stop", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -425,12 +562,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "stop", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "stop", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "stop", "container not found")
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "stop")
+					sendLifecycleLog(ctx, ws, containerName, "stop", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -441,11 +578,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "stop", fmt.Sprintf("stopping container (timeout=30s, id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "stop", fmt.Sprintf("stopping container (timeout=30s, id=%s)…", id[:12]))
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
-					log.Printf("failed to stop %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "stop", fmt.Sprintf("failed to stop: %v", err))
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to stop container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "stop", fmt.Sprintf("failed to stop: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -455,8 +592,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("stopped container %s", containerName)
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.InfoContext(ctx, "stopped container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -468,13 +605,14 @@ func main() {
 			}()
 
 		case "start":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:start", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "start", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -484,8 +622,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("start: invalid container name rejected: %q", containerName)
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "start", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -494,12 +632,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "start", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "start", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "start", "container not found")
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "start")
+					sendLifecycleLog(ctx, ws, containerName, "start", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -510,11 +648,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "start", fmt.Sprintf("starting container (id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "start", fmt.Sprintf("starting container (id=%s)…", id[:12]))
 				if err := docker.StartContainer(ctx, id); err != nil {
-					log.Printf("failed to start %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "start", fmt.Sprintf("failed to start: %v", err))
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to start container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "start", fmt.Sprintf("failed to start: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -524,8 +662,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("started container %s", containerName)
-					wsSend(ws, "container_status", client.OutgoingMessage{
+					slog.InfoContext(ctx, "started container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -537,13 +675,14 @@ func main() {
 			}()
 
 		case "kill":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:kill", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "kill", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -553,8 +692,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("kill: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "kill", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -563,12 +702,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "kill", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "kill", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "kill", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "kill")
+					sendLifecycleLog(ctx, ws, containerName, "kill", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -579,11 +718,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "kill", fmt.Sprintf("sending SIGKILL to container (id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "kill", fmt.Sprintf("sending SIGKILL to container (id=%s)…", id[:12]))
 				if err := docker.KillContainer(ctx, id); err != nil {
-					log.Printf("failed to kill %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "kill", fmt.Sprintf("failed to kill: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to kill container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "kill", fmt.Sprintf("failed to kill: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -593,8 +732,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("killed container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "killed container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -606,13 +745,14 @@ func main() {
 			}()
 
 		case "pause":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:pause", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "pause", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -622,8 +762,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("pause: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "pause", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -632,12 +772,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "pause", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "pause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "pause", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "pause")
+					sendLifecycleLog(ctx, ws, containerName, "pause", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -648,11 +788,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "pause", fmt.Sprintf("pausing container (id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "pause", fmt.Sprintf("pausing container (id=%s)…", id[:12]))
 				if err := docker.PauseContainer(ctx, id); err != nil {
-					log.Printf("failed to pause %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "pause", fmt.Sprintf("failed to pause: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to pause container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "pause", fmt.Sprintf("failed to pause: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -662,8 +802,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("paused container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "paused container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -675,13 +815,14 @@ func main() {
 			}()
 
 		case "unpause":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:unpause", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "unpause", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -691,8 +832,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("unpause: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "unpause", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -701,12 +842,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "unpause", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "unpause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "unpause", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "unpause")
+					sendLifecycleLog(ctx, ws, containerName, "unpause", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -717,11 +858,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "unpause", fmt.Sprintf("resuming container (id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "unpause", fmt.Sprintf("resuming container (id=%s)…", id[:12]))
 				if err := docker.UnpauseContainer(ctx, id); err != nil {
-					log.Printf("failed to unpause %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "unpause", fmt.Sprintf("failed to resume: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to unpause container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "unpause", fmt.Sprintf("failed to resume: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -731,8 +872,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("unpaused container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "unpaused container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -744,13 +885,14 @@ func main() {
 			}()
 
 		case "restart":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:restart", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "restart", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -760,8 +902,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("restart: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "restart", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -770,12 +912,12 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "restart", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "restart", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					log.Printf("container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "restart", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "restart")
+					sendLifecycleLog(ctx, ws, containerName, "restart", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -786,11 +928,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "restart", fmt.Sprintf("restarting container (timeout=30s, id=%s)… container will stop then start", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "restart", fmt.Sprintf("restarting container (timeout=30s, id=%s)… container will stop then start", id[:12]))
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
-					log.Printf("failed to restart %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "restart", fmt.Sprintf("failed to restart: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to restart container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "restart", fmt.Sprintf("failed to restart: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -800,8 +942,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("restarted container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "restarted container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -813,13 +955,14 @@ func main() {
 			}()
 
 		case "remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "remove", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -829,8 +972,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("remove: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "remove", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -839,11 +982,11 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "remove", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "remove", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					sendLifecycleLog(ws, containerName, "remove", "container not found")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					sendLifecycleWarn(ctx, ws, containerName, "remove", "container not found")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -854,16 +997,16 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("stopping container before removal (timeout=10s, id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "remove", fmt.Sprintf("stopping container before removal (timeout=10s, id=%s)…", id[:12]))
 				if err := docker.StopContainer(ctx, id, 10); err != nil {
-					sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("stop returned: %v (proceeding with force remove)", err))
+					sendLifecycleWarn(ctx, ws, containerName, "remove", fmt.Sprintf("stop returned: %v (proceeding with force remove)", err))
 				} else {
-					sendLifecycleLog(ws, containerName, "remove", "container stopped, removing…")
+					sendLifecycleLog(ctx, ws, containerName, "remove", "container stopped, removing…")
 				}
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
-					log.Printf("failed to remove %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "remove", fmt.Sprintf("failed to remove: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to remove container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "remove", fmt.Sprintf("failed to remove: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -873,8 +1016,8 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("removed container %s", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "removed container", "component", "runner", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -886,13 +1029,14 @@ func main() {
 			}()
 
 		case "recreate":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:recreate", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "recreate", "command_id", env.CommandID)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -902,8 +1046,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("recreate: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "recreate", "container", containerName)
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -921,37 +1065,36 @@ func main() {
 					if tag != "" {
 						fullRef = imageRef + ":" + tag
 					}
-					var regAuth *dockerclient.RegistryAuth
-					if authData, ok := env.Payload["auth"]; ok {
-						b, _ := json.Marshal(authData)
-						regAuth = &dockerclient.RegistryAuth{}
-						_ = json.Unmarshal(b, regAuth)
-					}
+					regAuth := parseRegistryAuth(ctx, env.Payload, fullRef)
 					authInfo := ""
 					if regAuth != nil && regAuth.Username != "" {
 						authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
 					}
-					sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("pulling image %s%s…", fullRef, authInfo))
+					sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("pulling image %s%s…", fullRef, authInfo))
 					if err := docker.PullImage(ctx, fullRef, regAuth); err != nil {
-						log.Printf("pull failed for %s: %v — proceeding with recreate anyway", fullRef, err)
-						sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("image pull failed: %v — proceeding with local image", err))
+						slog.WarnContext(ctx, "image pull failed, proceeding with recreate anyway", "component", "runner", "container", containerName, "image", fullRef, "error", err)
+						sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("image pull failed: %v — proceeding with local image", err))
 					} else {
-						sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("image %s pulled successfully", fullRef))
+						sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("image %s pulled successfully", fullRef))
 					}
 				} else {
-					sendLifecycleLog(ws, containerName, "recreate", "no image specified, recreating with current image")
+					sendLifecycleLog(ctx, ws, containerName, "recreate", "no image specified, recreating with current image")
 				}
 
-				sendLifecycleLog(ws, containerName, "recreate", "looking up container…")
+				sendLifecycleLog(ctx, ws, containerName, "recreate", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
+				if err != nil {
+					slog.WarnContext(ctx, "container lookup failed, trying canonical variants", "component", "recreate", "container", containerName, "error", err)
+				}
 				if err != nil || id == "" {
-					// Try canonical variants (suffixed names from deploys)
+					// Try canonical variants (suffixed names from deploys). A
+					// Docker failure in this lookup is logged by the executor.
 					id, _ = executor.FindCanonicalContainer(ctx, containerName)
 				}
 				if id == "" {
-					log.Printf("container %s not found for recreate", containerName)
-					sendLifecycleLog(ws, containerName, "recreate", "container not found — run a stack deploy to create it")
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "runner", "container", containerName, "action", "recreate")
+					sendLifecycleLog(ctx, ws, containerName, "recreate", "container not found — run a stack deploy to create it")
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -972,12 +1115,12 @@ func main() {
 					}
 				}
 
-				sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("graceful recreate (old id=%s)… starting new container, health checking, then swapping", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("graceful recreate (old id=%s)… starting new container, health checking, then swapping", id[:12]))
 				newID, err := docker.GracefulRecreate(ctx, id, newImageRef)
 				if err != nil {
-					log.Printf("failed to recreate %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "recreate", fmt.Sprintf("failed to recreate: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to recreate container", "component", "runner", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "recreate", fmt.Sprintf("failed to recreate: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": containerName,
@@ -988,8 +1131,8 @@ func main() {
 					})
 					return
 				}
-				log.Printf("recreated container %s -> %s", containerName, newID)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				slog.InfoContext(ctx, "recreated container", "component", "runner", "container", containerName, "container_id", newID)
+				wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 					Type: "container_status",
 					Payload: map[string]any{
 						"container_name": containerName,
@@ -1000,29 +1143,25 @@ func main() {
 			}()
 
 		case "pull_image":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:pull_image", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				imageRef, _ := env.Payload["image"].(string)
 				if imageRef == "" {
+					slog.WarnContext(ctx, "pull_image command missing image", "component", "pull_image", "command_id", env.CommandID)
 					return
 				}
-				var regAuth *dockerclient.RegistryAuth
-				if authData, ok := env.Payload["auth"]; ok {
-					b, _ := json.Marshal(authData)
-					regAuth = &dockerclient.RegistryAuth{}
-					_ = json.Unmarshal(b, regAuth)
-				}
+				regAuth := parseRegistryAuth(ctx, env.Payload, imageRef)
 				authInfo := ""
 				if regAuth != nil && regAuth.Username != "" {
 					authInfo = fmt.Sprintf(" (registry auth: %s)", regAuth.Username)
 				}
-				sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("pulling image %s%s…", imageRef, authInfo))
+				sendLifecycleLog(ctx, ws, imageRef, "pull_image", fmt.Sprintf("pulling image %s%s…", imageRef, authInfo))
 				if err := docker.PullImage(ctx, imageRef, regAuth); err != nil {
-					log.Printf("failed to pull %s: %v", imageRef, err)
-					sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("pull failed: %v", err))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to pull image", "component", "runner", "image", imageRef, "error", err)
+					sendLifecycleLog(ctx, ws, imageRef, "pull_image", fmt.Sprintf("pull failed: %v", err))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": imageRef,
@@ -1032,9 +1171,9 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("pulled image %s", imageRef)
-					sendLifecycleLog(ws, imageRef, "pull_image", fmt.Sprintf("image %s pulled successfully", imageRef))
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.InfoContext(ctx, "pulled image", "component", "runner", "image", imageRef)
+					sendLifecycleLog(ctx, ws, imageRef, "pull_image", fmt.Sprintf("image %s pulled successfully", imageRef))
+					wsSend(ctx, ws, "container_status", client.OutgoingMessage{
 						Type: "container_status",
 						Payload: map[string]any{
 							"container_name": imageRef,
@@ -1052,8 +1191,8 @@ func main() {
 				lastRebootMu.Lock()
 				if time.Since(lastRebootTime) < 5*time.Minute {
 					lastRebootMu.Unlock()
-					log.Println("reboot rejected: cooldown period (5 minutes between reboots)")
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					slog.WarnContext(ctx, "reboot rejected: cooldown period (5 minutes between reboots)", "component", "runner")
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "reboot_os",
@@ -1066,8 +1205,8 @@ func main() {
 				lastRebootTime = time.Now()
 				lastRebootMu.Unlock()
 
-				log.Println("reboot command received, rebooting system...")
-				wsSend(ws, "worker_action_status", client.OutgoingMessage{
+				slog.InfoContext(ctx, "reboot command received, rebooting system", "component", "runner")
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "reboot_os",
@@ -1078,15 +1217,21 @@ func main() {
 				time.Sleep(1 * time.Second)
 				out, err := exec.Command("sudo", "reboot").CombinedOutput()
 				if err != nil {
-					log.Printf("reboot failed: %v — %s", err, string(out))
+					slog.ErrorContext(ctx, "reboot failed", "component", "runner", "error", err, "output", string(out))
 				}
 			}()
 
 		case "upgrade_runner":
 			go func() {
 				defer telemetry.Recover("handler:upgrade_runner", map[string]any{"command_id": env.CommandID})
-				log.Println("upgrade runner command received")
-				wsSend(ws, "worker_action_status", client.OutgoingMessage{
+				// The orchestrator does not send the target version today; it is
+				// reported when a payload carries one.
+				upgradeAttrs := []any{"component", "runner", "event", "runner.upgrade.started", "from_version", Version}
+				if to := payloadString(env.Payload, "to_version", "target_version", "version"); to != "" {
+					upgradeAttrs = append(upgradeAttrs, "to_version", to)
+				}
+				slog.InfoContext(ctx, "runner upgrade started", upgradeAttrs...)
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "upgrade_runner",
@@ -1102,8 +1247,8 @@ func main() {
 				// integrity, so we refuse to download or execute it. Running an unverified
 				// script here is a fleet-wide remote-code-execution risk.
 				if expectedHash == "" {
-					log.Println("upgrade ABORTED: no expected_hash provided by orchestrator — refusing to run unverified script")
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "upgrade aborted: no expected_hash provided by orchestrator, refusing to run unverified script", "component", "runner")
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1125,8 +1270,8 @@ func main() {
 				// Use a secure temp directory with unpredictable name
 				tmpDir, mkErr := os.MkdirTemp("", "lattice-upgrade-*")
 				if mkErr != nil {
-					log.Printf("upgrade: failed to create temp dir: %v", mkErr)
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to create temp dir", "component", "upgrade", "error", mkErr)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1142,13 +1287,18 @@ func main() {
 				// Download to temp file
 				dlCmd := exec.CommandContext(ctx, "curl", "-fsSL", "-o", tmpFile, upgradeURL)
 				if dlOut, dlErr := dlCmd.CombinedOutput(); dlErr != nil {
-					log.Printf("upgrade download failed: %v — %s", dlErr, string(dlOut))
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					reportUpgradeFailure("runner.upgrade.download_failed", "upgrade download failed", dlErr, dlOut)
+					// Include curl's output (e.g. "curl: (22) ... 404") so the dashboard shows why
+					dlMsg := fmt.Sprintf("upgrade download failed: %v", dlErr)
+					if dlOutput := string(outputTail(dlOut, 1000)); dlOutput != "" {
+						dlMsg = fmt.Sprintf("upgrade download failed: %v\n%s", dlErr, dlOutput)
+					}
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
 							"status":  "failed",
-							"message": fmt.Sprintf("upgrade download failed: %v", dlErr),
+							"message": dlMsg,
 						},
 					})
 					return
@@ -1157,8 +1307,8 @@ func main() {
 				// Verify SHA256 hash of the downloaded script
 				scriptBytes, readErr := os.ReadFile(tmpFile)
 				if readErr != nil {
-					log.Printf("upgrade: failed to read downloaded script: %v", readErr)
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to read downloaded script", "component", "upgrade", "error", readErr)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1171,11 +1321,11 @@ func main() {
 
 				actualHash := sha256.Sum256(scriptBytes)
 				actualHashHex := hex.EncodeToString(actualHash[:])
-				log.Printf("upgrade script hash: %s", actualHashHex)
+				slog.InfoContext(ctx, "upgrade script hash", "component", "runner", "hash", actualHashHex)
 
 				if actualHashHex != expectedHash {
-					log.Printf("upgrade ABORTED: hash mismatch — expected %s, got %s", expectedHash, actualHashHex)
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					slog.ErrorContext(ctx, "upgrade aborted: script hash mismatch", "component", "runner", "expected_hash", expectedHash, "hash", actualHashHex)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1187,10 +1337,13 @@ func main() {
 				}
 
 				// Make executable and run
-				_ = os.Chmod(tmpFile, 0755)
+				if err := os.Chmod(tmpFile, 0755); err != nil {
+					// Not fatal: the script is run through bash, not exec'd.
+					slog.WarnContext(ctx, "upgrade script chmod failed", "component", "upgrade", "error", err)
+				}
 				out, err := exec.CommandContext(ctx, "bash", tmpFile).CombinedOutput()
 				if err != nil {
-					log.Printf("upgrade failed: %v — %s", err, string(out))
+					reportUpgradeFailure("runner.upgrade.failed", "upgrade failed", err, out)
 					// Include truncated script output so the dashboard shows the real error
 					scriptOutput := string(out)
 					if len(scriptOutput) > 1000 {
@@ -1200,7 +1353,7 @@ func main() {
 					if scriptOutput != "" {
 						failMsg = fmt.Sprintf("upgrade failed: %v\n%s", err, scriptOutput)
 					}
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1209,8 +1362,10 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("upgrade completed: %s", string(out))
-					wsSend(ws, "worker_action_status", client.OutgoingMessage{
+					// Fixed text: the script output contains words like "errors" (e.g.
+					// github.com/pkg/errors) that the log classifier would read as a failure.
+					slog.InfoContext(ctx, "upgrade completed, runner will restart via systemd", "component", "runner", "output_bytes", len(out))
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
@@ -1224,11 +1379,11 @@ func main() {
 		case "stop_all":
 			go func() {
 				defer telemetry.Recover("handler:stop_all", map[string]any{"command_id": env.CommandID})
-				log.Println("stop all containers command received")
+				slog.InfoContext(ctx, "stop all containers command received", "component", "runner")
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
-					log.Printf("failed to list containers: %v", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to list containers", "component", "runner", "action", "stop_all", "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "stop_all",
@@ -1244,7 +1399,7 @@ func main() {
 						running++
 					}
 				}
-				log.Printf("stop_all: found %d running containers out of %d total", running, len(containers))
+				slog.InfoContext(ctx, "found running containers", "component", "stop_all", "count", running, "total", len(containers))
 				stopped := 0
 				failed := 0
 				for _, c := range containers {
@@ -1258,18 +1413,25 @@ func main() {
 							}
 						}
 						if name != "" {
-							sendLifecycleLog(ws, name, "stop", fmt.Sprintf("stopping container as part of stop_all (%d/%d)…", stopped+failed+1, running))
+							sendLifecycleLog(ctx, ws, name, "stop", fmt.Sprintf("stopping container as part of stop_all (%d/%d)…", stopped+failed+1, running))
 						}
 						if err := docker.StopContainer(ctx, c.ID, 30); err != nil {
-							log.Printf("failed to stop %s: %v", c.ID[:12], err)
+							slog.ErrorContext(ctx, "failed to stop container", "component", "runner", "container", name, "container_id", c.ID[:12], "error", err)
 							failed++
 						} else {
 							stopped++
 						}
 					}
 				}
-				log.Printf("stop_all complete: stopped=%d failed=%d", stopped, failed)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				// No "failed" in the summary: each failure is already logged at error
+				// above, so the summary is info when all succeeded and warn otherwise
+				// ("could not be stopped" is a caution token in telemetry.classify).
+				if failed == 0 {
+					slog.InfoContext(ctx, "stop_all complete, all succeeded", "component", "runner", "stopped", stopped)
+				} else {
+					slog.WarnContext(ctx, "stop_all complete, some containers could not be stopped", "component", "runner", "stopped", stopped, "failed", failed)
+				}
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "stop_all",
@@ -1282,11 +1444,11 @@ func main() {
 		case "start_all":
 			go func() {
 				defer telemetry.Recover("handler:start_all", map[string]any{"command_id": env.CommandID})
-				log.Println("start all containers command received")
+				slog.InfoContext(ctx, "start all containers command received", "component", "runner")
 				containers, err := docker.ListContainers(ctx, "")
 				if err != nil {
-					log.Printf("failed to list containers: %v", err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to list containers", "component", "runner", "action", "start_all", "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "start_all",
@@ -1302,7 +1464,7 @@ func main() {
 						notRunning++
 					}
 				}
-				log.Printf("start_all: found %d stopped containers out of %d total", notRunning, len(containers))
+				slog.InfoContext(ctx, "found stopped containers", "component", "start_all", "count", notRunning, "total", len(containers))
 				started := 0
 				failed := 0
 				for _, c := range containers {
@@ -1316,18 +1478,23 @@ func main() {
 							}
 						}
 						if name != "" {
-							sendLifecycleLog(ws, name, "start", fmt.Sprintf("starting container as part of start_all (%d/%d)…", started+failed+1, notRunning))
+							sendLifecycleLog(ctx, ws, name, "start", fmt.Sprintf("starting container as part of start_all (%d/%d)…", started+failed+1, notRunning))
 						}
 						if err := docker.StartContainer(ctx, c.ID); err != nil {
-							log.Printf("failed to start %s: %v", c.ID[:12], err)
+							slog.ErrorContext(ctx, "failed to start container", "component", "runner", "container", name, "container_id", c.ID[:12], "error", err)
 							failed++
 						} else {
 							started++
 						}
 					}
 				}
-				log.Printf("start_all complete: started=%d failed=%d", started, failed)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				// See stop_all: info when all succeeded, warn otherwise.
+				if failed == 0 {
+					slog.InfoContext(ctx, "start_all complete, all succeeded", "component", "runner", "started", started)
+				} else {
+					slog.WarnContext(ctx, "start_all complete, some containers could not be started", "component", "runner", "started", started, "failed", failed)
+				}
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":  "start_all",
@@ -1342,8 +1509,8 @@ func main() {
 				defer telemetry.Recover("handler:list_volumes", map[string]any{"command_id": env.CommandID})
 				volumes, err := docker.ListVolumes(ctx)
 				if err != nil {
-					log.Printf("failed to list volumes: %v", err)
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to list volumes", "component", "runner", "error", err)
+					wsSendReliable(ctx, ws, "list_volumes_response", client.OutgoingMessage{
 						Type: "list_volumes_response",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1364,7 +1531,7 @@ func main() {
 						"labels":     v.Labels,
 					})
 				}
-				_ = ws.SendJSONReliable(client.OutgoingMessage{
+				wsSendReliable(ctx, ws, "list_volumes_response", client.OutgoingMessage{
 					Type: "list_volumes_response",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1380,7 +1547,7 @@ func main() {
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1395,7 +1562,7 @@ func main() {
 					driver = "local"
 				}
 				if err := docker.CreateVolume(ctx, name, driver); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1406,7 +1573,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1422,7 +1589,7 @@ func main() {
 				defer telemetry.Recover("handler:remove_volume", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1435,7 +1602,7 @@ func main() {
 				}
 				force, _ := env.Payload["force"].(bool)
 				if err := docker.RemoveVolume(ctx, name, force); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1446,7 +1613,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1462,8 +1629,8 @@ func main() {
 				defer telemetry.Recover("handler:list_networks", map[string]any{"command_id": env.CommandID})
 				networks, err := docker.ListNetworks(ctx)
 				if err != nil {
-					log.Printf("failed to list networks: %v", err)
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to list networks", "component", "runner", "error", err)
+					wsSendReliable(ctx, ws, "list_networks_response", client.OutgoingMessage{
 						Type: "list_networks_response",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1489,7 +1656,7 @@ func main() {
 						"created":    n.Created,
 					})
 				}
-				_ = ws.SendJSONReliable(client.OutgoingMessage{
+				wsSendReliable(ctx, ws, "list_networks_response", client.OutgoingMessage{
 					Type: "list_networks_response",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1505,7 +1672,7 @@ func main() {
 				name, _ := env.Payload["name"].(string)
 				driver, _ := env.Payload["driver"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1520,7 +1687,8 @@ func main() {
 					driver = "bridge"
 				}
 				if err := docker.CreateNetwork(ctx, name, driver); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "failed to create network", "component", "create_network", "network", name, "driver", driver, "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1531,7 +1699,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1547,7 +1715,7 @@ func main() {
 				defer telemetry.Recover("handler:remove_network", map[string]any{"command_id": env.CommandID})
 				name, _ := env.Payload["name"].(string)
 				if name == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1559,7 +1727,8 @@ func main() {
 					return
 				}
 				if err := docker.RemoveNetwork(ctx, name); err != nil {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "failed to remove network", "component", "remove_network", "network", name, "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -1570,7 +1739,7 @@ func main() {
 					})
 					return
 				}
-				_ = ws.SendJSON(client.OutgoingMessage{
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -1582,13 +1751,14 @@ func main() {
 			}()
 
 		case "force_remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:force_remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "command missing container_name", "component", "force_remove", "command_id", env.CommandID)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "missing container_name",
@@ -1597,8 +1767,8 @@ func main() {
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("force_remove: invalid container name rejected: %q", containerName)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "invalid container name rejected", "component", "force_remove", "container", containerName)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "invalid container_name",
@@ -1608,7 +1778,8 @@ func main() {
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "force_remove", "container", containerName, "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "error", "message": "container not found",
@@ -1616,11 +1787,13 @@ func main() {
 					})
 					return
 				}
-				log.Printf("force_remove: stopping and removing %s (id=%s)", containerName, id[:12])
-				_ = docker.StopContainer(ctx, id, 5)
+				slog.InfoContext(ctx, "stopping and removing container", "component", "force_remove", "container", containerName, "container_id", id[:12])
+				if err := docker.StopContainer(ctx, id, 5); err != nil {
+					slog.WarnContext(ctx, "stop before force remove failed, removing anyway", "component", "force_remove", "container", containerName, "error", err)
+				}
 				if err := docker.RemoveContainer(ctx, id, true); err != nil {
-					log.Printf("force_remove: failed to remove %s: %v", containerName, err)
-					_ = ws.SendJSON(client.OutgoingMessage{
+					slog.ErrorContext(ctx, "failed to remove container", "component", "force_remove", "container", containerName, "error", err)
+					wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action": "force_remove", "status": "failed", "message": fmt.Sprintf("failed to remove: %v", err),
@@ -1628,8 +1801,8 @@ func main() {
 					})
 					return
 				}
-				log.Printf("force_remove: removed %s", containerName)
-				_ = ws.SendJSON(client.OutgoingMessage{
+				slog.InfoContext(ctx, "removed container", "component", "force_remove", "container", containerName)
+				wsSend(ctx, ws, "worker_action_status", client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
 						"action":         "force_remove",
@@ -1646,15 +1819,17 @@ func main() {
 				containerName, _ := env.Payload["container_name"].(string)
 				commandID := env.CommandID
 				if containerName == "" || commandID == "" {
+					slog.WarnContext(ctx, "exec_start command missing container_name or command_id", "component", "exec_start", "container", containerName)
 					return
 				}
 				if !validContainerName(containerName) {
-					log.Printf("exec_start: invalid container name: %s", containerName)
+					slog.WarnContext(ctx, "invalid container name", "component", "exec_start", "container", containerName)
 					return
 				}
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					slog.WarnContext(ctx, "container not found", "component", "exec_start", "container", containerName, "error", err)
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1670,7 +1845,8 @@ func main() {
 
 				execID, err := docker.ContainerExecCreate(ctx, id, cmd)
 				if err != nil {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					slog.WarnContext(ctx, "exec create failed", "component", "exec_start", "container", containerName, "error", err)
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1682,7 +1858,8 @@ func main() {
 
 				conn, err := docker.ContainerExecAttach(ctx, execID)
 				if err != nil {
-					_ = ws.SendJSONReliable(client.OutgoingMessage{
+					slog.WarnContext(ctx, "exec attach failed", "component", "exec_start", "container", containerName, "error", err)
+					wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 						Type: "exec_output",
 						Payload: map[string]any{
 							"command_id": commandID,
@@ -1706,7 +1883,7 @@ func main() {
 						execMu.Lock()
 						delete(execSessions, commandID)
 						execMu.Unlock()
-						_ = ws.SendJSONReliable(client.OutgoingMessage{
+						wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 							Type: "exec_output",
 							Payload: map[string]any{
 								"command_id": commandID,
@@ -1723,7 +1900,7 @@ func main() {
 						}
 						n, err := conn.Reader.Read(buf)
 						if n > 0 {
-							_ = ws.SendJSONReliable(client.OutgoingMessage{
+							wsSendReliable(ctx, ws, "exec_output", client.OutgoingMessage{
 								Type: "exec_output",
 								Payload: map[string]any{
 									"command_id": commandID,
@@ -1733,7 +1910,7 @@ func main() {
 						}
 						if err != nil {
 							if err != io.EOF {
-								log.Printf("exec read error for %s: %v", commandID, err)
+								slog.ErrorContext(ctx, "exec read error", "component", "runner", "command_id", commandID, "error", err)
 							}
 							return
 						}
@@ -1757,9 +1934,12 @@ func main() {
 				}
 				data, err := base64.StdEncoding.DecodeString(dataB64)
 				if err != nil {
+					slog.WarnContext(ctx, "exec input is not valid base64", "component", "exec_input", "error", err)
 					return
 				}
-				_, _ = session.conn.Conn.Write(data)
+				if _, err := session.conn.Conn.Write(data); err != nil {
+					slog.WarnContext(ctx, "exec input write failed", "component", "exec_input", "exec_id", session.execID, "error", err)
+				}
 			}()
 
 		case "exec_resize":
@@ -1777,7 +1957,9 @@ func main() {
 				if !ok {
 					return
 				}
-				_ = docker.ContainerExecResize(ctx, session.execID, uint(heightF), uint(widthF))
+				if err := docker.ContainerExecResize(ctx, session.execID, uint(heightF), uint(widthF)); err != nil {
+					slog.WarnContext(ctx, "exec resize failed", "component", "exec_resize", "exec_id", session.execID, "error", err)
+				}
 			}()
 
 		case "exec_close":
@@ -1801,22 +1983,22 @@ func main() {
 			// state — sent on its reconcile tick and whenever this worker
 			// reconnects, so anything that changed while we were unreachable is
 			// corrected straight away.
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_sync_request", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				sendDatabaseSync(ctx, ws, docker)
 			}()
 
 		case "db_create":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_create", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_create: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_create", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"action": "db_create", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
@@ -1844,7 +2026,7 @@ func main() {
 				// database image can take minutes; without this the
 				// orchestrator cannot distinguish "the worker never got the
 				// command" from "the worker is working on it".
-				sendDbReply(ws, env, "db_status", map[string]any{
+				sendDbReply(ctx, ws, env, "db_status", map[string]any{
 					"container_name": containerName,
 					"action":         "db_create",
 					"status":         "accepted",
@@ -1859,9 +2041,9 @@ func main() {
 				if port > 0 {
 					if err := probeHostPort(port); err != nil {
 						msg := fmt.Sprintf("host port %d is not available: %v", port, err)
-						log.Printf("db_create: %s", msg)
-						sendLifecycleLog(ws, containerName, "db_create", msg)
-						sendDbReply(ws, env, "db_status", map[string]any{
+						slog.ErrorContext(ctx, "host port is not available", "component", "db_create", "container", containerName, "port", port, "error", err)
+						sendLifecycleLog(ctx, ws, containerName, "db_create", msg)
+						sendDbReply(ctx, ws, env, "db_status", map[string]any{
 							"container_name": containerName,
 							"action":         "db_create",
 							"status":         "failed",
@@ -1873,8 +2055,7 @@ func main() {
 
 				memoryLimit := normaliseMemoryLimit(int64(memoryLimitF))
 				if memoryLimit != int64(memoryLimitF) {
-					log.Printf("db_create: memory_limit %.0f is below Docker's minimum; interpreted as megabytes (%d bytes)",
-						memoryLimitF, memoryLimit)
+					slog.WarnContext(ctx, "memory_limit is below Docker's minimum, interpreted as megabytes", "component", "db_create", "container", containerName, "memory_limit", memoryLimitF, "memory_limit_bytes", memoryLimit)
 				}
 
 				spec := dockerclient.DatabaseSpec{
@@ -1899,12 +2080,12 @@ func main() {
 					}(),
 				}
 
-				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
+				sendLifecycleLog(ctx, ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
 				containerID, err := docker.CreateDatabaseContainer(ctx, spec)
 				if err != nil {
-					log.Printf("db_create: failed to create %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("failed to create: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to create database container", "component", "db_create", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_create", fmt.Sprintf("failed to create: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_create",
 						"status":         "failed",
@@ -1913,9 +2094,9 @@ func main() {
 					return
 				}
 
-				log.Printf("db_create: created database container %s (id=%s)", containerName, containerID[:12])
-				sendLifecycleLog(ws, containerName, "db_create", fmt.Sprintf("database container created and started (id=%s)", containerID[:12]))
-				sendDbReply(ws, env, "db_status", map[string]any{
+				slog.InfoContext(ctx, "created database container", "component", "db_create", "container", containerName, "container_id", containerID[:12])
+				sendLifecycleLog(ctx, ws, containerName, "db_create", fmt.Sprintf("database container created and started (id=%s)", containerID[:12]))
+				sendDbReply(ctx, ws, env, "db_status", map[string]any{
 					"container_name": containerName,
 					"action":         "db_create",
 					"status":         "success",
@@ -1924,28 +2105,28 @@ func main() {
 			}()
 
 		case "db_start":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_start", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_start: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_start", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"action": "db_start", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_start", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_start", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_start: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_start", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_start", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_start",
 						"status":         "failed",
@@ -1954,9 +2135,9 @@ func main() {
 					return
 				}
 				if id == "" {
-					log.Printf("db_start: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_start", "container not found")
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "container not found", "component", "db_start", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_start", "container not found")
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_start",
 						"status":         "failed",
@@ -1964,19 +2145,19 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("starting database container (id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "db_start", fmt.Sprintf("starting database container (id=%s)…", id[:12]))
 				if err := docker.StartContainer(ctx, id); err != nil {
-					log.Printf("db_start: failed to start %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_start", fmt.Sprintf("failed to start: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to start database container", "component", "db_start", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_start", fmt.Sprintf("failed to start: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_start",
 						"status":         "failed",
 						"message":        err.Error(),
 					})
 				} else {
-					log.Printf("db_start: started database container %s", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.InfoContext(ctx, "started database container", "component", "db_start", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_start",
 						"status":         "success",
@@ -1985,28 +2166,28 @@ func main() {
 			}()
 
 		case "db_stop":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_stop", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_stop: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_stop", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"action": "db_stop", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_stop", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_stop", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_stop: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_stop", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_stop", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_stop",
 						"status":         "failed",
@@ -2015,9 +2196,9 @@ func main() {
 					return
 				}
 				if id == "" {
-					log.Printf("db_stop: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_stop", "container not found")
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "container not found", "component", "db_stop", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_stop", "container not found")
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_stop",
 						"status":         "failed",
@@ -2025,19 +2206,19 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("stopping database container (timeout=30s, id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "db_stop", fmt.Sprintf("stopping database container (timeout=30s, id=%s)…", id[:12]))
 				if err := docker.StopContainer(ctx, id, 30); err != nil {
-					log.Printf("db_stop: failed to stop %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_stop", fmt.Sprintf("failed to stop: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to stop database container", "component", "db_stop", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_stop", fmt.Sprintf("failed to stop: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_stop",
 						"status":         "failed",
 						"message":        err.Error(),
 					})
 				} else {
-					log.Printf("db_stop: stopped database container %s", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.InfoContext(ctx, "stopped database container", "component", "db_stop", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_stop",
 						"status":         "success",
@@ -2046,28 +2227,28 @@ func main() {
 			}()
 
 		case "db_restart":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_restart", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_restart: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_restart", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"action": "db_restart", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_restart", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_restart", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_restart: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_restart", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_restart", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_restart",
 						"status":         "failed",
@@ -2076,9 +2257,9 @@ func main() {
 					return
 				}
 				if id == "" {
-					log.Printf("db_restart: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_restart", "container not found")
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "container not found", "component", "db_restart", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_restart", "container not found")
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_restart",
 						"status":         "failed",
@@ -2086,19 +2267,19 @@ func main() {
 					})
 					return
 				}
-				sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("restarting database container (timeout=30s, id=%s)…", id[:12]))
+				sendLifecycleLog(ctx, ws, containerName, "db_restart", fmt.Sprintf("restarting database container (timeout=30s, id=%s)…", id[:12]))
 				if err := docker.RestartContainer(ctx, id, 30); err != nil {
-					log.Printf("db_restart: failed to restart %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_restart", fmt.Sprintf("failed to restart: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to restart database container", "component", "db_restart", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_restart", fmt.Sprintf("failed to restart: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_restart",
 						"status":         "failed",
 						"message":        err.Error(),
 					})
 				} else {
-					log.Printf("db_restart: restarted database container %s", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.InfoContext(ctx, "restarted database container", "component", "db_restart", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_restart",
 						"status":         "success",
@@ -2107,14 +2288,14 @@ func main() {
 			}()
 
 		case "db_remove":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_remove", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_remove: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_remove", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"action": "db_remove", "status": "error", "message": "invalid or missing container_name",
 					})
 					return
@@ -2125,8 +2306,8 @@ func main() {
 				removeVolume, _ := env.Payload["remove_volume"].(bool)
 				volumeName, _ := env.Payload["volume_name"].(string)
 				if removeVolume && (volumeName == "" || !validContainerName(volumeName)) {
-					log.Printf("db_remove: volume purge requested with invalid volume name: %q", volumeName)
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.WarnContext(ctx, "volume purge requested with invalid volume name", "component", "db_remove", "container", containerName, "volume", volumeName)
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_remove",
 						"status":         "failed",
@@ -2135,16 +2316,16 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "db_remove", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_remove", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_remove: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_remove", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_remove",
 						"status":         "failed",
@@ -2158,19 +2339,19 @@ func main() {
 				// on any second remove — and made a delete unable to clean up
 				// the volume left behind by a first one.
 				if id == "" {
-					log.Printf("db_remove: container %s already absent", containerName)
-					sendLifecycleLog(ws, containerName, "db_remove", "container already absent, nothing to remove")
+					slog.WarnContext(ctx, "container already absent", "component", "db_remove", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", "container already absent, nothing to remove")
 				} else {
-					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stopping database container before removal (timeout=10s, id=%s)…", id[:12]))
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", fmt.Sprintf("stopping database container before removal (timeout=10s, id=%s)…", id[:12]))
 					if err := docker.StopContainer(ctx, id, 10); err != nil {
-						sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("stop returned: %v (proceeding with remove)", err))
+						sendLifecycleWarn(ctx, ws, containerName, "db_remove", fmt.Sprintf("stop returned: %v (proceeding with remove)", err))
 					} else {
-						sendLifecycleLog(ws, containerName, "db_remove", "container stopped, removing…")
+						sendLifecycleLog(ctx, ws, containerName, "db_remove", "container stopped, removing…")
 					}
 					if err := docker.RemoveContainer(ctx, id, true); err != nil {
-						log.Printf("db_remove: failed to remove %s: %v", containerName, err)
-						sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
-						sendDbReply(ws, env, "db_status", map[string]any{
+						slog.ErrorContext(ctx, "failed to remove database container", "component", "db_remove", "container", containerName, "error", err)
+						sendLifecycleLog(ctx, ws, containerName, "db_remove", fmt.Sprintf("failed to remove: %v", err))
+						sendDbReply(ctx, ws, env, "db_status", map[string]any{
 							"container_name": containerName,
 							"action":         "db_remove",
 							"status":         "failed",
@@ -2178,12 +2359,12 @@ func main() {
 						})
 						return
 					}
-					log.Printf("db_remove: removed database container %s", containerName)
+					slog.InfoContext(ctx, "removed database container", "component", "db_remove", "container", containerName)
 				}
 
 				if !removeVolume {
-					sendLifecycleLog(ws, containerName, "db_remove", "database container removed (volume preserved)")
-					sendDbReply(ws, env, "db_status", map[string]any{
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", "database container removed (volume preserved)")
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_remove",
 						"status":         "success",
@@ -2195,11 +2376,11 @@ func main() {
 				// force=true makes the daemon treat an already-absent volume as
 				// success, so a retried purge converges instead of erroring on
 				// the volume it removed last time.
-				sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("removing data volume %s…", volumeName))
+				sendLifecycleLog(ctx, ws, containerName, "db_remove", fmt.Sprintf("removing data volume %s…", volumeName))
 				if err := docker.RemoveVolume(ctx, volumeName, true); err != nil {
-					log.Printf("db_remove: failed to remove volume %s: %v", volumeName, err)
-					sendLifecycleLog(ws, containerName, "db_remove", fmt.Sprintf("failed to remove data volume: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to remove data volume", "component", "db_remove", "container", containerName, "volume", volumeName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", fmt.Sprintf("failed to remove data volume: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_remove",
 						"status":         "failed",
@@ -2208,9 +2389,9 @@ func main() {
 					return
 				}
 
-				log.Printf("db_remove: removed database container %s and data volume %s", containerName, volumeName)
-				sendLifecycleLog(ws, containerName, "db_remove", "database container and data volume removed")
-				sendDbReply(ws, env, "db_status", map[string]any{
+				slog.InfoContext(ctx, "removed database container and data volume", "component", "db_remove", "container", containerName, "volume", volumeName)
+				sendLifecycleLog(ctx, ws, containerName, "db_remove", "database container and data volume removed")
+				sendDbReply(ctx, ws, env, "db_status", map[string]any{
 					"container_name": containerName,
 					"action":         "db_remove",
 					"status":         "success",
@@ -2219,10 +2400,10 @@ func main() {
 			}()
 
 		case "db_snapshot":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_snapshot", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
 				databaseName, _ := env.Payload["database_name"].(string)
@@ -2233,8 +2414,8 @@ func main() {
 				destType, destConfig := backupDestinationFrom(env.Payload)
 
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_snapshot: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_snapshot", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2243,7 +2424,8 @@ func main() {
 					return
 				}
 				if engine == "" || databaseName == "" {
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					slog.WarnContext(ctx, "db_snapshot command missing engine or database_name", "component", "db_snapshot", "container", containerName, "engine", engine, "snapshot_id", snapshotID)
+					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2253,22 +2435,22 @@ func main() {
 				}
 
 				// Send uploading status
-				sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+				sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 					"snapshot_id":    snapshotID,
 					"container_name": containerName,
 					"status":         "uploading",
 				})
 
-				sendLifecycleLog(ws, containerName, "db_snapshot", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_snapshot", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_snapshot: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_snapshot", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_snapshot",
 						"status":         "failed",
@@ -2277,9 +2459,9 @@ func main() {
 					return
 				}
 				if id == "" {
-					log.Printf("db_snapshot: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_snapshot", "container not found")
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					slog.WarnContext(ctx, "container not found", "component", "db_snapshot", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_snapshot", "container not found")
+					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2292,8 +2474,8 @@ func main() {
 				// before the database is asked to produce a dump.
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
-					log.Printf("db_snapshot: failed to create backup destination: %v", err)
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to create backup destination", "component", "db_snapshot", "container", containerName, "error", err)
+					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2302,15 +2484,15 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination…", engine))
+				sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination…", engine))
 				size, err := streamSnapshot(ctx,
 					func(c context.Context) (io.ReadCloser, error) {
 						return docker.ExecDatabaseDump(c, id, engine, databaseName, username, password)
 					}, dest, remotePath)
 				if err != nil {
-					log.Printf("db_snapshot: snapshot failed for %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("snapshot failed: %v", err))
-					sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+					slog.ErrorContext(ctx, "snapshot failed", "component", "db_snapshot", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("snapshot failed: %v", err))
+					sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 						"snapshot_id":    snapshotID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2319,9 +2501,9 @@ func main() {
 					return
 				}
 
-				log.Printf("db_snapshot: snapshot completed for %s (size=%d bytes)", containerName, size)
-				sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("snapshot completed (size=%d bytes)", size))
-				sendDbReply(ws, env, "db_snapshot_status", map[string]any{
+				slog.InfoContext(ctx, "snapshot completed", "component", "db_snapshot", "container", containerName, "size_bytes", size)
+				sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("snapshot completed (size=%d bytes)", size))
+				sendDbReply(ctx, ws, env, "db_snapshot_status", map[string]any{
 					"snapshot_id":    snapshotID,
 					"container_name": containerName,
 					"status":         "completed",
@@ -2330,10 +2512,10 @@ func main() {
 			}()
 
 		case "db_restore":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_restore", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				containerName, _ := env.Payload["container_name"].(string)
 				engine, _ := env.Payload["engine"].(string)
 				databaseName, _ := env.Payload["database_name"].(string)
@@ -2346,8 +2528,8 @@ func main() {
 				destType, destConfig := backupDestinationFrom(env.Payload)
 
 				if containerName == "" || !validContainerName(containerName) {
-					log.Printf("db_restore: invalid or empty container name: %q", containerName)
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.WarnContext(ctx, "invalid or empty container name", "component", "db_restore", "container", containerName)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2356,7 +2538,8 @@ func main() {
 					return
 				}
 				if engine == "" || databaseName == "" {
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.WarnContext(ctx, "db_restore command missing engine or database_name", "component", "db_restore", "container", containerName, "engine", engine, "restore_id", restoreID)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2366,17 +2549,17 @@ func main() {
 				}
 
 				// Send downloading status
-				sendDbReply(ws, env, "db_restore_status", map[string]any{
+				sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 					"restore_id":     restoreID,
 					"container_name": containerName,
 					"status":         "downloading",
 				})
 
-				sendLifecycleLog(ws, containerName, "db_restore", "downloading snapshot from backup destination…")
+				sendLifecycleLog(ctx, ws, containerName, "db_restore", "downloading snapshot from backup destination…")
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
-					log.Printf("db_restore: failed to create backup destination: %v", err)
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to create backup destination", "component", "db_restore", "container", containerName, "error", err)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2387,8 +2570,8 @@ func main() {
 
 				tmpDir, err := os.MkdirTemp("", "lattice-restore-*")
 				if err != nil {
-					log.Printf("db_restore: failed to create temp dir: %v", err)
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to create temp dir", "component", "db_restore", "container", containerName, "error", err)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2400,9 +2583,9 @@ func main() {
 
 				tmpFile := filepath.Join(tmpDir, "restore.sql")
 				if err := dest.Download(ctx, remotePath, tmpFile); err != nil {
-					log.Printf("db_restore: download failed: %v", err)
-					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("download failed: %v", err))
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "snapshot download failed", "component", "db_restore", "container", containerName, "path", remotePath, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_restore", fmt.Sprintf("download failed: %v", err))
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2411,16 +2594,16 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "db_restore", "looking up database container…")
+				sendLifecycleLog(ctx, ws, containerName, "db_restore", "looking up database container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				// Distinguish a Docker API failure from a genuinely absent
 				// container: reporting "not found" for both sends the reader
 				// hunting for a deleted container when the daemon merely
 				// errored.
 				if err != nil {
-					log.Printf("db_restore: failed to look up %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("failed to look up container: %v", err))
-					sendDbReply(ws, env, "db_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to look up container", "component", "db_restore", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_restore", fmt.Sprintf("failed to look up container: %v", err))
+					sendDbReply(ctx, ws, env, "db_status", map[string]any{
 						"container_name": containerName,
 						"action":         "db_restore",
 						"status":         "failed",
@@ -2429,9 +2612,9 @@ func main() {
 					return
 				}
 				if id == "" {
-					log.Printf("db_restore: container %s not found", containerName)
-					sendLifecycleLog(ws, containerName, "db_restore", "container not found")
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.WarnContext(ctx, "container not found", "component", "db_restore", "container", containerName)
+					sendLifecycleLog(ctx, ws, containerName, "db_restore", "container not found")
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2440,11 +2623,11 @@ func main() {
 					return
 				}
 
-				sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restoring %s database…", engine))
+				sendLifecycleLog(ctx, ws, containerName, "db_restore", fmt.Sprintf("restoring %s database…", engine))
 				restoreFile, err := os.Open(tmpFile)
 				if err != nil {
-					log.Printf("db_restore: failed to open temp file: %v", err)
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to open temp file", "component", "db_restore", "container", containerName, "error", err)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2459,8 +2642,8 @@ func main() {
 				// for months before compression actually existed.
 				restoreReader, err := maybeGunzip(restoreFile)
 				if err != nil {
-					log.Printf("db_restore: %v", err)
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "failed to read snapshot", "component", "db_restore", "container", containerName, "error", err)
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2470,9 +2653,9 @@ func main() {
 				}
 
 				if err := docker.ExecDatabaseRestore(ctx, id, engine, databaseName, username, password, restoreReader); err != nil {
-					log.Printf("db_restore: restore failed for %s: %v", containerName, err)
-					sendLifecycleLog(ws, containerName, "db_restore", fmt.Sprintf("restore failed: %v", err))
-					sendDbReply(ws, env, "db_restore_status", map[string]any{
+					slog.ErrorContext(ctx, "restore failed", "component", "db_restore", "container", containerName, "error", err)
+					sendLifecycleLog(ctx, ws, containerName, "db_restore", fmt.Sprintf("restore failed: %v", err))
+					sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 						"restore_id":     restoreID,
 						"container_name": containerName,
 						"status":         "failed",
@@ -2481,9 +2664,9 @@ func main() {
 					return
 				}
 
-				log.Printf("db_restore: restore completed for %s", containerName)
-				sendLifecycleLog(ws, containerName, "db_restore", "database restore completed")
-				sendDbReply(ws, env, "db_restore_status", map[string]any{
+				slog.InfoContext(ctx, "restore completed", "component", "db_restore", "container", containerName)
+				sendLifecycleLog(ctx, ws, containerName, "db_restore", "database restore completed")
+				sendDbReply(ctx, ws, env, "db_restore_status", map[string]any{
 					"restore_id":     restoreID,
 					"container_name": containerName,
 					"status":         "completed",
@@ -2491,18 +2674,18 @@ func main() {
 			}()
 
 		case "db_update_schedule":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_update_schedule", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				instanceIDFloat, _ := env.Payload["instance_id"].(float64)
 				instanceID := int(instanceIDFloat)
 				enabled, _ := env.Payload["enabled"].(bool)
 
 				if !enabled {
 					snapshotScheduler.RemoveSchedule(instanceID)
-					log.Printf("db_update_schedule: removed schedule for instance %d", instanceID)
-					sendDbReply(ws, env, "db_schedule_status", map[string]any{
+					slog.InfoContext(ctx, "removed schedule", "component", "db_update_schedule", "instance_id", instanceID)
+					sendDbReply(ctx, ws, env, "db_schedule_status", map[string]any{
 						"instance_id": instanceID,
 						"status":      "removed",
 					})
@@ -2538,8 +2721,8 @@ func main() {
 					BackupDest:     backupDest,
 				})
 
-				log.Printf("db_update_schedule: updated schedule for instance %d (cron=%s)", instanceID, cron)
-				sendDbReply(ws, env, "db_schedule_status", map[string]any{
+				slog.InfoContext(ctx, "updated schedule", "component", "db_update_schedule", "instance_id", instanceID, "cron", cron)
+				sendDbReply(ctx, ws, env, "db_schedule_status", map[string]any{
 					"instance_id": instanceID,
 					"status":      "updated",
 					"cron":        cron,
@@ -2547,17 +2730,17 @@ func main() {
 			}()
 
 		case "backup_dest_test":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:backup_dest_test", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				destType, _ := env.Payload["dest_type"].(string)
 				destConfig, _ := env.Payload["dest_config"].(map[string]any)
 
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
-					log.Printf("backup_dest_test: failed to create destination: %v", err)
-					wsSendReliable(ws, "backup_dest_test_result", client.OutgoingMessage{
+					slog.WarnContext(ctx, "failed to create destination", "component", "backup_dest_test", "error", err)
+					wsSendReliable(ctx, ws, "backup_dest_test_result", client.OutgoingMessage{
 						Type: "backup_dest_test_result",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -2569,8 +2752,8 @@ func main() {
 				}
 
 				if err := dest.Test(ctx); err != nil {
-					log.Printf("backup_dest_test: test failed: %v", err)
-					wsSendReliable(ws, "backup_dest_test_result", client.OutgoingMessage{
+					slog.WarnContext(ctx, "destination test failed", "component", "backup_dest_test", "destination_type", destType, "error", err)
+					wsSendReliable(ctx, ws, "backup_dest_test_result", client.OutgoingMessage{
 						Type: "backup_dest_test_result",
 						Payload: map[string]any{
 							"command_id": env.CommandID,
@@ -2581,8 +2764,8 @@ func main() {
 					return
 				}
 
-				log.Printf("backup_dest_test: test passed for %s destination", destType)
-				wsSendReliable(ws, "backup_dest_test_result", client.OutgoingMessage{
+				slog.InfoContext(ctx, "destination test passed", "component", "backup_dest_test", "destination_type", destType)
+				wsSendReliable(ctx, ws, "backup_dest_test_result", client.OutgoingMessage{
 					Type: "backup_dest_test_result",
 					Payload: map[string]any{
 						"command_id": env.CommandID,
@@ -2593,18 +2776,24 @@ func main() {
 			}()
 
 		case "db_mirror_snapshot":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_mirror_snapshot", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 
 				filename := payloadString(env.Payload, "filename", "remote_path")
 				sourceRaw, _ := env.Payload["source_destination"].(map[string]any)
 				targetRaw, _ := env.Payload["target_destination"].(map[string]any)
 
-				fail := func(reason string) {
-					log.Printf("db_mirror_snapshot: %s", reason)
-					sendDbReply(ws, env, "db_mirror_status", map[string]any{
+				// fail logs msg (fixed text, attributed to the caller of fail)
+				// and replies with reason, the text the control plane shows.
+				fail := func(level slog.Level, msg, reason string, err error) {
+					args := []any{"component", "db_mirror_snapshot", "path", filename}
+					if err != nil {
+						args = append(args, "error", err)
+					}
+					telemetry.LogAt(ctx, 1, level, msg, args...)
+					sendDbReply(ctx, ws, env, "db_mirror_status", map[string]any{
 						"filename":      filename,
 						"status":        "failed",
 						"error_message": reason,
@@ -2612,7 +2801,7 @@ func main() {
 				}
 
 				if filename == "" || sourceRaw == nil || targetRaw == nil {
-					fail("missing filename, source_destination or target_destination")
+					fail(slog.LevelWarn, "missing filename, source_destination or target_destination", "missing filename, source_destination or target_destination", nil)
 					return
 				}
 
@@ -2623,12 +2812,12 @@ func main() {
 
 				source, err := backup.NewDestination(sourceType, sourceConfig)
 				if err != nil {
-					fail(fmt.Sprintf("source destination unusable: %v", err))
+					fail(slog.LevelError, "source destination unusable", fmt.Sprintf("source destination unusable: %v", err), err)
 					return
 				}
 				target, err := backup.NewDestination(targetType, targetConfig)
 				if err != nil {
-					fail(fmt.Sprintf("target destination unusable: %v", err))
+					fail(slog.LevelError, "target destination unusable", fmt.Sprintf("target destination unusable: %v", err), err)
 					return
 				}
 
@@ -2639,25 +2828,25 @@ func main() {
 				// database is waiting on this.
 				tmpDir, err := os.MkdirTemp("", "lattice-mirror-*")
 				if err != nil {
-					fail(fmt.Sprintf("failed to create temp dir: %v", err))
+					fail(slog.LevelError, "failed to create temp dir", fmt.Sprintf("failed to create temp dir: %v", err), err)
 					return
 				}
 				defer os.RemoveAll(tmpDir)
 				local := filepath.Join(tmpDir, "snapshot.bin")
 
 				if err := source.Download(ctx, filename, local); err != nil {
-					fail(fmt.Sprintf("failed to read %s from the primary destination: %v", filename, err))
+					fail(slog.LevelError, "failed to read snapshot from the primary destination", fmt.Sprintf("failed to read %s from the primary destination: %v", filename, err), err)
 					return
 				}
 
 				size, err := target.Upload(ctx, local, filename)
 				if err != nil {
-					fail(fmt.Sprintf("failed to write %s to the mirror: %v", filename, err))
+					fail(slog.LevelError, "failed to write snapshot to the mirror", fmt.Sprintf("failed to write %s to the mirror: %v", filename, err), err)
 					return
 				}
 
-				log.Printf("db_mirror_snapshot: mirrored %s (%d bytes)", filename, size)
-				sendDbReply(ws, env, "db_mirror_status", map[string]any{
+				slog.InfoContext(ctx, "mirrored snapshot", "component", "db_mirror_snapshot", "path", filename, "size_bytes", size)
+				sendDbReply(ctx, ws, env, "db_mirror_status", map[string]any{
 					"filename":   filename,
 					"status":     "completed",
 					"size_bytes": size,
@@ -2665,10 +2854,10 @@ func main() {
 			}()
 
 		case "db_delete_snapshot_file":
-			handlerSem <- struct{}{}
+			acquireHandler(ctx, env.Type)
 			go func() {
 				defer telemetry.Recover("handler:db_delete_snapshot_file", map[string]any{"command_id": env.CommandID})
-				defer func() { <-handlerSem }()
+				defer releaseHandler()
 				destType, destConfig := backupDestinationFrom(env.Payload)
 				remotePath := payloadString(env.Payload, "remote_path", "filename")
 				snapshotID := payloadString(env.Payload, "snapshot_id")
@@ -2679,7 +2868,7 @@ func main() {
 				// left on the destination forever — the exact leak the July
 				// pass believed it had fixed by starting to send the command.
 				if remotePath == "" {
-					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+					sendDbReply(ctx, ws, env, "db_delete_snapshot_result", map[string]any{
 						"snapshot_id": snapshotID,
 						"status":      "failed",
 						"message":     "missing remote_path/filename",
@@ -2689,8 +2878,8 @@ func main() {
 
 				dest, err := backup.NewDestination(destType, destConfig)
 				if err != nil {
-					log.Printf("db_delete_snapshot_file: failed to create destination: %v", err)
-					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+					slog.ErrorContext(ctx, "failed to create destination", "component", "db_delete_snapshot_file", "path", remotePath, "error", err)
+					sendDbReply(ctx, ws, env, "db_delete_snapshot_result", map[string]any{
 						"snapshot_id": snapshotID,
 						"status":      "failed",
 						"message":     fmt.Sprintf("failed to create destination: %v", err),
@@ -2699,8 +2888,8 @@ func main() {
 				}
 
 				if err := dest.Delete(ctx, remotePath); err != nil {
-					log.Printf("db_delete_snapshot_file: delete failed: %v", err)
-					sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+					slog.ErrorContext(ctx, "delete failed", "component", "db_delete_snapshot_file", "path", remotePath, "error", err)
+					sendDbReply(ctx, ws, env, "db_delete_snapshot_result", map[string]any{
 						"snapshot_id": snapshotID,
 						"status":      "failed",
 						"message":     fmt.Sprintf("delete failed: %v", err),
@@ -2708,8 +2897,8 @@ func main() {
 					return
 				}
 
-				log.Printf("db_delete_snapshot_file: deleted %s", remotePath)
-				sendDbReply(ws, env, "db_delete_snapshot_result", map[string]any{
+				slog.InfoContext(ctx, "deleted snapshot file", "component", "db_delete_snapshot_file", "path", remotePath)
+				sendDbReply(ctx, ws, env, "db_delete_snapshot_result", map[string]any{
 					"snapshot_id": snapshotID,
 					"status":      "success",
 				})
@@ -2768,6 +2957,12 @@ func main() {
 		})
 	})
 
+	// runner.stats: queue depth, drops by type, handler pool and SDK health.
+	safeGoResilient("runner-stats", func() { runRunnerStats(ctx, ws, RUNNER_STATS_INTERVAL) })
+
+	// Last health reported per container, so only transitions are logged.
+	health := newHealthTracker()
+
 	// Heartbeat ticker — also pushes live container states each tick
 	safeGoResilient("heartbeat", func() {
 		ticker := time.NewTicker(cfg.HeartbeatInterval)
@@ -2779,6 +2974,9 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// One job id per heartbeat/container-sync cycle. Not a command
+				// context, so the heartbeat and sync messages carry no ids.
+				ctx := cycleContext(ctx)
 				heartbeatCount++
 				m := metrics.Collect(ctx, docker)
 				runnerMetrics := metrics.CollectRunnerMetrics()
@@ -2809,12 +3007,15 @@ func main() {
 
 				// Collect per-container resource stats every 3rd heartbeat (expensive)
 				if heartbeatCount%3 == 0 {
-					if containerStats, err := docker.ContainerStats(ctx); err == nil && len(containerStats) > 0 {
+					containerStats, err := docker.ContainerStats(ctx)
+					if err != nil {
+						slog.WarnContext(ctx, "container stats collection failed", "component", "heartbeat", "error", err)
+					} else if len(containerStats) > 0 {
 						payload["container_stats"] = containerStats
 					}
 				}
 
-				wsSend(ws, "heartbeat", client.OutgoingMessage{
+				wsSend(ctx, ws, "heartbeat", client.OutgoingMessage{
 					Type:    "heartbeat",
 					Payload: payload,
 				})
@@ -2830,7 +3031,11 @@ func main() {
 
 				// Push live container state snapshot so the orchestrator stays in sync
 				// even when containers are stopped/started outside of Lattice.
-				if containers, err := docker.ListContainers(ctx, ""); err == nil {
+				containers, err := docker.ListContainers(ctx, "")
+				if err != nil {
+					slog.WarnContext(ctx, "container sync skipped, failed to list containers", "component", "heartbeat", "error", err)
+				} else {
+					withHealth := make(map[string]bool, len(containers))
 					for _, c := range containers {
 						name := ""
 						for _, n := range c.Names {
@@ -2879,6 +3084,8 @@ func main() {
 								healthStatus = "starting"
 							}
 							if healthStatus != "" {
+								withHealth[name] = true
+								health.observe(ctx, name, healthStatus)
 								statePayload["health_status"] = healthStatus
 								_ = ws.SendJSON(client.OutgoingMessage{
 									Type: "container_health_status",
@@ -2895,6 +3102,7 @@ func main() {
 							Payload: statePayload,
 						})
 					}
+					health.retain(withHealth)
 				}
 			}
 		}
@@ -2909,7 +3117,7 @@ func main() {
 		Port:       cfg.DashboardPort,
 		LatticeURL: cfg.LatticeURL,
 	}
-	go dashboard.Start()
+	safeGoResilient("dashboard", dashboard.Start)
 
 	fmt.Println()
 	fmt.Println("Lattice Runner ready")
@@ -2919,7 +3127,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("shutting down gracefully...")
+	slog.InfoContext(ctx, "shutting down gracefully", "component", "runner")
 
 	// Wait for in-flight deployments to finish (up to 60s)
 	shutdownDeadline := time.Now().Add(60 * time.Second)
@@ -2936,11 +3144,11 @@ func main() {
 		if !hasActive {
 			break
 		}
-		log.Println("waiting for in-flight deployment to complete...")
+		slog.InfoContext(ctx, "waiting for in-flight deployment to complete", "component", "runner")
 		time.Sleep(2 * time.Second)
 	}
 
-	wsSend(ws, "worker_shutdown", client.OutgoingMessage{
+	wsSend(ctx, ws, "worker_shutdown", client.OutgoingMessage{
 		Type: "worker_shutdown",
 		Payload: map[string]any{
 			"reason":  "graceful",
@@ -2955,7 +3163,7 @@ func main() {
 	ws.Drain(5 * time.Second)   // flush remaining messages while the write pump lives
 	cancel()                    // signal all goroutines to stop
 	ws.Close()
-	log.Println("runner stopped")
+	slog.InfoContext(ctx, "runner stopped", "component", "runner")
 	telemetry.Shutdown("signal")
 }
 
@@ -2969,8 +3177,10 @@ func main() {
 // orchestrator could not match a reply to the row it was supposed to update —
 // which meant no managed database could ever leave "pending", whether the
 // operation succeeded or failed.
-func sendDbReply(ws *client.WSClient, env client.Envelope, msgType string, payload map[string]any) {
-	wsSendReliable(ws, msgType, client.OutgoingMessage{
+//
+// A send failure is attributed to sendDbReply's caller.
+func sendDbReply(ctx context.Context, ws *client.WSClient, env client.Envelope, msgType string, payload map[string]any) {
+	wsSendReliableAt(ctx, 1, ws, msgType, client.OutgoingMessage{
 		Type:    msgType,
 		Payload: buildDbReplyPayload(env, payload),
 	})
@@ -3108,9 +3318,31 @@ func scheduledEnv(instanceID int) client.Envelope {
 	}
 }
 
-func sendLifecycleLog(ws *client.WSClient, containerName, event, message string) {
-	log.Printf("[lifecycle] %s: %s — %s", containerName, event, message)
-	wsSend(ws, "lifecycle_log", client.OutgoingMessage{
+// sendLifecycleLog sends a lifecycle entry to the orchestrator and logs it at
+// info, attributed to its caller. Failures the entry describes are logged by
+// the caller at their own level; logging them here too would make every
+// failure two issues.
+func sendLifecycleLog(ctx context.Context, ws *client.WSClient, containerName, event, message string) {
+	lifecycleLog(ctx, slog.LevelInfo, ws, containerName, event, message)
+}
+
+// sendLifecycleWarn is sendLifecycleLog for a handled failure (a fallback, a
+// missing container) that the caller does not log itself.
+func sendLifecycleWarn(ctx context.Context, ws *client.WSClient, containerName, event, message string) {
+	lifecycleLog(ctx, slog.LevelWarn, ws, containerName, event, message)
+}
+
+// lifecycleCallerSkip is how far above lifecycleLog its logs are attributed:
+// lifecycleLog is called only by sendLifecycleLog and sendLifecycleWarn, so
+// skip 2 is their caller.
+const lifecycleCallerSkip = 2
+
+// lifecycleLog logs the entry and sends it, attributing both the entry and any
+// send failure to the caller of sendLifecycleLog/sendLifecycleWarn.
+func lifecycleLog(ctx context.Context, level slog.Level, ws *client.WSClient, containerName, event, message string) {
+	telemetry.LogAt(ctx, lifecycleCallerSkip, level, "lifecycle event",
+		"component", "lifecycle", "container", containerName, "action", event, "detail", message)
+	wsSendAt(ctx, lifecycleCallerSkip, ws, "lifecycle_log", client.OutgoingMessage{
 		Type: "lifecycle_log",
 		Payload: map[string]any{
 			"container_name": containerName,
@@ -3131,7 +3363,7 @@ func sendLifecycleLog(ws *client.WSClient, containerName, event, message string)
 // (database_instance_id, filename) instead — previously this sent a synthetic
 // string id like "scheduled-5-1738…", which the orchestrator parsed to 0 and
 // dropped, so no scheduled snapshot has ever been recorded.
-func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, job scheduler.Job) {
+func handleScheduledSnapshot(ctx context.Context, ws *client.WSClient, docker *dockerclient.Client, job scheduler.Job) {
 	containerName := job.ContainerName
 	filename := fmt.Sprintf("%s_%s_%s.sql", containerName, job.DatabaseName, time.Now().UTC().Format("20060102T150405Z"))
 
@@ -3140,9 +3372,10 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	// worker: no lifecycle log, no event, no failed row, nothing in Monitor —
 	// which is how a schedule that never once produced a backup went unnoticed.
 	failPreflight := func(reason string) {
-		log.Printf("scheduled snapshot for instance %d: %s", job.InstanceID, reason)
-		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot could not start: "+reason)
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		telemetry.LogAt(ctx, 1, slog.LevelError, "scheduled snapshot failed preflight",
+			"component", "runner", "instance_id", job.InstanceID, "container", containerName, "reason", reason)
+		sendLifecycleLog(ctx, ws, containerName, "db_snapshot", "scheduled snapshot could not start: "+reason)
+		sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
@@ -3167,12 +3400,14 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	// WithoutCancel: a snapshot already under way runs to completion (bounded by
+	// the timeout) rather than being cut off by runner shutdown.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Minute)
 	defer cancel()
 
-	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot triggered (instance=%d)", job.InstanceID))
+	sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot triggered (instance=%d)", job.InstanceID))
 
-	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+	sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 		"filename":       filename,
 		"container_name": containerName,
 		"instance_id":    job.InstanceID,
@@ -3182,9 +3417,9 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 
 	id, err := docker.FindContainerByName(ctx, containerName)
 	if err != nil || id == "" {
-		log.Printf("scheduled snapshot: container %s not found", containerName)
-		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot failed: container not found")
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		slog.ErrorContext(ctx, "scheduled snapshot failed: container not found", "component", "runner", "container", containerName, "instance_id", job.InstanceID)
+		sendLifecycleLog(ctx, ws, containerName, "db_snapshot", "scheduled snapshot failed: container not found")
+		sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
@@ -3197,9 +3432,9 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 
 	dest, err := backup.NewDestination(destType, destConfig)
 	if err != nil {
-		log.Printf("scheduled snapshot: failed to create backup destination: %v", err)
-		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		slog.ErrorContext(ctx, "scheduled snapshot failed to create backup destination", "component", "runner", "container", containerName, "instance_id", job.InstanceID, "error", err)
+		sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
+		sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
@@ -3214,15 +3449,15 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	// its artifact can never point at different objects.
 	remotePath := filename
 
-	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination (scheduled)…", job.Engine))
+	sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("streaming %s dump to backup destination (scheduled)…", job.Engine))
 	size, err := streamSnapshot(ctx,
 		func(c context.Context) (io.ReadCloser, error) {
 			return docker.ExecDatabaseDump(c, id, job.Engine, job.DatabaseName, job.Username, job.Password)
 		}, dest, remotePath)
 	if err != nil {
-		log.Printf("scheduled snapshot: failed for %s: %v", containerName, err)
-		sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
-		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+		slog.ErrorContext(ctx, "scheduled snapshot failed", "component", "runner", "container", containerName, "instance_id", job.InstanceID, "error", err)
+		sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot failed: %v", err))
+		sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,
 			"container_name": containerName,
 			"instance_id":    job.InstanceID,
@@ -3233,9 +3468,9 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 		return
 	}
 
-	log.Printf("scheduled snapshot: completed for %s (size=%d bytes)", containerName, size)
-	sendLifecycleLog(ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot completed (size=%d bytes)", size))
-	sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
+	slog.InfoContext(ctx, "scheduled snapshot completed", "component", "runner", "container", containerName, "instance_id", job.InstanceID, "size_bytes", size)
+	sendLifecycleLog(ctx, ws, containerName, "db_snapshot", fmt.Sprintf("scheduled snapshot completed (size=%d bytes)", size))
+	sendDbReply(ctx, ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 		"filename":       filename,
 		"container_name": containerName,
 		"instance_id":    job.InstanceID,

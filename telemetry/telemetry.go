@@ -10,17 +10,30 @@ package telemetry
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
 	"regexp"
 	"runtime/debug"
-	"strings"
 	"sync/atomic"
 
 	monitor "github.com/aidenappl/go-monitor"
 	"github.com/aidenappl/lattice-runner/config"
 )
+
+// sdkDropTotal is the shipper's running drop total, as last reported to
+// OnDrop. OnDrop runs on the goroutine that hit the drop — for a full buffer,
+// whoever called Emit — so it only stores a number.
+var sdkDropTotal atomic.Int64
+
+func recordSDKDrops(total int64) {
+	sdkDropTotal.Store(total)
+}
+
+// SDKStats reports go-monitor's shipper counters and the drop total OnDrop last
+// saw. The two drop counts agree; OnDrop's is kept because it is what is
+// reported the moment a drop happens.
+func SDKStats() (monitor.ShipperStats, int64) {
+	return monitor.Stats(), sdkDropTotal.Load()
+}
 
 // Service is the name every runner event is filed under. Which worker sent it
 // is the "worker" field: one failure on two workers is one issue.
@@ -35,7 +48,8 @@ func workerName() string {
 	return ""
 }
 
-// Init configures Monitor and tees the standard logger into it. It never
+// Init configures Monitor and routes the standard logger into it through
+// slog (see installLogBridge). It never
 // returns an error: a misconfiguration is logged and the runner carries on.
 func Init(version string, cfg config.Monitor) {
 	w := cfg.WorkerName
@@ -51,12 +65,13 @@ func Init(version string, cfg config.Monitor) {
 		Debug:         cfg.Debug,
 		DisableStdout: !cfg.Stdout,
 		GzipEnabled:   true,
+		OnDrop:        recordSDKDrops,
 	})
 	if err != nil {
 		log.Printf("telemetry: Monitor disabled: %v", err)
 		return
 	}
-	InstallLogTee()
+	installLogBridge(cfg.Debug)
 	if cfg.IngestURL == "" {
 		log.Printf("telemetry: MONITOR_INGEST_URL is not set; events are not being shipped")
 	}
@@ -66,55 +81,23 @@ func Init(version string, cfg config.Monitor) {
 	})
 }
 
-// InstallLogTee sends every standard-library log line to Monitor as well as to
-// stderr, and adds the file:line of each call. The runner logs through the
-// standard logger everywhere, so this is what makes "every error" true without
-// rewriting two hundred call sites.
-func InstallLogTee() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.SetOutput(io.MultiWriter(os.Stderr, logTee{}))
-}
-
-type logTee struct{}
-
-// Write receives one log entry per call — the log package serialises them. It
-// never fails: a telemetry problem must not become a logging problem.
-func (logTee) Write(p []byte) (int, error) {
-	emitLogLine(string(p))
-	return len(p), nil
-}
-
 var (
-	stdPrefix        = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)? `)
-	callerPrefix     = regexp.MustCompile(`^([\w.-]+\.go:\d+): `)
 	bracketComponent = regexp.MustCompile(`^\[([A-Za-z0-9_-]+)\] ?`)
 	colonComponent   = regexp.MustCompile(`^([a-z][a-z0-9_-]*): `)
 )
 
-// parseLine splits a formatted log line into the call site, a component taken
-// from the runner's "[name] …" or "name: …" conventions, and the message.
-func parseLine(line string) (caller, component, msg string) {
-	msg = strings.TrimRight(line, "\n")
-	msg = stdPrefix.ReplaceAllString(msg, "")
-	if m := callerPrefix.FindStringSubmatch(msg); m != nil {
-		caller = m[1]
-		msg = msg[len(m[0]):]
-	}
-	if m := bracketComponent.FindStringSubmatch(msg); m != nil {
-		component = m[1]
-		msg = msg[len(m[0]):]
-	} else if m := colonComponent.FindStringSubmatch(msg); m != nil {
-		component = m[1]
-	}
-	return caller, component, msg
-}
-
 var (
 	// softFailure is an error the code already handles — a retry, a fallback.
 	// Checked first: these lines usually contain the word "failed" too.
-	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate|will reconnect)`)
-	hardFailure = regexp.MustCompile(`(?i)\b(fail|failed|failure|fails|error|errors|cannot|can't|unable|refused|fatal|corrupt)\b`)
-	caution     = regexp.MustCompile(`(?i)\b(invalid|rejected|not found|orphan|orphaned|timed out|timeout|full|dropped|denied|missing|warning|stale|offline|disconnected)\b`)
+	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate|will reconnect|proceeding)`)
+	// "aborted"/"refusing" are the runner's words for a failure it stopped on
+	// deliberately (e.g. an upgrade whose script hash does not match).
+	hardFailure = regexp.MustCompile(`(?i)\b(fail|failed|failure|fails|error|errors|cannot|can't|unable|refused|fatal|corrupt|aborted|refusing)\b`)
+	// "could not be stopped/started" is the stop_all/start_all summary when
+	// some containers failed: each failure is already logged at error, so the
+	// summary is a warning rather than a second error. It is matched as an exact
+	// phrase so no other "could not …" line changes level.
+	caution = regexp.MustCompile(`(?i)\b(invalid|rejected|not found|orphan|orphaned|timed out|timeout|full|dropped|denied|missing|warning|stale|offline|disconnected|rejecting|could not be stopped|could not be started)\b`)
 )
 
 // classify picks a level for a line that was written without one. Only error
@@ -133,26 +116,31 @@ func classify(msg string) string {
 	}
 }
 
-func emitLogLine(line string) {
-	caller, component, msg := parseLine(line)
-	// Panics are reported with their stack by ReportPanic; the log line that
-	// accompanies one would be a second, poorer copy.
-	if strings.TrimSpace(msg) == "" || strings.Contains(msg, "PANIC") {
-		return
+// panicReportLine matches only the runner's own panic log lines, which are
+// always written as "[<goroutine>] PANIC…: <value>\n<stack>" next to a
+// ReportPanic/ReportCrash call (Recover, safeGo, safeGoResilient and the message
+// handler). The goroutine name may contain ':' ("handler:deploy"), which
+// bracketComponent does not strip, so the bracket is matched here. Anything else
+// mentioning PANIC — e.g. Postgres stderr "PANIC: …" — has no goroutine stack
+// and is a real log line that must still be emitted.
+var panicReportLine = regexp.MustCompile(`(?s)^(?:\[[^\]\n]+\] )?PANIC\b.*?\ngoroutine \d+ \[`)
+
+// Event sends one event at an explicit level, stamped with the worker like
+// every other runner event. Use it where a log line would be misclassified or
+// would carry data (script output, IDs) that belongs in a field.
+func Event(level, name string, data map[string]any) {
+	if data == nil {
+		data = map[string]any{}
 	}
-	level := classify(msg)
-	name := component
-	if name == "" {
-		name = "runner"
-	}
-	emit(level, name+".log."+level, map[string]any{
-		"message":   msg,
-		"component": component,
-		"caller":    caller,
-	})
+	emit(level, name, data)
 }
 
 // emit stamps the worker on every event the runner sends.
+//
+// Explicit events keep going straight to monitor.Emit. Its source_* fields are
+// the frame two above it, which is this function (telemetry.go, emit), not the
+// caller of Event or ReportPanic; log lines get their true call site through
+// the slog bridge instead (see installLogBridge).
 func emit(level, name string, data map[string]any) {
 	data["worker"] = workerName()
 	monitor.Emit(context.Background(), name, data, monitor.WithLevel(level))

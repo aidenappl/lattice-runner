@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	dockerclient "github.com/aidenappl/lattice-runner/docker"
@@ -82,8 +83,10 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 	healthy := e.monitorCanary(monitorCtx, canaryID, spec.DeploymentID)
 
 	// Clean up canary
-	_ = e.Docker.StopContainer(ctx, canaryID, 10)
-	_ = e.Docker.RemoveContainer(ctx, canaryID, true)
+	logCleanupErr(ctx, slog.LevelWarn, e.Docker.StopContainer(ctx, canaryID, 10), "deploy failed to stop canary container", spec,
+		"container_id", canaryID)
+	logCleanupErr(ctx, slog.LevelWarn, e.Docker.RemoveContainer(ctx, canaryID, true), "deploy failed to remove canary container", spec,
+		"container_id", canaryID)
 
 	if !healthy {
 		return fmt.Errorf("canary health check failed — aborting deployment")

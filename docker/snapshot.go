@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -170,17 +171,32 @@ func (c *Client) ExecDatabaseRestore(ctx context.Context, containerID, engine, d
 		return fmt.Errorf("exec attach: %w", err)
 	}
 
-	// Write data to stdin
+	// Write data to stdin. The copy result is kept: a restore whose input was
+	// cut short can still exit 0 having applied only part of the dump.
+	copyDone := make(chan restoreCopyResult, 1)
 	go func() {
+		var res restoreCopyResult
+		defer func() { copyDone <- res }()
 		defer telemetry.Recover("snapshot.restore_stdin", nil)
 		defer resp.CloseWrite()
-		io.Copy(resp.Conn, data)
+		res.n, res.err = io.Copy(resp.Conn, data)
 	}()
 
 	// Read and discard stdout/stderr
 	var stderr bytes.Buffer
-	stdcopy.StdCopy(io.Discard, &stderr, resp.Reader)
+	if _, err := stdcopy.StdCopy(io.Discard, &stderr, resp.Reader); err != nil {
+		slog.WarnContext(ctx, "restore output stream failed, stderr may be incomplete", "component", "snapshot",
+			"container_id", containerID, "engine", engine, "error", err)
+	}
 	resp.Close()
+	// Closing the connection fails any write still in flight, so the copy ends
+	// promptly unless it is stuck reading the source; don't wait on that forever.
+	var copyRes restoreCopyResult
+	select {
+	case copyRes = <-copyDone:
+	case <-time.After(restoreCopyWait):
+		copyRes.err = fmt.Errorf("input copy still running %v after the restore exited", restoreCopyWait)
+	}
 
 	// Check exit code
 	inspectResp, err := c.cli.ContainerExecInspect(ctx, execID.ID)
@@ -188,8 +204,27 @@ func (c *Client) ExecDatabaseRestore(ctx context.Context, containerID, engine, d
 		return fmt.Errorf("exec inspect: %w", err)
 	}
 	if inspectResp.ExitCode != 0 {
+		if copyRes.err != nil {
+			slog.WarnContext(ctx, "restore input stream failed", "component", "snapshot",
+				"container_id", containerID, "engine", engine, "bytes_written", copyRes.n, "error", copyRes.err)
+		}
 		return fmt.Errorf("restore exited with code %d: %s", inspectResp.ExitCode, stderr.String())
+	}
+	if copyRes.err != nil {
+		// The caller logs the returned error; this is the one place it is
+		// known how much of the input reached the database.
+		return fmt.Errorf("restore input truncated after %d bytes: %w", copyRes.n, copyRes.err)
 	}
 
 	return nil
+}
+
+// restoreCopyWait bounds how long a restore waits for its stdin copy to report
+// once the restore process has exited.
+const restoreCopyWait = 30 * time.Second
+
+// restoreCopyResult is what the restore stdin copy managed to write.
+type restoreCopyResult struct {
+	n   int64
+	err error
 }

@@ -2,7 +2,7 @@ package metrics
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"runtime"
@@ -71,14 +71,16 @@ func Collect(ctx context.Context, docker *dockerclient.Client) SystemMetrics {
 	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
 		parts := strings.Fields(string(data))
 		if len(parts) >= 3 {
-			m.LoadAvg1, _ = strconv.ParseFloat(parts[0], 64)
-			m.LoadAvg5, _ = strconv.ParseFloat(parts[1], 64)
-			m.LoadAvg15, _ = strconv.ParseFloat(parts[2], 64)
+			m.LoadAvg1 = parseFloat("load_avg_1", parts[0])
+			m.LoadAvg5 = parseFloat("load_avg_5", parts[1])
+			m.LoadAvg15 = parseFloat("load_avg_15", parts[2])
 		}
 		// Process count from field 4: "running/total"
 		if len(parts) >= 4 {
 			if slash := strings.Index(parts[3], "/"); slash > 0 {
-				m.ProcessCount, _ = strconv.Atoi(parts[3][slash+1:])
+				n, err := strconv.Atoi(parts[3][slash+1:])
+				logParseErr("process_count", err)
+				m.ProcessCount = n
 			}
 		}
 	}
@@ -123,7 +125,7 @@ func Collect(ctx context.Context, docker *dockerclient.Client) SystemMetrics {
 				}
 			}
 		} else {
-			log.Printf("metrics: failed to list containers: %v", err)
+			slog.WarnContext(ctx, "metrics failed to list containers, container counts omitted", "component", "metrics", "error", err)
 		}
 	}
 
@@ -136,7 +138,7 @@ func Collect(ctx context.Context, docker *dockerclient.Client) SystemMetrics {
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
 		parts := strings.Fields(string(data))
 		if len(parts) >= 1 {
-			m.UptimeSeconds, _ = strconv.ParseFloat(parts[0], 64)
+			m.UptimeSeconds = parseFloat("uptime_seconds", parts[0])
 		}
 	}
 
@@ -187,7 +189,7 @@ func readCPUSample() cpuSample {
 
 			var total, idle uint64
 			for i := 1; i < len(fields); i++ {
-				v, _ := strconv.ParseUint(fields[i], 10, 64)
+				v := parseUint("proc_stat_cpu", fields[i])
 				total += v
 				if i == 4 { // idle is field index 4
 					idle = v
@@ -210,8 +212,7 @@ func parseMemInfoKB(data, key string) uint64 {
 		if strings.HasPrefix(line, prefix) {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
-				v, _ := strconv.ParseUint(fields[1], 10, 64)
-				return v
+				return parseUint("meminfo_"+key, fields[1])
 			}
 		}
 	}
@@ -266,4 +267,27 @@ func CollectRunnerMetrics() map[string]interface{} {
 
 func round1(v float64) float64 {
 	return math.Round(v*10) / 10
+}
+
+// parseFloat parses a number read from /proc, returning 0 when it cannot.
+func parseFloat(field, v string) float64 {
+	f, err := strconv.ParseFloat(v, 64)
+	logParseErr(field, err)
+	return f
+}
+
+// parseUint parses a counter read from /proc, returning 0 when it cannot.
+func parseUint(field, v string) uint64 {
+	n, err := strconv.ParseUint(v, 10, 64)
+	logParseErr(field, err)
+	return n
+}
+
+// logParseErr records a /proc value that did not parse. It is debug: these run
+// on every heartbeat, and an odd kernel format would otherwise log on each one.
+// The metric reads 0 either way.
+func logParseErr(field string, err error) {
+	if err != nil {
+		slog.DebugContext(context.Background(), "metrics value did not parse", "component", "metrics", "field", field, "error", err)
+	}
 }

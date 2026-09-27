@@ -3,7 +3,7 @@ package deploy
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -83,7 +83,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			}
 		}
 
-		log.Printf("deploy: pulling image %s", imageRef)
+		slog.InfoContext(ctx, "deploy pulling image", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName, "image", imageRef)
 		if err := e.Docker.PullImage(ctx, imageRef, regAuth); err != nil {
 			e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
 			return fmt.Errorf("pull image %s, rolled back %d containers: %w", imageRef, len(updatedContainers), err)
@@ -166,7 +166,8 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				// Give it a moment to crash if it's going to
 				time.Sleep(2 * time.Second)
 				if info, inspErr := e.Docker.InspectContainer(ctx, probeID); inspErr != nil || !info.State.Running {
-					_ = e.Docker.StopAndRemoveContainer(ctx, probeID, 5)
+					logCleanupErr(ctx, slog.LevelWarn, e.Docker.StopAndRemoveContainer(ctx, probeID, 5), "deploy failed to remove probe container", spec,
+						"container", probeName, "container_id", probeID)
 					e.reportProgress(spec.DeploymentID, "deploying",
 						fmt.Sprintf("[%d/%d] probe container exited immediately for %s", i+1, len(spec.Containers), name), nil)
 					e.rollbackContainers(ctx, spec, snapshots, updatedContainers)
@@ -174,16 +175,20 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				}
 
 				// Probe passed — remove it and do the swap
-				_ = e.Docker.StopAndRemoveContainer(ctx, probeID, 5)
+				logCleanupErr(ctx, slog.LevelWarn, e.Docker.StopAndRemoveContainer(ctx, probeID, 5), "deploy failed to remove probe container", spec,
+					"container", probeName, "container_id", probeID)
 
 				// Stop old containers to free ports
 				e.reportProgress(spec.DeploymentID, "deploying",
 					fmt.Sprintf("[%d/%d] swapping ports for %s", i+1, len(spec.Containers), name), nil)
 				for _, old := range oldContainers {
-					log.Printf("deploy: stopping old container %s (id=%s) to free ports", old.name, old.id[:12])
+					slog.InfoContext(ctx, "deploy stopping old container to free ports", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+						"container", old.name, "container_id", old.id[:12])
 					if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
-						log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
-						_ = e.Docker.KillContainer(ctx, old.id)
+						slog.WarnContext(ctx, "deploy stop failed, trying kill", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+							"container", old.name, "error", err)
+						logCleanupErr(ctx, slog.LevelWarn, e.Docker.KillContainer(ctx, old.id), "deploy kill failed", spec,
+							"container", old.name, "container_id", old.id)
 					}
 				}
 
@@ -204,10 +209,13 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				stoppedOld := len(oldContainers) > 0
 				if stoppedOld {
 					for _, old := range oldContainers {
-						log.Printf("deploy: stopping old container %s (id=%s)", old.name, old.id[:12])
+						slog.InfoContext(ctx, "deploy stopping old container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+							"container", old.name, "container_id", old.id[:12])
 						if err := e.Docker.StopContainer(ctx, old.id, 10); err != nil {
-							log.Printf("deploy: stop failed for %s: %v, trying kill", old.name, err)
-							_ = e.Docker.KillContainer(ctx, old.id)
+							slog.WarnContext(ctx, "deploy stop failed, trying kill", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+								"container", old.name, "error", err)
+							logCleanupErr(ctx, slog.LevelWarn, e.Docker.KillContainer(ctx, old.id), "deploy kill failed", spec,
+								"container", old.name, "container_id", old.id)
 						}
 					}
 				}
@@ -238,19 +246,23 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				return fmt.Errorf("container %s not running after create", name)
 			}
 
-			log.Printf("deploy: container %s started (id=%s)", deployName, containerID[:12])
+			slog.InfoContext(ctx, "deploy container started", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", deployName, "container_id", containerID[:12])
 
 			// Clean up ALL old containers (stop if needed, remove)
 			for _, old := range oldContainers {
-				log.Printf("deploy: removing old container %s (id=%s)", old.name, old.id[:12])
+				slog.InfoContext(ctx, "deploy removing old container", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+					"container", old.name, "container_id", old.id[:12])
 				if err := e.Docker.StopAndRemoveContainer(ctx, old.id, 10); err != nil {
-					log.Printf("deploy: failed to remove old container %s: %v (will be orphaned)", old.name, err)
+					slog.WarnContext(ctx, "deploy failed to remove old container (will be orphaned)", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+						"container", old.name, "container_id", old.id[:12], "error", err)
 				}
 			}
 
 			// Best-effort rename to canonical name for clean display
 			if renameErr := e.Docker.RenameContainer(ctx, containerID, name); renameErr != nil {
-				log.Printf("deploy: rename %s -> %s failed: %v (container running with suffixed name)", deployName, name, renameErr)
+				slog.WarnContext(ctx, "deploy rename failed (container running with suffixed name)", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+					"container", name, "from", deployName, "error", renameErr)
 				// Not fatal — container is running, just with the suffixed name
 			} else {
 				deployName = name
@@ -301,6 +313,7 @@ func (e *Executor) FindCanonicalContainer(ctx context.Context, canonicalName str
 func (e *Executor) findAllMatchingContainers(ctx context.Context, canonicalName string) []oldContainer {
 	all, err := e.Docker.ListContainers(ctx, "")
 	if err != nil {
+		slog.WarnContext(ctx, "deploy failed to list containers for name match", "component", "deploy", "container", canonicalName, "error", err)
 		return nil
 	}
 
@@ -356,7 +369,8 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			e.reportProgress(spec.DeploymentID, "deploying",
 				fmt.Sprintf("rollback: removing %s (no prior version to restore)", snap.Name), nil)
 			for _, cur := range e.findAllMatchingContainers(ctx, snap.Name) {
-				_ = e.Docker.StopAndRemoveContainer(ctx, cur.id, 10)
+				logCleanupErr(ctx, slog.LevelWarn, e.Docker.StopAndRemoveContainer(ctx, cur.id, 10), "deploy rollback failed to remove container", spec,
+					"container", cur.name, "container_id", cur.id)
 			}
 			continue
 		}
@@ -366,12 +380,14 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 
 		// Pull old image
 		if err := e.Docker.PullImage(ctx, snap.OldImage, nil); err != nil {
-			log.Printf("deploy: rollback pull failed for %s: %v", snap.Name, err)
+			slog.ErrorContext(ctx, "deploy rollback pull failed", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", snap.Name, "image", snap.OldImage, "error", err)
 		}
 
 		// Stop and remove all current containers with this canonical name
 		for _, old := range e.findAllMatchingContainers(ctx, snap.Name) {
-			_ = e.Docker.StopAndRemoveContainer(ctx, old.id, 10)
+			logCleanupErr(ctx, slog.LevelWarn, e.Docker.StopAndRemoveContainer(ctx, old.id, 10), "deploy rollback failed to remove container", spec,
+				"container", old.name, "container_id", old.id)
 		}
 
 		// Recreate with old image and canonical name
@@ -407,12 +423,14 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 		}
 		containerID, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 		if createErr != nil {
-			log.Printf("deploy: rollback create failed for %s: %v", snap.Name, createErr)
+			slog.ErrorContext(ctx, "deploy rollback create failed", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", snap.Name, "image", snap.OldImage, "error", createErr)
 			continue
 		}
 		// Best-effort rename to canonical
 		if renameErr := e.Docker.RenameContainer(ctx, containerID, snap.Name); renameErr != nil {
-			log.Printf("deploy: rollback rename %s -> %s failed: %v", rollbackName, snap.Name, renameErr)
+			slog.ErrorContext(ctx, "deploy rollback rename failed", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
+				"container", snap.Name, "from", rollbackName, "error", renameErr)
 		}
 	}
 }
@@ -423,7 +441,7 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 func (e *Executor) CleanupOrphanedContainers(ctx context.Context) []string {
 	containers, err := e.Docker.ListContainers(ctx, "")
 	if err != nil {
-		log.Printf("deploy: failed to list containers for orphan check: %v", err)
+		slog.ErrorContext(ctx, "deploy failed to list containers for orphan check", "component", "deploy", "error", err)
 		return nil
 	}
 
@@ -435,7 +453,8 @@ func (e *Executor) CleanupOrphanedContainers(ctx context.Context) []string {
 				strings.HasSuffix(name, "-lattice-retired") ||
 				strings.HasSuffix(name, "-lattice-updating") {
 				orphans = append(orphans, name)
-				log.Printf("deploy: orphaned container detected: %s (state=%s)", name, ct.State)
+				slog.WarnContext(ctx, "deploy orphaned container detected", "component", "deploy",
+					"container", name, "state", ct.State)
 			}
 		}
 	}

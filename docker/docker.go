@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"time"
@@ -215,14 +215,14 @@ func IsGeneratedSuffixSegment(seg string) bool {
 func (c *Client) StopAndRemoveContainer(ctx context.Context, containerID string, timeout int) error {
 	// Stop
 	if err := c.StopContainer(ctx, containerID, timeout); err != nil {
-		log.Printf("docker: stop failed for %s: %v, trying kill", containerID[:12], err)
+		slog.WarnContext(ctx, "docker stop failed, trying kill", "component", "docker", "container_id", containerID[:12], "error", err)
 		_ = c.KillContainer(ctx, containerID)
 		time.Sleep(1 * time.Second)
 	}
 
 	// Verify stopped
 	if info, err := c.InspectContainer(ctx, containerID); err == nil && info.State.Running {
-		log.Printf("docker: container %s still running after stop, killing", containerID[:12])
+		slog.InfoContext(ctx, "docker container still running after stop, killing", "component", "docker", "container_id", containerID[:12])
 		_ = c.KillContainer(ctx, containerID)
 		time.Sleep(2 * time.Second)
 	}
@@ -232,7 +232,8 @@ func (c *Client) StopAndRemoveContainer(ctx context.Context, containerID string,
 		if err := c.RemoveContainer(ctx, containerID, true); err == nil {
 			return nil
 		} else {
-			log.Printf("docker: remove attempt %d for %s failed: %v", attempt+1, containerID[:12], err)
+			slog.WarnContext(ctx, "docker remove attempt failed", "component", "docker",
+				"container_id", containerID[:12], "attempt", attempt+1, "error", err)
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -394,7 +395,8 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 				endpointConfig = &network.EndpointSettings{Aliases: spec.NetworkAliases}
 			}
 			if err := c.cli.NetworkConnect(ctx, netName, resp.ID, endpointConfig); err != nil {
-				log.Printf("docker: failed to connect container %s to network %s: %v", spec.Name, netName, err)
+				slog.ErrorContext(ctx, "docker failed to connect container to network", "component", "docker",
+					"container", spec.Name, "network", netName, "error", err)
 			}
 		}
 	}
@@ -671,14 +673,24 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 	retiredName := originalName + "-retired-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	oldRetired := false
 	if renameErr := c.cli.ContainerRename(ctx, containerID, retiredName); renameErr != nil {
-		log.Printf("graceful-recreate: rename failed for %s: %v — falling back to stop+remove", originalName, renameErr)
-		_ = c.StopContainer(ctx, containerID, 10)
-		_ = c.RemoveContainer(ctx, containerID, true)
+		slog.WarnContext(ctx, "graceful-recreate rename failed, falling back to stop+remove", "component", "graceful-recreate",
+			"container", originalName, "error", renameErr)
+		if err := c.StopContainer(ctx, containerID, 10); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate fallback stop failed", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
+		if err := c.RemoveContainer(ctx, containerID, true); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate fallback remove failed", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 		// Wait briefly for name release
 		time.Sleep(2 * time.Second)
 	} else {
 		oldRetired = true
-		_ = c.StopContainer(ctx, containerID, 10)
+		if err := c.StopContainer(ctx, containerID, 10); err != nil {
+			slog.WarnContext(ctx, "graceful-recreate failed to stop retired container", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 	}
 
 	// restoreOld brings the retired old container back under the original name.
@@ -688,9 +700,15 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 			return
 		}
 		if renameErr := c.cli.ContainerRename(ctx, containerID, originalName); renameErr != nil {
-			log.Printf("graceful-recreate: rollback rename %s -> %s failed: %v", retiredName, originalName, renameErr)
+			slog.ErrorContext(ctx, "graceful-recreate rollback rename failed", "component", "graceful-recreate",
+				"container", originalName, "from", retiredName, "error", renameErr)
 		}
-		_ = c.StartContainer(ctx, containerID)
+		// A failure here leaves the old container stopped with nothing serving
+		// in its place.
+		if err := c.StartContainer(ctx, containerID); err != nil {
+			slog.ErrorContext(ctx, "graceful-recreate rollback failed to start old container", "component", "graceful-recreate",
+				"container", originalName, "container_id", containerID, "error", err)
+		}
 	}
 	// removeOld disposes of the retired old container once the swap succeeded.
 	removeOld := func() {
@@ -699,8 +717,12 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 		}
 		go func() {
 			defer telemetry.Recover("docker.remove_retired", nil)
-			if err := c.RemoveContainer(context.Background(), containerID, true); err != nil {
-				log.Printf("docker: failed to remove retired container %s: %v", containerID, err)
+			// WithoutCancel: the removal outlives the recreate call, but keeps
+			// its context values for log correlation.
+			bg := context.WithoutCancel(ctx)
+			if err := c.RemoveContainer(bg, containerID, true); err != nil {
+				slog.ErrorContext(bg, "docker failed to remove retired container", "component", "docker",
+					"container_id", containerID, "error", err)
 			}
 		}()
 	}
@@ -758,7 +780,8 @@ func (c *Client) GracefulRecreate(ctx context.Context, containerID string, newIm
 	// Step 5: No port bindings — just rename the temp container
 	if err := c.cli.ContainerRename(ctx, resp.ID, originalName); err != nil {
 		// Rename failed — container is running with temp name, not critical
-		log.Printf("warning: failed to rename %s to %s: %v", tempName, originalName, err)
+		slog.WarnContext(ctx, "docker rename failed, container running with temp name", "component", "docker",
+			"container", originalName, "from", tempName, "error", err)
 	}
 
 	// Temp (now canonical) container is running — dispose of the retired old.

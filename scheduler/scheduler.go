@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/aidenappl/lattice-runner/telemetry"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +48,8 @@ func (s *Scheduler) UpdateSchedule(job Job) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.jobs[job.InstanceID] = &job
-	log.Printf("scheduler: updated schedule for instance %d: %s", job.InstanceID, job.Cron)
+	slog.InfoContext(context.Background(), "scheduler updated schedule", "component", "scheduler",
+		"instance_id", job.InstanceID, "cron", job.Cron)
 }
 
 // RemoveSchedule removes a scheduled job.
@@ -56,7 +57,7 @@ func (s *Scheduler) RemoveSchedule(instanceID int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.jobs, instanceID)
-	log.Printf("scheduler: removed schedule for instance %d", instanceID)
+	slog.InfoContext(context.Background(), "scheduler removed schedule", "component", "scheduler", "instance_id", instanceID)
 }
 
 // Run starts the scheduler loop. It re-aligns to the next minute boundary on
@@ -91,7 +92,8 @@ func (s *Scheduler) checkAndFire() {
 	for _, job := range toFire {
 		j := job
 		if _, loaded := s.inflight.LoadOrStore(j.InstanceID, true); loaded {
-			log.Printf("scheduler: skipping instance %d, previous snapshot still running", j.InstanceID)
+			slog.WarnContext(context.Background(), "scheduler skipping instance, previous snapshot still running", "component", "scheduler",
+				"instance_id", j.InstanceID)
 			continue
 		}
 		go func() {
@@ -108,7 +110,8 @@ func (s *Scheduler) checkAndFire() {
 func cronMatches(expr string, t time.Time) bool {
 	fields := strings.Fields(expr)
 	if len(fields) != 5 {
-		log.Printf("scheduler: invalid cron expression (expected 5 fields): %q", expr)
+		slog.ErrorContext(context.Background(), "scheduler invalid cron expression (expected 5 fields)", "component", "scheduler",
+			"cron", expr)
 		return false
 	}
 
@@ -134,7 +137,8 @@ func cronMatches(expr string, t time.Time) bool {
 	for _, c := range checks {
 		matched, err := fieldMatches(c.field, c.value, c.min, c.max)
 		if err != nil {
-			log.Printf("scheduler: error parsing cron field %q: %v", c.field, err)
+			slog.ErrorContext(context.Background(), "scheduler error parsing cron field", "component", "scheduler",
+				"cron", expr, "field", c.field, "error", err)
 			return false
 		}
 		if !matched {

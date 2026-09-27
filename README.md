@@ -87,6 +87,7 @@ Loaded in `config/config.go`. Required variables cause a startup panic if missin
 | `MONITOR_API_KEY` | No | — | Ingest-scoped key minted on the appleby zone. |
 | `MONITOR_SPOOL_DIR` | No | `/opt/lattice-runner/monitor-spool` | Durable spool, so events wait out a Monitor outage or restart. Off when no ingest URL is set. |
 | `MONITOR_ZONE` / `MONITOR_ENV` | No | `appleby` / `production` | Expected zone (checked at boot) / event environment. |
+| `MONITOR_DEBUG` | No | `false` | Also log and ship debug records. Off, no debug event reaches Monitor. |
 | `LATTICE_URL` | No | — | Link to the orchestrator UI, shown on the dashboard. |
 | `ALLOW_INSECURE` | No | `false` | Permit an unencrypted `ws://` URL (local dev only). |
 
@@ -112,7 +113,7 @@ The binary itself has three modes: `lattice-runner` (start the daemon), `lattice
 main.go              # Entrypoint + the message-handler switch, heartbeat loop, graceful shutdown
 validate.go          # validContainerName — allow-list guard for orchestrator-supplied names
 config/config.go     # Config loading from env; enforces wss:// unless ALLOW_INSECURE
-telemetry/           # Monitor wiring: log tee, panic/crash reporting, spool (never a boot requirement)
+telemetry/           # Monitor wiring: slog handler (true call sites, warn limiter), panic/crash reporting, spool (never a boot requirement)
 client/websocket.go  # WebSocket client: auto-reconnect, read/write pumps, ping/pong, send buffer
 cmd/setup.go         # Interactive setup wizard + systemd install
 deploy/              # Deployment executor + rolling / blue-green / canary strategies, spec validation

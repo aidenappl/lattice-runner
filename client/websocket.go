@@ -3,8 +3,9 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"sync"
 	"time"
@@ -15,8 +16,13 @@ import (
 
 // Envelope is the standard message format from the orchestrator.
 type Envelope struct {
-	Type      string         `json:"type"`
-	CommandID string         `json:"command_id,omitempty"`
+	Type      string `json:"type"`
+	CommandID string `json:"command_id,omitempty"`
+	// RequestID and TraceID carry the orchestrator's correlation ids for the
+	// command. An older orchestrator omits them; the runner then behaves as
+	// it always has.
+	RequestID string         `json:"request_id,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
 	WorkerID  string         `json:"worker_id,omitempty"`
 	IssuedAt  *time.Time     `json:"issued_at,omitempty"`
 	Payload   map[string]any `json:"payload,omitempty"`
@@ -24,8 +30,13 @@ type Envelope struct {
 
 // OutgoingMessage is sent from the runner to the orchestrator.
 type OutgoingMessage struct {
-	Type      string         `json:"type"`
-	CommandID string         `json:"command_id,omitempty"`
+	Type      string `json:"type"`
+	CommandID string `json:"command_id,omitempty"`
+	// RequestID and TraceID echo the ids of the command a reply belongs to.
+	// Unsolicited messages (heartbeat, container_sync, metrics, logs) leave
+	// them empty.
+	RequestID string         `json:"request_id,omitempty"`
+	TraceID   string         `json:"trace_id,omitempty"`
 	Status    string         `json:"status,omitempty"`
 	Payload   map[string]any `json:"payload,omitempty"`
 }
@@ -40,6 +51,11 @@ type WSClient struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// dropsMu guards drops: messages dropped for want of queue room, by
+	// message type, since the last TakeDrops.
+	dropsMu sync.Mutex
+	drops   map[string]int64
 }
 
 func NewWSClient(orchestratorURL, token string, reconnectInterval time.Duration) *WSClient {
@@ -68,9 +84,30 @@ func (c *WSClient) SendJSON(v any) error {
 	case c.send <- b:
 		return nil
 	default:
-		log.Printf("ws: send queue full (%d/%d), dropping message", len(c.send), cap(c.send))
-		return fmt.Errorf("send queue full")
+		mt := messageType(b)
+		c.countDrop(mt)
+		slog.WarnContext(context.Background(), "ws send queue full, dropping message", "component", "ws",
+			"queue_len", len(c.send), "queue_cap", cap(c.send), "message_type", mt)
+		return ErrSendQueueFull
 	}
+}
+
+// ErrSendQueueFull is returned (wrapped, for SendJSONReliable) when a message is
+// dropped because the send queue had no room. The drop has already been logged
+// once, with the message type, so callers should not log it again.
+var ErrSendQueueFull = errors.New("send queue full")
+
+// messageType reads the "type" field of an encoded message for drop logs. Many
+// callers pass OutgoingMessage, but SendJSON accepts any value, so it is read
+// back from the JSON rather than type-asserted.
+func messageType(b []byte) string {
+	var m struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(b, &m) != nil || m.Type == "" {
+		return "untyped"
+	}
+	return m.Type
 }
 
 // SendJSONReliable enqueues a message, blocking until the send queue has room or
@@ -90,9 +127,42 @@ func (c *WSClient) SendJSONReliable(v any) error {
 	case c.send <- b:
 		return nil
 	case <-time.After(reliableSendTimeout):
-		log.Printf("ws: reliable send timed out after %v (queue %d/%d), dropping message", reliableSendTimeout, len(c.send), cap(c.send))
-		return fmt.Errorf("send queue full after %v", reliableSendTimeout)
+		mt := messageType(b)
+		c.countDrop(mt)
+		slog.WarnContext(context.Background(), "ws reliable send timed out, dropping message", "component", "ws",
+			"timeout_ms", reliableSendTimeout.Milliseconds(), "queue_len", len(c.send), "queue_cap", cap(c.send),
+			"message_type", mt)
+		return fmt.Errorf("%w after %v", ErrSendQueueFull, reliableSendTimeout)
 	}
+}
+
+// countDrop records one message of type msgType dropped for want of queue room.
+func (c *WSClient) countDrop(msgType string) {
+	c.dropsMu.Lock()
+	defer c.dropsMu.Unlock()
+	if c.drops == nil {
+		c.drops = map[string]int64{}
+	}
+	c.drops[msgType]++
+}
+
+// TakeDrops returns the messages dropped since the last call, by message type,
+// and starts counting afresh. The map is never nil.
+func (c *WSClient) TakeDrops() map[string]int64 {
+	c.dropsMu.Lock()
+	defer c.dropsMu.Unlock()
+	d := c.drops
+	c.drops = nil
+	if d == nil {
+		d = map[string]int64{}
+	}
+	return d
+}
+
+// QueueStats reports how many messages are waiting in the send queue and its
+// capacity.
+func (c *WSClient) QueueStats() (length, capacity int) {
+	return len(c.send), cap(c.send)
 }
 
 // reliableSendTimeout bounds how long SendJSONReliable waits for queue room.
@@ -108,8 +178,8 @@ func (c *WSClient) Connect(ctx context.Context) {
 		}
 
 		if err := c.dial(ctx); err != nil {
-			log.Printf("ws: connection failed, will reconnect: %v", err)
-			log.Printf("ws: reconnecting in %v...", c.reconnectInterval)
+			slog.WarnContext(ctx, "ws connection failed, will reconnect", "component", "ws", "error", err)
+			slog.InfoContext(ctx, "ws reconnecting", "component", "ws", "backoff", c.reconnectInterval.String())
 			select {
 			case <-time.After(c.reconnectInterval):
 			case <-ctx.Done():
@@ -118,9 +188,14 @@ func (c *WSClient) Connect(ctx context.Context) {
 			continue
 		}
 
-		log.Println("ws: connected to orchestrator")
+		slog.InfoContext(ctx, "ws connected to orchestrator", "component", "ws")
 		c.run(ctx)
-		log.Println("ws: disconnected from orchestrator")
+		// A disconnect caused by shutdown is expected; any other is a warning.
+		if ctx.Err() != nil {
+			slog.InfoContext(ctx, "ws disconnected from orchestrator", "component", "ws")
+		} else {
+			slog.WarnContext(ctx, "ws disconnected from orchestrator", "component", "ws")
+		}
 
 		select {
 		case <-time.After(c.reconnectInterval):
@@ -204,14 +279,14 @@ func (c *WSClient) readPump(ctx context.Context, cancel context.CancelFunc) {
 		_, payload, err := c.conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("ws: read error, will reconnect: %v", err)
+				slog.WarnContext(ctx, "ws read error, will reconnect", "component", "ws", "error", err)
 			}
 			return
 		}
 
 		var env Envelope
 		if err := json.Unmarshal(payload, &env); err != nil {
-			log.Printf("ws: invalid json from orchestrator: %v", err)
+			slog.WarnContext(ctx, "ws invalid json from orchestrator", "component", "ws", "error", err)
 			continue
 		}
 
@@ -240,7 +315,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.TextMessage, msg)
 			c.mu.Unlock()
 			if err != nil {
-				log.Printf("ws: write error: %v", err)
+				slog.WarnContext(ctx, "ws write error, will reconnect", "component", "ws", "error", err)
 				return
 			}
 
@@ -254,6 +329,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.PingMessage, nil)
 			c.mu.Unlock()
 			if err != nil {
+				slog.WarnContext(ctx, "ws ping write error, will reconnect", "component", "ws", "error", err)
 				return
 			}
 		}
