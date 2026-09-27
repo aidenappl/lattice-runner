@@ -1,6 +1,15 @@
 package docker
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/docker/docker/client"
+)
 
 func TestCanonicalContainerName(t *testing.T) {
 	tests := []struct {
@@ -33,5 +42,61 @@ func TestCanonicalContainerName(t *testing.T) {
 				t.Errorf("CanonicalContainerName(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+// fakeDockerLogs serves the container logs endpoint with a fixed status, so the
+// real Docker SDK error mapping (errdefs) is exercised end to end.
+func fakeDockerLogs(t *testing.T, status int) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"message":"No such container: 0a61bb2068c9"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	cli, err := client.NewClientWithOpts(
+		client.WithHost("tcp://"+strings.TrimPrefix(srv.URL, "http://")),
+		client.WithHTTPClient(srv.Client()),
+		client.WithVersion("1.45"),
+	)
+	if err != nil {
+		t.Fatalf("docker client: %v", err)
+	}
+	return &Client{cli: cli}
+}
+
+func TestDoStreamReportsGoneContainer(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		wantGone bool
+	}{
+		{"removed container", http.StatusNotFound, true},
+		{"daemon error is retryable", http.StatusInternalServerError, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ls := NewLogStreamer(fakeDockerLogs(t, tt.status), func(LogLine) {}, time.Hour)
+			_, gone := ls.doStream(context.Background(), "0a61bb2068c9", "trailblaze-auth-v2", time.Time{})
+			if gone != tt.wantGone {
+				t.Errorf("gone = %v, want %v", gone, tt.wantGone)
+			}
+		})
+	}
+}
+
+// A removed container must end its stream goroutine immediately rather than
+// backing off and retrying an ID that can never come back.
+func TestStreamExitsWhenContainerRemoved(t *testing.T) {
+	ls := NewLogStreamer(fakeDockerLogs(t, http.StatusNotFound), func(LogLine) {}, time.Hour)
+	done := make(chan struct{})
+	go ls.stream(context.Background(), "0a61bb2068c9", "trailblaze-auth-v2", done)
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("stream kept retrying a removed container (first backoff is 1s)")
 	}
 }

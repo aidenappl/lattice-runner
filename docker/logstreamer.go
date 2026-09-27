@@ -12,6 +12,7 @@ import (
 
 	monitor "github.com/aidenappl/go-monitor"
 	"github.com/aidenappl/lattice-runner/telemetry"
+	"github.com/docker/docker/errdefs"
 )
 
 // LogLine represents a single log line from a container.
@@ -167,7 +168,7 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 	const maxBackoff = 30 * time.Second
 
 	for {
-		lastSeen := ls.doStream(ctx, containerID, containerName, since)
+		lastSeen, gone := ls.doStream(ctx, containerID, containerName, since)
 		if !lastSeen.IsZero() {
 			since = lastSeen
 			// Reset backoff on successful stream that produced data
@@ -176,6 +177,14 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 
 		// Context was cancelled — sync() stopped tracking this container.
 		if ctx.Err() != nil {
+			return
+		}
+
+		// The container no longer exists — a graceful recreate or rolling
+		// deploy removed it between sync ticks. Retrying an ID that can never
+		// come back only produces noise; exit and let the next sync() pick up
+		// whatever replaced it (closing done tells sync() to drop this entry).
+		if gone {
 			return
 		}
 
@@ -199,10 +208,18 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 
 // doStream opens the Docker log stream for one container and reads until it
 // closes or the context is cancelled. Returns the timestamp of the last line
-// received so the caller can avoid replaying historical lines on reconnect.
-func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string, since time.Time) (lastSeen time.Time) {
+// received so the caller can avoid replaying historical lines on reconnect, and
+// gone=true when Docker reports the container no longer exists.
+func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string, since time.Time) (lastSeen time.Time, gone bool) {
 	reader, err := ls.docker.StreamContainerLogs(ctx, containerID, since)
 	if err != nil {
+		if errdefs.IsNotFound(err) {
+			// Expected during every graceful recreate: the old (or temporary
+			// health-check) container is removed before sync() notices.
+			slog.DebugContext(ctx, "logstreamer container removed, stopping log stream", "component", "logstreamer",
+				"container", containerName, "container_id", containerID)
+			return lastSeen, true
+		}
 		if ctx.Err() == nil {
 			slog.WarnContext(ctx, "logstreamer failed to open log stream, will retry", "component", "logstreamer",
 				"container", containerName, "error", err)
@@ -247,7 +264,7 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 		if size > maxLogLineSize {
 			// Skip oversized log line
 			if _, err := io.CopyN(io.Discard, bufReader, int64(size)); err != nil {
-				return lastSeen
+				return lastSeen, false
 			}
 			continue
 		}
