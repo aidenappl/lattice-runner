@@ -112,7 +112,7 @@ func parseLine(line string) (caller, component, msg string) {
 var (
 	// softFailure is an error the code already handles — a retry, a fallback.
 	// Checked first: these lines usually contain the word "failed" too.
-	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate)`)
+	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate|will reconnect)`)
 	hardFailure = regexp.MustCompile(`(?i)\b(fail|failed|failure|fails|error|errors|cannot|can't|unable|refused|fatal|corrupt)\b`)
 	caution     = regexp.MustCompile(`(?i)\b(invalid|rejected|not found|orphan|orphaned|timed out|timeout|full|dropped|denied|missing|warning|stale|offline|disconnected)\b`)
 )

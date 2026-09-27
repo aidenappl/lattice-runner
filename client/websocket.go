@@ -108,7 +108,7 @@ func (c *WSClient) Connect(ctx context.Context) {
 		}
 
 		if err := c.dial(ctx); err != nil {
-			log.Printf("ws: connection failed: %v", err)
+			log.Printf("ws: connection failed, will reconnect: %v", err)
 			log.Printf("ws: reconnecting in %v...", c.reconnectInterval)
 			select {
 			case <-time.After(c.reconnectInterval):
@@ -204,7 +204,7 @@ func (c *WSClient) readPump(ctx context.Context, cancel context.CancelFunc) {
 		_, payload, err := c.conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("ws: read error: %v", err)
+				log.Printf("ws: read error, will reconnect: %v", err)
 			}
 			return
 		}

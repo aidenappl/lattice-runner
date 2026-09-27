@@ -37,6 +37,8 @@ func TestClassify(t *testing.T) {
 		{"deploy: network edge may already exist: Error response from daemon", monitor.LevelWarn},
 		{"invalid deploy spec: missing stack", monitor.LevelWarn},
 		{"ws: send queue full", monitor.LevelWarn},
+		{"ws: read error, will reconnect: websocket: close 1006 (abnormal closure): unexpected EOF", monitor.LevelWarn},
+		{"ws: connection failed, will reconnect: dial: read tcp 10.0.0.1:1->10.0.0.2:443: i/o timeout", monitor.LevelWarn},
 		{"deploy: pulling image registry.appleby.cloud/web:latest", monitor.LevelInfo},
 		{"db_snapshot: snapshot completed for pg (size=1024 bytes)", monitor.LevelInfo},
 	}
