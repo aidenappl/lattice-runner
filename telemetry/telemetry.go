@@ -112,9 +112,15 @@ func parseLine(line string) (caller, component, msg string) {
 var (
 	// softFailure is an error the code already handles — a retry, a fallback.
 	// Checked first: these lines usually contain the word "failed" too.
-	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate|will reconnect)`)
-	hardFailure = regexp.MustCompile(`(?i)\b(fail|failed|failure|fails|error|errors|cannot|can't|unable|refused|fatal|corrupt)\b`)
-	caution     = regexp.MustCompile(`(?i)\b(invalid|rejected|not found|orphan|orphaned|timed out|timeout|full|dropped|denied|missing|warning|stale|offline|disconnected)\b`)
+	softFailure = regexp.MustCompile(`(?i)(\battempt \d+|\bretry|\bretrying|trying kill|falling back|may already exist|already absent|will be orphaned|stopping in place|skipping|ignoring duplicate|will reconnect|proceeding)`)
+	// "aborted"/"refusing" are the runner's words for a failure it stopped on
+	// deliberately (e.g. an upgrade whose script hash does not match).
+	hardFailure = regexp.MustCompile(`(?i)\b(fail|failed|failure|fails|error|errors|cannot|can't|unable|refused|fatal|corrupt|aborted|refusing)\b`)
+	// "could not be stopped/started" is the stop_all/start_all summary when
+	// some containers failed: each failure is already logged at error, so the
+	// summary is a warning rather than a second error. It is matched as an exact
+	// phrase so no other "could not …" line changes level.
+	caution = regexp.MustCompile(`(?i)\b(invalid|rejected|not found|orphan|orphaned|timed out|timeout|full|dropped|denied|missing|warning|stale|offline|disconnected|rejecting|could not be stopped|could not be started)\b`)
 )
 
 // classify picks a level for a line that was written without one. Only error
@@ -133,11 +139,20 @@ func classify(msg string) string {
 	}
 }
 
+// panicReportLine matches only the runner's own panic log lines, which are
+// always written as "[<goroutine>] PANIC…: <value>\n<stack>" next to a
+// ReportPanic/ReportCrash call (Recover, safeGo, safeGoResilient and the message
+// handler). The goroutine name may contain ':' ("handler:deploy"), which
+// bracketComponent does not strip, so the bracket is matched here. Anything else
+// mentioning PANIC — e.g. Postgres stderr "PANIC: …" — has no goroutine stack
+// and is a real log line that must still be emitted.
+var panicReportLine = regexp.MustCompile(`(?s)^(?:\[[^\]\n]+\] )?PANIC\b.*?\ngoroutine \d+ \[`)
+
 func emitLogLine(line string) {
 	caller, component, msg := parseLine(line)
 	// Panics are reported with their stack by ReportPanic; the log line that
 	// accompanies one would be a second, poorer copy.
-	if strings.TrimSpace(msg) == "" || strings.Contains(msg, "PANIC") {
+	if strings.TrimSpace(msg) == "" || panicReportLine.MatchString(msg) {
 		return
 	}
 	level := classify(msg)
@@ -150,6 +165,16 @@ func emitLogLine(line string) {
 		"component": component,
 		"caller":    caller,
 	})
+}
+
+// Event sends one event at an explicit level, stamped with the worker like
+// every other runner event. Use it where a log line would be misclassified or
+// would carry data (script output, IDs) that belongs in a field.
+func Event(level, name string, data map[string]any) {
+	if data == nil {
+		data = map[string]any{}
+	}
+	emit(level, name, data)
 }
 
 // emit stamps the worker on every event the runner sends.

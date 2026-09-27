@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	monitor "github.com/aidenappl/go-monitor"
 	"github.com/aidenappl/lattice-runner/backup"
 	"github.com/aidenappl/lattice-runner/client"
 	"github.com/aidenappl/lattice-runner/cmd"
@@ -47,9 +49,39 @@ var (
 	lastRebootMu   sync.Mutex
 )
 
+// upgradeOutputTailBytes bounds the script/curl output kept with an upgrade
+// failure, in the Monitor event and in the stderr copy.
+const upgradeOutputTailBytes = 4096
+
+// outputTail returns at most the last n bytes of b.
+func outputTail(b []byte, n int) []byte {
+	if len(b) > n {
+		return b[len(b)-n:]
+	}
+	return b
+}
+
+// reportUpgradeFailure records an upgrade failure exactly once in Monitor: one
+// error event with fixed text and the output tail in a field. The human-readable
+// line goes straight to stderr (journald) rather than through log.Printf, because
+// the log tee would turn it into a second error event — a second issue — without
+// the output.
+func reportUpgradeFailure(event, msg string, err error, out []byte) {
+	tail := outputTail(out, upgradeOutputTailBytes)
+	fmt.Fprintf(os.Stderr, "%s %s: %v (output %d bytes)\n%s\n", time.Now().Format("2006/01/02 15:04:05"), msg, err, len(out), tail)
+	telemetry.Event(monitor.LevelError, event, map[string]any{
+		"message":      msg,
+		"error":        err.Error(),
+		"output":       string(tail),
+		"output_bytes": len(out),
+	})
+}
+
 // wsSend sends a JSON message over the WebSocket and logs any failure.
 func wsSend(ws *client.WSClient, msgType string, payload interface{}) {
-	if err := ws.SendJSON(payload); err != nil {
+	// A queue-full drop is already logged once, at warn, with its type by
+	// SendJSON; only other failures (e.g. marshal errors) are logged here.
+	if err := ws.SendJSON(payload); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
 		log.Printf("ws send [%s] failed: %v", msgType, err)
 	}
 }
@@ -58,7 +90,9 @@ func wsSend(ws *client.WSClient, msgType string, payload interface{}) {
 // on. Unlike wsSend it waits for queue room (up to the timeout) instead of
 // dropping immediately when the queue is momentarily full under a telemetry burst.
 func wsSendReliable(ws *client.WSClient, msgType string, payload interface{}) {
-	if err := ws.SendJSONReliable(payload); err != nil {
+	// The timeout drop is already logged once, at warn, with its type by
+	// SendJSONReliable; only other failures are logged here.
+	if err := ws.SendJSONReliable(payload); err != nil && !errors.Is(err, client.ErrSendQueueFull) {
 		log.Printf("ws reliable send [%s] failed: %v", msgType, err)
 	}
 }
@@ -1142,13 +1176,18 @@ func main() {
 				// Download to temp file
 				dlCmd := exec.CommandContext(ctx, "curl", "-fsSL", "-o", tmpFile, upgradeURL)
 				if dlOut, dlErr := dlCmd.CombinedOutput(); dlErr != nil {
-					log.Printf("upgrade download failed: %v — %s", dlErr, string(dlOut))
+					reportUpgradeFailure("runner.upgrade.download_failed", "upgrade download failed", dlErr, dlOut)
+					// Include curl's output (e.g. "curl: (22) ... 404") so the dashboard shows why
+					dlMsg := fmt.Sprintf("upgrade download failed: %v", dlErr)
+					if dlOutput := string(outputTail(dlOut, 1000)); dlOutput != "" {
+						dlMsg = fmt.Sprintf("upgrade download failed: %v\n%s", dlErr, dlOutput)
+					}
 					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
 							"action":  "upgrade_runner",
 							"status":  "failed",
-							"message": fmt.Sprintf("upgrade download failed: %v", dlErr),
+							"message": dlMsg,
 						},
 					})
 					return
@@ -1190,7 +1229,7 @@ func main() {
 				_ = os.Chmod(tmpFile, 0755)
 				out, err := exec.CommandContext(ctx, "bash", tmpFile).CombinedOutput()
 				if err != nil {
-					log.Printf("upgrade failed: %v — %s", err, string(out))
+					reportUpgradeFailure("runner.upgrade.failed", "upgrade failed", err, out)
 					// Include truncated script output so the dashboard shows the real error
 					scriptOutput := string(out)
 					if len(scriptOutput) > 1000 {
@@ -1209,7 +1248,9 @@ func main() {
 						},
 					})
 				} else {
-					log.Printf("upgrade completed: %s", string(out))
+					// Fixed text: the script output contains words like "errors" (e.g.
+					// github.com/pkg/errors) that the log classifier would read as a failure.
+					log.Printf("upgrade completed; runner will restart via systemd (output %d bytes)", len(out))
 					wsSend(ws, "worker_action_status", client.OutgoingMessage{
 						Type: "worker_action_status",
 						Payload: map[string]any{
@@ -1268,7 +1309,14 @@ func main() {
 						}
 					}
 				}
-				log.Printf("stop_all complete: stopped=%d failed=%d", stopped, failed)
+				// No "failed" in the summary: each failure is already logged at error
+				// above, so the summary is info when all succeeded and warn otherwise
+				// ("could not be stopped" is a caution token in telemetry.classify).
+				if failed == 0 {
+					log.Printf("stop_all complete: %d stopped, all succeeded", stopped)
+				} else {
+					log.Printf("stop_all complete: %d stopped, %d could not be stopped", stopped, failed)
+				}
 				_ = ws.SendJSON(client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
@@ -1326,7 +1374,12 @@ func main() {
 						}
 					}
 				}
-				log.Printf("start_all complete: started=%d failed=%d", started, failed)
+				// See stop_all: info when all succeeded, warn otherwise.
+				if failed == 0 {
+					log.Printf("start_all complete: %d started, all succeeded", started)
+				} else {
+					log.Printf("start_all complete: %d started, %d could not be started", started, failed)
+				}
 				_ = ws.SendJSON(client.OutgoingMessage{
 					Type: "worker_action_status",
 					Payload: map[string]any{
@@ -3140,7 +3193,7 @@ func handleScheduledSnapshot(ws *client.WSClient, docker *dockerclient.Client, j
 	// worker: no lifecycle log, no event, no failed row, nothing in Monitor —
 	// which is how a schedule that never once produced a backup went unnoticed.
 	failPreflight := func(reason string) {
-		log.Printf("scheduled snapshot for instance %d: %s", job.InstanceID, reason)
+		log.Printf("scheduled snapshot for instance %d failed preflight: %s", job.InstanceID, reason)
 		sendLifecycleLog(ws, containerName, "db_snapshot", "scheduled snapshot could not start: "+reason)
 		sendDbReply(ws, scheduledEnv(job.InstanceID), "db_snapshot_status", map[string]any{
 			"filename":       filename,

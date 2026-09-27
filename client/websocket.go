@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -68,9 +69,27 @@ func (c *WSClient) SendJSON(v any) error {
 	case c.send <- b:
 		return nil
 	default:
-		log.Printf("ws: send queue full (%d/%d), dropping message", len(c.send), cap(c.send))
-		return fmt.Errorf("send queue full")
+		log.Printf("ws: send queue full (%d/%d), dropping %s message", len(c.send), cap(c.send), messageType(b))
+		return ErrSendQueueFull
 	}
+}
+
+// ErrSendQueueFull is returned (wrapped, for SendJSONReliable) when a message is
+// dropped because the send queue had no room. The drop has already been logged
+// once, with the message type, so callers should not log it again.
+var ErrSendQueueFull = errors.New("send queue full")
+
+// messageType reads the "type" field of an encoded message for drop logs. Many
+// callers pass OutgoingMessage, but SendJSON accepts any value, so it is read
+// back from the JSON rather than type-asserted.
+func messageType(b []byte) string {
+	var m struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(b, &m) != nil || m.Type == "" {
+		return "untyped"
+	}
+	return m.Type
 }
 
 // SendJSONReliable enqueues a message, blocking until the send queue has room or
@@ -90,8 +109,8 @@ func (c *WSClient) SendJSONReliable(v any) error {
 	case c.send <- b:
 		return nil
 	case <-time.After(reliableSendTimeout):
-		log.Printf("ws: reliable send timed out after %v (queue %d/%d), dropping message", reliableSendTimeout, len(c.send), cap(c.send))
-		return fmt.Errorf("send queue full after %v", reliableSendTimeout)
+		log.Printf("ws: reliable send timed out after %v (queue %d/%d), dropping %s message", reliableSendTimeout, len(c.send), cap(c.send), messageType(b))
+		return fmt.Errorf("%w after %v", ErrSendQueueFull, reliableSendTimeout)
 	}
 }
 
@@ -240,7 +259,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.TextMessage, msg)
 			c.mu.Unlock()
 			if err != nil {
-				log.Printf("ws: write error: %v", err)
+				log.Printf("ws: write error, will reconnect: %v", err)
 				return
 			}
 
@@ -254,6 +273,7 @@ func (c *WSClient) writePump(ctx context.Context) {
 			err := c.conn.WriteMessage(websocket.PingMessage, nil)
 			c.mu.Unlock()
 			if err != nil {
+				log.Printf("ws: ping write error, will reconnect: %v", err)
 				return
 			}
 		}
