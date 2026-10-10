@@ -391,8 +391,15 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 		e.reportProgress(spec.DeploymentID, "deploying",
 			fmt.Sprintf("rollback: restoring %s to %s", snap.Name, snap.OldImage), nil)
 
-		// Pull old image
-		if err := e.Docker.PullImage(ctx, snap.OldImage, nil); err != nil {
+		// Pull old image — same registry as the forward pull, so reuse its credentials
+		var regAuth *dockerclient.RegistryAuth
+		if cSpec.RegistryAuth != nil {
+			regAuth = &dockerclient.RegistryAuth{
+				Username: cSpec.RegistryAuth.Username,
+				Password: cSpec.RegistryAuth.Password,
+			}
+		}
+		if err := e.Docker.PullImage(ctx, snap.OldImage, regAuth); err != nil {
 			slog.ErrorContext(ctx, "deploy rollback pull failed", "component", "deploy", "deployment_id", spec.DeploymentID, "stack", spec.StackName,
 				"container", snap.Name, "image", snap.OldImage, "error", err)
 		}
