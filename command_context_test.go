@@ -43,10 +43,22 @@ func wsHarness(t *testing.T) (*client.WSClient, func() (client.OutgoingMessage, 
 	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	ws := client.NewWSClient("ws"+strings.TrimPrefix(srv.URL, "http"), "token", 50*time.Millisecond)
-	go ws.Connect(ctx)
+	// Connect logs "ws disconnected from orchestrator" on its way out. Wait for
+	// it before the test ends, or that record lands in whichever later test has
+	// swapped in a capturing slog default (flaky "logged 2 records, want 1").
+	connected := make(chan struct{})
+	go func() {
+		defer close(connected)
+		ws.Connect(ctx)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		ws.Close()
+		select {
+		case <-connected:
+		case <-time.After(5 * time.Second):
+			t.Error("ws.Connect did not return after cancel")
+		}
 		srv.Close()
 	})
 	next := func() (client.OutgoingMessage, []byte) {
