@@ -775,7 +775,9 @@ writes these.
   line also reaches Monitor. The SDK redacts credential-shaped values; don't rely on it.
 - **Every handler must reply.** Emit a `*_status`/`worker_action_status` on both success and
   failure so the dashboard reflects reality.
-- **Respect the global guardrails:** never push/deploy without explicit instruction, never modify
+- **Respect the global guardrails:** commit, push, merge and deploy **only after asking Aiden and
+  getting an explicit yes** for that specific action (see `~/CLAUDE.md` *Ask-first actions*);
+  **never** amend, rebase, force-push, or run destructive git ops; never modify
   `Dockerfile`/CI/compose unless asked, never create/modify `.env`.
 - **`upgrade_runner` must keep verifying the script hash** — dropping the SHA-256 check turns a
   worker into a remote-code-execution target. It **fails closed**: a missing/empty `expected_hash`
