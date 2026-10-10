@@ -145,7 +145,8 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 			// 1. Start a probe container WITHOUT ports to verify the image works
 			// 2. Only then stop the old container and recreate with ports
 			// This prevents leaving nothing running if the new image fails.
-			if len(portMappings) > 0 && len(oldContainers) > 0 {
+			// Containers with volumes skip the probe (see shouldProbe).
+			if shouldProbe(len(portMappings), len(oldContainers), len(dockerSpec.Volumes)) {
 				probeName := deployName + "-probe"
 				probeSpec := dockerSpec
 				probeSpec.Name = probeName
@@ -278,6 +279,18 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 	}
 
 	return nil
+}
+
+// shouldProbe reports whether a rolling deploy should start a port-less probe
+// container before swapping. The probe runs while the old container is still up,
+// so it only applies when the new container has host ports to free and a
+// predecessor to replace. Containers with volumes skip it: the probe would mount
+// the live data directory alongside the running server, and stateful images
+// (ClickHouse, MariaDB, Postgres) lock that directory and exit, failing every
+// deploy. They take the stop-then-create path instead, which still verifies the
+// new container is running and restores the predecessor on failure.
+func shouldProbe(portMappings, oldContainers, volumes int) bool {
+	return portMappings > 0 && oldContainers > 0 && volumes == 0
 }
 
 // appendIdx returns a new slice with idx appended, without mutating base. Used to

@@ -369,6 +369,11 @@ carries a `DeploymentSpec`. `Executor.Execute` (in `deploy/executor.go`):
    - **rolling** (`rolling.go`, default): per container, pull the new image, create it under a
      `<name>-<6charsuffix>` temp name, health-gate it, then stop/remove the old and rename the new
      to the canonical name. Keeps snapshots to `rollbackContainers` on failure; cleans up orphans.
+     A container with host ports and a predecessor first gets a port-less `-probe` container
+     (2s "does it stay up" check) before the old one is stopped. **Containers with volumes skip the
+     probe** (`shouldProbe`): it would mount the live data directory next to the running server, and
+     stateful images (ClickHouse, MariaDB, Postgres) lock it and exit, failing every deploy. They go
+     stop-then-create, still covered by the post-create running check and rollback.
    - **blue-green** (`bluegreen.go`): start all "green" containers *without* host port bindings
      **and without the canonical `NetworkAliases`** (blue is still live under those aliases — sharing
      them would make Docker's embedded DNS round-robin the service name onto the not-yet-ready green),

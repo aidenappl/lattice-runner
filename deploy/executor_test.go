@@ -307,3 +307,24 @@ func TestCleanupDecisionRemovesStaleStackContainers(t *testing.T) {
 		}
 	})
 }
+
+func TestShouldProbe(t *testing.T) {
+	tests := []struct {
+		name                          string
+		ports, oldContainers, volumes int
+		want                          bool
+	}{
+		{"ports and predecessor, no volumes", 2, 1, 0, true},
+		{"stateful container with volumes", 2, 1, 2, false},
+		{"no host ports", 0, 1, 0, false},
+		{"first deploy, no predecessor", 2, 0, 0, false},
+		{"volumes without ports", 0, 1, 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldProbe(tt.ports, tt.oldContainers, tt.volumes); got != tt.want {
+				t.Errorf("shouldProbe(%d, %d, %d) = %v, want %v", tt.ports, tt.oldContainers, tt.volumes, got, tt.want)
+			}
+		})
+	}
+}
