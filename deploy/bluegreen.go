@@ -45,6 +45,13 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 			return fmt.Errorf("pull image %s: %w", imageRef, err)
 		}
 
+		if !needsGreen(cSpec) {
+			e.reportProgress(spec.DeploymentID, "deploying",
+				fmt.Sprintf("[%d/%d] %s has volumes: no green copy, it is replaced in place at the swap", i+1, len(spec.Containers), cSpec.Name),
+				map[string]any{"container_name": cSpec.Name, "step": "in_place"})
+			continue
+		}
+
 		for replica := 0; replica < replicas; replica++ {
 			name := cSpec.Name
 			if replicas > 1 {
@@ -79,6 +86,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				NetworkAliases: nil,
 				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
+				Ulimits:        convertUlimits(cSpec.Ulimits),
 			}
 
 			containerID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
@@ -213,6 +221,7 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 				NetworkAliases: cSpec.NetworkAliases,
 				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
+				Ulimits:        convertUlimits(cSpec.Ulimits),
 			}
 
 			finalID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
@@ -272,6 +281,16 @@ func (e *Executor) executeBlueGreen(ctx context.Context, spec DeploymentSpec) er
 	}
 
 	return nil
+}
+
+// needsGreen reports whether blue-green should start a side-by-side green copy
+// of a container. Containers with volumes do not: green would mount the live
+// data directory next to blue, and stateful images (ClickHouse, MariaDB,
+// Postgres) lock it and exit — the rolling-probe failure in a different place.
+// They skip phases 1–2 and are replaced in place by phase 3, whose retire →
+// create → verify → restore-blue-on-failure sequence is the rollback.
+func needsGreen(c ContainerSpec) bool {
+	return len(c.Volumes) == 0
 }
 
 func (e *Executor) cleanupGreen(ctx context.Context, greenIDs map[string]string) {

@@ -99,6 +99,12 @@ func (c *Client) ServerVersion(ctx context.Context) (string, error) {
 	return info.Version, nil
 }
 
+// Ulimit is one container resource limit; -1 means unlimited.
+type Ulimit struct {
+	Name       string
+	Soft, Hard int64
+}
+
 // HealthCheck defines a container health check configuration.
 type HealthCheck struct {
 	Test        []string
@@ -118,6 +124,7 @@ type ContainerSpec struct {
 	Volumes        map[string]string // host:container
 	CPULimit       float64           // CPU cores
 	MemoryLimit    int64             // bytes
+	Ulimits        []Ulimit
 	RestartPolicy  string
 	Command        []string
 	Entrypoint     []string
@@ -301,6 +308,9 @@ func (c *Client) CreateAndStartContainer(ctx context.Context, spec ContainerSpec
 	}
 	if spec.MemoryLimit > 0 {
 		resources.Memory = spec.MemoryLimit
+	}
+	for _, u := range spec.Ulimits {
+		resources.Ulimits = append(resources.Ulimits, &container.Ulimit{Name: u.Name, Soft: u.Soft, Hard: u.Hard})
 	}
 
 	labels := map[string]string{"managed-by": "lattice"}

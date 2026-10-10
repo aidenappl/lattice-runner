@@ -88,6 +88,7 @@ type ContainerSpec struct {
 	Networks       []string          `json:"networks"`
 	NetworkAliases []string          `json:"network_aliases,omitempty"`
 	HealthCheck    *HealthCheck      `json:"health_check,omitempty"`
+	Ulimits        []Ulimit          `json:"ulimits,omitempty"`
 	RegistryAuth   *RegistryAuth     `json:"registry_auth,omitempty"`
 	DependsOn      []string          `json:"depends_on,omitempty"`
 }
@@ -619,6 +620,26 @@ func (e *Executor) reportProgress(deploymentID int, status, message string, extr
 		}
 		e.Progress(deploymentID, status, message, payload)
 	}
+}
+
+// Ulimit is one container resource limit (compose `ulimits`), e.g.
+// {name: nofile, soft: 262144, hard: 262144}. -1 means unlimited.
+type Ulimit struct {
+	Name string `json:"name"`
+	Soft int64  `json:"soft"`
+	Hard int64  `json:"hard"`
+}
+
+// convertUlimits converts deploy ulimits to docker ulimits.
+func convertUlimits(in []Ulimit) []dockerclient.Ulimit {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]dockerclient.Ulimit, len(in))
+	for i, u := range in {
+		out[i] = dockerclient.Ulimit{Name: u.Name, Soft: u.Soft, Hard: u.Hard}
+	}
+	return out
 }
 
 // convertHealthCheck converts a deploy HealthCheck to a docker HealthCheck.

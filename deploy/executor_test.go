@@ -328,3 +328,38 @@ func TestShouldProbe(t *testing.T) {
 		})
 	}
 }
+
+func TestNeedsGreen(t *testing.T) {
+	tests := []struct {
+		name string
+		spec ContainerSpec
+		want bool
+	}{
+		{"stateless", ContainerSpec{Name: "web"}, true},
+		{"stateful", ContainerSpec{Name: "db", Volumes: map[string]string{"db-data": "/var/lib/mysql"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := needsGreen(tt.spec); got != tt.want {
+				t.Errorf("needsGreen(%s) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+// The API sends ulimits as [{name, soft, hard}] (lattice-api specBuilder);
+// this pins the wire contract and the conversion to the docker spec.
+func TestContainerSpecUlimitsContract(t *testing.T) {
+	raw := `{"name":"monitor-clickhouse","image":"clickhouse/clickhouse-server","ulimits":[{"name":"nofile","soft":262144,"hard":262144},{"name":"memlock","soft":-1,"hard":-1}]}`
+	var c ContainerSpec
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatal(err)
+	}
+	got := convertUlimits(c.Ulimits)
+	if len(got) != 2 || got[0].Name != "nofile" || got[0].Soft != 262144 || got[0].Hard != 262144 || got[1].Soft != -1 {
+		t.Errorf("convertUlimits = %+v", got)
+	}
+	if convertUlimits(nil) != nil {
+		t.Error("no ulimits must stay nil so the daemon defaults apply")
+	}
+}

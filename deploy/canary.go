@@ -65,6 +65,7 @@ func (e *Executor) executeCanary(ctx context.Context, spec DeploymentSpec) error
 		NetworkAliases: canarySpec.NetworkAliases,
 		StackName:      spec.StackName,
 		HealthCheck:    convertHealthCheck(canarySpec.HealthCheck),
+		Ulimits:        convertUlimits(canarySpec.Ulimits),
 	}
 
 	canaryID, err := e.Docker.CreateAndStartContainer(ctx, dockerSpec)

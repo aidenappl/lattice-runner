@@ -379,6 +379,9 @@ carries a `DeploymentSpec`. `Executor.Execute` (in `deploy/executor.go`):
      them would make Docker's embedded DNS round-robin the service name onto the not-yet-ready green),
      health-check by container ID, then swap ports + canonical aliases over to green and retire the
      old ("blue").
+     **Containers with volumes get no green copy** (`needsGreen`): green would mount the live data
+     dir beside blue and stateful images lock it and exit. They skip the green/health phases and are
+     replaced in place by the swap phase (retire blue → create → verify → restore blue on failure).
    - **canary** (`canary.go`): start one `<name>-canary`, monitor for ~30s; if healthy, proceed as
      a rolling deploy; otherwise abort.
 7. `postDeployVerify` — 6 checks at 10s intervals (60s). Flags containers that vanished, are stuck
@@ -391,6 +394,11 @@ serializes **by stack name**: a duplicate of the same `deployment_id` is rejecte
 `deploying` OR in the ~60s `validating` window (tracked by an `InProgress` flag, not just
 `Status=="deploying"`), and a *different* `deployment_id` targeting a stack that already has an
 in-flight deployment is rejected with a `deployment_progress{status:"failed"}` reply.
+
+**Container `ulimits`** (v1.3.2+): the deploy spec's `ulimits: [{name, soft, hard}]` (from
+  lattice-api's `specBuilder`; -1 = unlimited) is set as `HostConfig.Resources.Ulimits` by
+  `CreateAndStartContainer`, in every strategy and in rolling's rollback. `GracefulRecreate` copies the
+  inspected `HostConfig`, so recreates keep them. Absent or empty means Docker's defaults.
 
 **Partial-failure safety in the strategies** (all three keep the previous container recoverable
 until the replacement is verified):

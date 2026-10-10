@@ -137,6 +137,7 @@ func (e *Executor) executeRolling(ctx context.Context, spec DeploymentSpec) erro
 				NetworkAliases: cSpec.NetworkAliases,
 				StackName:      spec.StackName,
 				HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
+				Ulimits:        convertUlimits(cSpec.Ulimits),
 			}
 
 			var containerID string
@@ -440,6 +441,7 @@ func (e *Executor) rollbackContainers(ctx context.Context, spec DeploymentSpec, 
 			NetworkAliases: cSpec.NetworkAliases,
 			StackName:      spec.StackName,
 			HealthCheck:    convertHealthCheck(cSpec.HealthCheck),
+			Ulimits:        convertUlimits(cSpec.Ulimits),
 		}
 		containerID, createErr := e.Docker.CreateAndStartContainer(ctx, dockerSpec)
 		if createErr != nil {
