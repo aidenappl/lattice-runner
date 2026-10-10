@@ -117,7 +117,12 @@ fi
 CURRENT_VERSION=$($INSTALL_DIR/lattice-runner version 2>/dev/null || echo 'unknown')
 log "Current version: $CURRENT_VERSION"
 
-LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+# Resolve the newest vX.Y.Z tag over git rather than api.github.com: the REST
+# API allows 60 unauthenticated calls per hour per IP, so a fleet upgrade from
+# workers behind one public IP hits 403 partway through. git ls-remote is not
+# counted against that limit.
+LATEST_TAG=$(git ls-remote --tags --refs "https://github.com/${REPO}.git" 'v*' 2>/dev/null \
+    | awk -F/ '{print $3}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
 if [ -z "$LATEST_TAG" ]; then
     err "Could not determine latest release tag from GitHub."
 fi

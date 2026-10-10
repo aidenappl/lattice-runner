@@ -655,6 +655,9 @@ daemon on its host and the WebSocket to `lattice-api`. It does not import `go-fo
   `install/runner.sh` (pinned by its `TestInstallScriptRunnerUnit`). `deploy/update.sh` and the
   lattice-api upgrade path both rewrite an existing `Requires=` unit in place. `update.sh` does it
   *before* its "already on latest" exit, so it repairs an up-to-date worker too.
+- **Release-tag lookup:** `deploy/update.sh` and lattice-api's `install/runner.sh` resolve the latest
+  tag with `git ls-remote --tags` (newest `vX.Y.Z`), not `api.github.com`, whose 60 calls/hour/IP
+  unauthenticated limit 403'd a fleet upgrade from workers sharing an egress IP (Oct 2026).
 - **Logs/metrics:** `sudo journalctl -u lattice-runner -f` on the host. Lines read
   `file.go:NN: [LEVEL ]message key=value…` (no level word for info), e.g.
   `websocket.go:133: WARN ws connection failed, will reconnect component=ws error="…"`. Every log
