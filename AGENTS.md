@@ -663,6 +663,17 @@ daemon on its host and the WebSocket to `lattice-api`. It does not import `go-fo
   `install/runner.sh` (pinned by its `TestInstallScriptRunnerUnit`). `deploy/update.sh` and the
   lattice-api upgrade path both rewrite an existing `Requires=` unit in place. `update.sh` does it
   *before* its "already on latest" exit, so it repairs an up-to-date worker too.
+- **Network path to `lattice-api` (on-prem fleet):** workers keep
+  `ORCHESTRATOR_URL=wss://lattice-api.appleby.cloud/ws/worker`, but on the LAN that name resolves
+  through a **UniFi local DNS record** (`lattice-api.appleby.cloud → 10.15.10.71`, the TLS reverse
+  proxy that serves the `*.appleby.cloud` cert and forwards to lattice-api at
+  `orchestrator.onprem.appleby.cloud`, `10.15.10.219:8000`). Off the LAN the same name is a proxied
+  Cloudflare record. Before the override (Oct 2026) every worker hairpinned out through Cloudflare
+  and back in, and Cloudflare dropping the socket (`close 1006`, "CloudFlare WebSocket proxy
+  restarting") disconnected the whole fleet ~65 times a day. Do not point workers at
+  `orchestrator.onprem` directly: it is plain HTTP, so that needs `ALLOW_INSECURE=true` and sends
+  the token and deploy secrets in the clear. `LATTICE_URL` is only the dashboard link and does
+  not affect the connection. A runner re-resolves the name only when it reconnects.
 - **Release-tag lookup:** `deploy/update.sh` and lattice-api's `install/runner.sh` resolve the latest
   tag with `git ls-remote --tags` (newest `vX.Y.Z`), not `api.github.com`, whose 60 calls/hour/IP
   unauthenticated limit 403'd a fleet upgrade from workers sharing an egress IP (Oct 2026).
@@ -681,6 +692,10 @@ daemon on its host and the WebSocket to `lattice-api`. It does not import `go-fo
   and let `systemd` restart the new binary. A `reboot_os` message triggers `sudo reboot` (rate-limited
   to once per 5 min). Manual update: `curl -fsSL https://lattice-api.appleby.cloud/install/update.sh | bash`.
 - **Common failure modes:**
+  - *Every worker flaps at once* (`close 1006` / `replaced by a new connection` on the lattice-api
+    side, spread evenly across the fleet) — the network path, not the workers. Check
+    `dig +short lattice-api.appleby.cloud` on a worker returns `10.15.10.71`; if it returns
+    Cloudflare IPs the UniFi override is missing or the worker isn't using the gateway resolver.
   - *Worker shows offline / reconnect loop* — bad or revoked `WORKER_TOKEN`, wrong `ORCHESTRATOR_URL`,
     or the TLS proxy in front of `lattice-api` has an expired cert. The runner keeps retrying every
     `RECONNECT_INTERVAL`; check journald for `ws connection failed`.
