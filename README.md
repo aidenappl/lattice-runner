@@ -30,7 +30,7 @@ This runner depends only on the Docker daemon on its host and the WebSocket to `
 
 ## Tech stack
 
-- **Go 1.25** (see `go.mod`)
+- **Go 1.26** (see `go.mod`)
 - **gorilla/websocket** — the persistent outbound connection to the orchestrator
 - **Docker Engine API** (`docker/docker` SDK) — container/image/network/volume/exec management
 - **AWS SDK v2 · Google API + OAuth2 · `smbclient`** — S3, Google Drive, and Samba backup destinations
@@ -41,7 +41,7 @@ This runner depends only on the Docker daemon on its host and the WebSocket to `
 ### Prerequisites
 
 - **Docker** — `curl -fsSL https://get.docker.com | sh`
-- **Go 1.25+** — https://go.dev/dl/ (only needed to build from source)
+- **Go 1.26+** — https://go.dev/dl/ (only needed to build from source)
 - A **worker token** from the Lattice dashboard (*Workers → Add Worker*)
 
 ### Setup

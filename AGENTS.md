@@ -50,8 +50,8 @@ cron snapshots.
 
 ## Stack & dependencies
 
-- **Go 1.25** (`go.mod` declares `go 1.25.5`; builder image is `golang:1.25-alpine`). The README
-  still says "Go 1.24+" for the install prerequisite — treat `go.mod` as authoritative.
+- **Go 1.26** (`go.mod` declares `go 1.25.5`; builder image is `golang:1.26-alpine`). The README
+  still says "Go 1.26+" for the install prerequisite — treat `go.mod` as authoritative.
 - **`github.com/gorilla/websocket` v1.5.3** — the single persistent connection to `lattice-api`.
   The runner is a WebSocket *client*; it never listens.
 - **`github.com/docker/docker` v27.5.1+incompatible** + **`github.com/docker/go-connections`** —
@@ -102,7 +102,7 @@ defers `telemetry.Recover`. ~2,978 lines. |
 | `backup/destination.go` | `Destination` interface (`Upload`/`Download`/`Test`/`Delete`) + `NewDestination` factory keyed on `s3` / `google_drive` / `samba`. |
 | `backup/s3.go`, `backup/gdrive.go`, `backup/samba.go` | The three backup-destination implementations. |
 | `web/server.go`, `web/dashboard.go` | Local read-only status dashboard (HTTP). Binds `127.0.0.1:9100` by default. |
-| `Dockerfile` | Multi-stage `golang:1.25-alpine` → `alpine:3.19`; ships `docker-cli` + `curl`; runs as UID 1001 in the `docker` group. |
+| `Dockerfile` | Multi-stage `golang:1.26-alpine` → `alpine:3.19`; ships `docker-cli` + `curl`; runs as UID 1001 in the `docker` group. |
 | `Devfile.yaml` | `dev` CLI command wiring (`build`/`run`/`test`/`fmt`/`vet`/`check`/`tidy`). |
 
 ## Running, building & testing
@@ -648,6 +648,18 @@ daemon on its host and the WebSocket to `lattice-api`. It does not import `go-fo
 (see *Monitor telemetry*).
 
 ## Operations
+
+- **CI runners:** every GitHub Actions job runs on `[self-hosted, lattice-worker]` — a
+  single-use runner started by `aidenappl/gh-runner-broker` on the CI host (`aplb-actions`,
+  10.15.10.78), with the toolchain and shared Go/npm caches provisioned by
+  `TeamTrailblaze/runner-setup`. Images build through the host's `lattice-builder` BuildKit
+  (`builder: lattice-builder`), never `docker/setup-buildx-action`, which races other runners
+  on the shared Docker daemon; its local layer cache replaces the gha cache. `setup-go` runs
+  with `cache: false`. Jobs stuck in "Queued" mean the broker or the host is down — check the
+  `gh-runner-broker` service in Monitor (zone `appleby`).
+  **Fallback:** Lattice must build even when that host is down, since Lattice is how you fix it.
+  Set the repo variable `LATTICE_CI_RUNS_ON` to `["ubuntu-latest"]` and every job runs
+  GitHub-hosted, building with `docker/setup-buildx-action`; delete the variable to switch back.
 
 - **Where it runs:** one instance per worker VM, as a `systemd` service
   (`/etc/systemd/system/lattice-runner.service`, `Restart=always`, `RestartSec=5`), working dir

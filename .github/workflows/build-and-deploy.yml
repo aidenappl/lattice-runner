@@ -7,7 +7,7 @@ on:
 
 jobs:
   resolve-version:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LATTICE_CI_RUNS_ON || '["self-hosted","lattice-worker"]') }}
     outputs:
       version: ${{ steps.version.outputs.value }}
       is_release: ${{ steps.version.outputs.is_release }}
@@ -64,7 +64,7 @@ jobs:
           echo "Resolved version: $VERSION_VALUE (is_release: $IS_RELEASE)"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LATTICE_CI_RUNS_ON || '["self-hosted","lattice-worker"]') }}
 
     steps:
       - name: Checkout code
@@ -74,7 +74,7 @@ jobs:
         uses: actions/setup-go@v5.2.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Check formatting
         run: |
@@ -95,7 +95,7 @@ jobs:
         run: go test ./...
 
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LATTICE_CI_RUNS_ON || '["self-hosted","lattice-worker"]') }}
     needs: [resolve-version, test]
 
     steps:
@@ -112,8 +112,24 @@ jobs:
           access-key-id: ${{ secrets.KEYRING_ACCESS_KEY_ID }}
           secret-access-key: ${{ secrets.KEYRING_SECRET_ACCESS_KEY }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.10.0
+      # The host's shared BuildKit, not docker/setup-buildx-action: that races
+      # with other runners on the shared Docker daemon. Its local layer cache
+      # persists between builds, so there is no gha cache (it fails through a
+      # remote builder anyway).
+      # Lattice must still build when the CI host is down (it is what you would
+      # use to fix it): set the repo variable LATTICE_CI_RUNS_ON to
+      # ["ubuntu-latest"] and every job runs GitHub-hosted, building with
+      # setup-buildx below instead of lattice-builder.
+      - name: Set up Docker Buildx (GitHub-hosted fallback)
+        if: runner.environment == 'github-hosted'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Use lattice-builder
+        if: runner.environment == 'self-hosted'
+        run: |
+          docker buildx inspect lattice-builder >/dev/null 2>&1 \
+            || docker buildx create --name lattice-builder --driver remote tcp://127.0.0.1:1234
+          docker buildx inspect lattice-builder
 
       - name: Login to Registry
         uses: docker/login-action@v3.4.0
@@ -135,21 +151,21 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
+          builder: ${{ runner.environment == 'self-hosted' && 'lattice-builder' || '' }}
+          provenance: false
           context: .
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: VERSION=${{ needs.resolve-version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Summary
         run: |
           echo "Image pushed: ${{ env.REGISTRY_URL }}/${{ github.event.repository.name }}:latest @ ${{ needs.resolve-version.outputs.version }}"
 
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.LATTICE_CI_RUNS_ON || '["self-hosted","lattice-worker"]') }}
     needs: [resolve-version, build-and-push]
     if: needs.resolve-version.outputs.is_release == 'true'
     permissions:
