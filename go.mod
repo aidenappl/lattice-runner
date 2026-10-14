@@ -1,6 +1,6 @@
 module github.com/aidenappl/lattice-runner
 
-go 1.25.5
+go 1.26.9
 
 require (
 	github.com/aidenappl/go-monitor v0.0.9-0.20260912224748-17017e52efeb
