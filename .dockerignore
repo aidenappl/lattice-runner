@@ -1,0 +1,4 @@
+# Keep the build context stable: a fresh checkout's .git differs every run and
+# would break the layer cache from COPY . . onwards.
+.git
+.github
