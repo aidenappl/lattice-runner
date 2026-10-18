@@ -268,6 +268,12 @@ func (e *Executor) execute(ctx context.Context, spec DeploymentSpec) (string, er
 		}
 	}
 
+	// Hold every container this deployment replaces for the rest of it,
+	// rollback and verification included, so a token-triggered recreate (or any
+	// other container action) of the same container waits instead of racing it.
+	// See deploy/locks.go for the 2026-10-17 failure this prevents.
+	defer lockSpecContainers(ctx, spec)()
+
 	// Clean up stale containers from this stack that are no longer in the spec
 	// (e.g. renamed or removed from compose). This prevents port conflicts and
 	// orphaned containers when compose services are renamed.

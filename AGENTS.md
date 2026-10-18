@@ -213,6 +213,16 @@ differ from a typical Go API.
   suffix format in one place, change it in all three** (`GenerateSuffix`,
   `docker.IsGeneratedSuffixSegment` used by `isCanonicalVariant`, and `CanonicalContainerName`) or
   containers become unfindable / logs orphan.
+- **Operations on one container are serialised** (`deploy/locks.go`). A deployment takes
+  `lockSpecContainers` (every spec container and replica, by **canonical** name, in sorted order)
+  for its whole run — rollback and verification included — and each container action (`stop`,
+  `start`, `kill`, `pause`, `unpause`, `restart`, `remove`, `recreate`, `force_remove`) takes
+  `deploy.LockContainer(ctx, name)` right after name validation. Without it a CI deploy token's
+  `recreate` and a stack deploy interleaved on 2026-10-17: the deploy stopped only the
+  `-retired-` copy, then lost the port bind to the recreate's new container (`port is already
+  allocated`), and the recreate's cleanup hit "No such container". A wait is logged
+  (`waiting for another operation on this container to finish`). The wait is bounded by `LOCK_WAIT_LIMIT` (10 min): the runner puts no timeout on a deploy, so past it the waiter warns and proceeds unlocked rather than blocking forever behind a stuck one. Never take a second container
+  lock inside a held one except through `lockSpecContainers`' sorted acquisition.
   - **Generated suffixes carry the `docker.SuffixMarker` (`"ltc"`) prefix** so the segment is
     `ltc` + 6 lowercase-alnum (e.g. `myapp-ltcz9i7q2`). This is deliberate: the previous *bare*
     6-char suffix collided with real container names ending in a 6-char word (`-worker`, `-server`,
@@ -793,6 +803,9 @@ writes these.
   message, or changing a payload field breaks `lattice-api`'s side and the whole worker fleet. If
   you must evolve it, coordinate the change in `lattice-api` in lockstep and update the tables above
   in the same change. Read the `lattice-api` handler — don't infer the shape.
+- **Take the container lock before touching a container.** A new handler that stops, replaces or
+  removes a container must call `deploy.LockContainer` first (see *How code is written here*), or
+  it can race a deploy of the same container.
 - **Always validate container names from the orchestrator** with `validContainerName` before any
   Docker call or exec. Names reach shell (db dumps) and Docker lookups.
 - **Keep the suffix helpers in sync** — `GenerateSuffix`, `docker.IsGeneratedSuffixSegment` (used by
