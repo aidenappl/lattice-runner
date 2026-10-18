@@ -562,6 +562,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "stop", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -632,6 +633,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "start", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -702,6 +704,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "kill", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -772,6 +775,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "pause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -842,6 +846,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "unpause", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -912,6 +917,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "restart", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -982,6 +988,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				sendLifecycleLog(ctx, ws, containerName, "remove", "looking up container…")
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
@@ -1056,6 +1063,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 
 				// Pull the latest image before recreating.
 				imageRef, _ := env.Payload["image"].(string)
@@ -1776,6 +1784,7 @@ func main() {
 					})
 					return
 				}
+				defer deploy.LockContainer(ctx, containerName)()
 				id, err := docker.FindContainerByName(ctx, containerName)
 				if err != nil || id == "" {
 					slog.WarnContext(ctx, "container not found", "component", "force_remove", "container", containerName, "error", err)
