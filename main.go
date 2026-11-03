@@ -2031,6 +2031,11 @@ func main() {
 
 				port := int(portF)
 
+				// Serialise with any remove of the same name, and let one sent
+				// while this create is still pulling cancel it (db_inflight.go).
+				createCtx, finishCreate := beginDbCreate(ctx, containerName)
+				defer finishCreate()
+
 				// Acknowledge receipt before doing anything slow. Pulling a
 				// database image can take minutes; without this the
 				// orchestrator cannot distinguish "the worker never got the
@@ -2068,6 +2073,7 @@ func main() {
 				}
 
 				spec := dockerclient.DatabaseSpec{
+					InstanceID:    payloadInt(env.Payload, "database_instance_id"),
 					ContainerName: containerName,
 					VolumeName:    volumeName,
 					Engine:        engine,
@@ -2090,8 +2096,17 @@ func main() {
 				}
 
 				sendLifecycleLog(ctx, ws, containerName, "db_create", fmt.Sprintf("creating %s:%s database container…", engine, engineVersion))
-				containerID, err := docker.CreateDatabaseContainer(ctx, spec)
+				containerID, err := docker.CreateDatabaseContainer(createCtx, spec)
+				if err == nil && createCtx.Err() != nil && ctx.Err() == nil {
+					// Finished in the instant a remove cancelled it: the remove
+					// is waiting on this create and will destroy the container,
+					// so report what will be true, not what is true right now.
+					err = fmt.Errorf("create cancelled by a remove of %s", containerName)
+				}
 				if err != nil {
+					if createCtx.Err() != nil && ctx.Err() == nil {
+						err = fmt.Errorf("create cancelled by a remove of %s: %w", containerName, err)
+					}
 					slog.ErrorContext(ctx, "failed to create database container", "component", "db_create", "container", containerName, "error", err)
 					sendLifecycleLog(ctx, ws, containerName, "db_create", fmt.Sprintf("failed to create: %v", err))
 					sendDbReply(ctx, ws, env, "db_status", map[string]any{
@@ -2323,6 +2338,15 @@ func main() {
 						"message":        "volume purge requested but volume_name is missing or invalid",
 					})
 					return
+				}
+
+				// Cancel a create still in flight for this name and wait for it
+				// to return, so this remove sees (and destroys) whatever it
+				// produced instead of finding nothing yet (APL-1).
+				cancelledCreate, finishRemove := beginDbRemove(containerName)
+				defer finishRemove()
+				if cancelledCreate {
+					sendLifecycleLog(ctx, ws, containerName, "db_remove", "cancelled the in-flight create; removing what it produced")
 				}
 
 				sendLifecycleLog(ctx, ws, containerName, "db_remove", "looking up database container…")
@@ -3193,6 +3217,22 @@ func sendDbReply(ctx context.Context, ws *client.WSClient, env client.Envelope, 
 		Type:    msgType,
 		Payload: buildDbReplyPayload(env, payload),
 	})
+}
+
+// payloadInt reads an integer field, tolerating the string form an
+// orchestrator might send. Missing or unparsable is 0.
+func payloadInt(p map[string]any, key string) int {
+	switch v := p[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // payloadString reads the first of several candidate keys that yields a
