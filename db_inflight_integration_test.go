@@ -41,7 +41,7 @@ func TestDeleteMidPullLeavesNothing(t *testing.T) {
 		_, err := docker.CreateDatabaseContainer(createCtx, dockerclient.DatabaseSpec{
 			InstanceID: 1, ContainerName: name, VolumeName: volume,
 			Engine: "postgres", EngineVersion: tag, Port: 25432,
-			RootPassword: "it-root", DatabaseName: "it", Username: "it", Password: "it-pass",
+			RootPassword: "it-root", DatabaseName: "it", Username: "it", Password: "it-pass", // ggignore
 		})
 		createDone <- err
 	}()
