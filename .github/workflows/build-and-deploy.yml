@@ -3,6 +3,7 @@ name: Build and Deploy to Registry
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', '.nexus.toml']
   workflow_dispatch:
 
 jobs:
