@@ -197,6 +197,9 @@ func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockercl
 			"health":         dockerHealthToLattice(c.Health),
 			"restart_count":  c.RestartCount,
 		}
+		if c.InstanceID > 0 {
+			entry["database_instance_id"] = c.InstanceID
+		}
 
 		// A restart count alone says a container is unhappy but not why. When
 		// one is clearly flapping, look for the handful of fatal signatures that
@@ -219,10 +222,18 @@ func sendDatabaseSync(ctx context.Context, ws *client.WSClient, docker *dockercl
 		entries = append(entries, entry)
 	}
 
+	payload := map[string]any{"containers": entries}
+	// Data volumes, so the control plane can flag one no instance owns. Omitted
+	// (not sent empty) when listing fails: an empty list would read as "every
+	// volume is gone".
+	if volumes, err := docker.ListDatabaseVolumes(ctx); err != nil {
+		slog.WarnContext(ctx, "failed to list database volumes", "component", "db_sync", "error", err)
+	} else {
+		payload["volumes"] = volumes
+	}
+
 	wsSendReliable(ctx, ws, "db_sync", client.OutgoingMessage{
-		Type: "db_sync",
-		Payload: map[string]any{
-			"containers": entries,
-		},
+		Type:    "db_sync",
+		Payload: payload,
 	})
 }

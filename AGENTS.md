@@ -78,6 +78,7 @@ message dispatch `switch`.
 |------|------|
 | `main.go` | Entrypoint + **the message handler**. CLI dispatch (`setup`/`version`/default), Docker connect-with-retry, wires up every subsystem, and contains the ~40-case `switch env.Type` that handles every inbound message. Also holds `sendLifecycleLog`, `handleScheduledSnapshot`, the heartbeat loop, graceful shutdown, and `safeGo` (panic-recovering goroutine launcher). Every command goroutine
 defers `telemetry.Recover`. ~2,978 lines. |
+| `db_inflight.go` | Per-container-name serialisation of `db_create` / `db_remove`: `beginDbCreate` (cancellable context + name lock), `beginDbRemove` (cancels an in-flight create, then waits for it). Unit tests in `db_inflight_test.go`; the Docker-backed delete-mid-pull test in `db_inflight_integration_test.go` (`-tags=integration`). |
 | `validate.go` | `validContainerName` — the allow-list guard applied to every container name arriving from the orchestrator (alphanumeric + `-_./`, ≤128 chars). |
 | `validate_test.go` | Table-driven tests for `validContainerName` (accepts normal names, rejects spaces and shell metacharacters `;$&\`|`). |
 | `config/config.go` | `Config` struct + `Load()`. Reads env vars, **enforces `wss://`** unless `ALLOW_INSECURE=true`, panics on missing required vars. `LoadMonitor()` reads the `MONITOR_*` block and never panics — it runs first, so a failing `Load` is reported. |
@@ -476,6 +477,27 @@ reality rather than trusting that command replies arrived:
   value is never legitimate; it always means the caller skipped the conversion, which is exactly
   the bug that made every create fail when 512MB arrived as 512 bytes.
 
+**Create and remove are serialised per container name, and a remove cancels an in-flight create**
+(`db_inflight.go`). Each `db_*` command runs in its own goroutine, so before this a delete sent
+while `db_create` was still pulling found no container, reported success (an absent container is
+the goal of a remove), and the control plane retired the record. The create then finished and left a
+running container and a populated volume nothing owned. The next instance created under the same
+name was matched to it and served the lost instance's credentials (APL-1). `beginDbRemove`
+cancels the create's context, which aborts the pull or Docker call, then waits for the name's lock,
+which the create holds until it returns. The remove therefore always destroys what the create
+produced. A create that is cancelled reports `failed` ("create cancelled by a remove"), never
+`success`. `CreateDatabaseContainer` re-checks its context before starting the container, and its
+error cleanup runs on a context of its own, because the usual reason to clean up is that the
+original was cancelled.
+
+**Containers carry their instance id.** `db_create` stamps `lattice-database-instance-id=<id>`
+(`LabelDatabaseInstanceID`). `db_sync` reports it as `database_instance_id` on each container. The
+control plane matches observations to instances by that id, not by name, so a same-name container
+left by an earlier instance can't be adopted. Containers created before the label have no id, and
+the control plane falls back to the name for them. `db_sync` also carries `volumes`, every
+`lattice-dbdata-*` volume on the host (omitted when listing fails, so an error never reads as "no
+volumes"), so the control plane can flag data volumes no instance owns.
+
 **Data volumes are never silently reused.** `CreateDatabaseContainer` refuses to start when
 `lattice-dbdata-<name>` already exists unless `adopt_existing_volume` is set. Every official
 database image only initialises when its data directory is empty, so attaching a populated volume
@@ -863,7 +885,16 @@ go vet ./...         # must be clean
 `build-and-push` depends on**, so unformatted code or a failing test blocks the image build and the
 deploy. The formatting gate uses plain `gofmt -l .`.
 
-There is no integration suite and no live smoke test in this repo. If you change the message
+```bash
+go test -tags=integration -run TestDeleteMidPull -count=1 .   # needs Docker + network (pulls postgres:17-alpine)
+```
+
+`db_inflight_integration_test.go` is the only Docker-backed test. It runs a real
+`CreateDatabaseContainer` and lands a remove mid-pull. Set `LATTICE_IT_DB_IMAGE_TAG` to another
+postgres tag if `17-alpine` is already cached, because the remove must arrive while the pull is still
+running. It is not in CI.
+
+There is no other integration suite and no live smoke test in this repo. If you change the message
 protocol, the real verification is a round-trip against a running `lattice-api` (or its worker WS
 endpoint) — schema-level agreement is not enough, and the database subsystem is the cautionary
 example: eight separate defects shipped because both sides compiled fine and nobody exercised the

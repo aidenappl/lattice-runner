@@ -17,6 +17,10 @@ import (
 
 // DatabaseSpec defines a database container to create.
 type DatabaseSpec struct {
+	// InstanceID is the control plane's database_instances.id, stamped on the
+	// container as LabelDatabaseInstanceID so observation matches containers to
+	// instances by id, never by a name a previous instance may have used.
+	InstanceID    int
 	ContainerName string
 	VolumeName    string
 	Engine        string // mysql, mariadb, postgres
@@ -228,9 +232,14 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 	}
 
 	var containerID string
+	// Cleanup runs on its own context: the usual reason to clean up is that ctx
+	// was cancelled (a remove arrived mid-create), and a cancelled context
+	// would make the remove call fail too.
 	cleanupOnError := func() {
 		if containerID != "" {
-			_ = c.cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+			cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer ccancel()
+			_ = c.cli.ContainerRemove(cctx, containerID, container.RemoveOptions{Force: true})
 		}
 	}
 
@@ -270,6 +279,9 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 		"lattice-type":   "database",
 		"lattice-engine": spec.Engine,
 	}
+	if spec.InstanceID > 0 {
+		labels[LabelDatabaseInstanceID] = strconv.Itoa(spec.InstanceID)
+	}
 
 	// Create the container
 	resp, err := c.cli.ContainerCreate(ctx,
@@ -302,6 +314,13 @@ func (c *Client) CreateDatabaseContainer(ctx context.Context, spec DatabaseSpec)
 	}
 	containerID = resp.ID
 
+	// A remove may have cancelled this create while ContainerCreate ran. Don't
+	// start a database nobody owns any more.
+	if err := ctx.Err(); err != nil {
+		cleanupOnError()
+		return "", fmt.Errorf("create cancelled before start: %w", err)
+	}
+
 	// Start
 	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		cleanupOnError()
@@ -320,8 +339,11 @@ type ContainerHealth struct {
 // ObservedDatabaseContainer is the state of one managed database container as
 // the worker actually sees it, as opposed to what the control plane believes.
 type ObservedDatabaseContainer struct {
-	ID           string
-	Name         string
+	ID   string
+	Name string
+	// InstanceID is the LabelDatabaseInstanceID label, or 0 for a container
+	// created before the label existed.
+	InstanceID   int
 	State        string // running, exited, restarting, created, paused, dead
 	Health       *ContainerHealth
 	RestartCount int
@@ -355,6 +377,9 @@ func (c *Client) ListDatabaseContainers(ctx context.Context) ([]ObservedDatabase
 			Name:  name,
 			State: ctr.State,
 		}
+		if v, err := strconv.Atoi(ctr.Labels[LabelDatabaseInstanceID]); err == nil {
+			entry.InstanceID = v
+		}
 
 		// Restart count and health only come back from an inspect. A failure
 		// here shouldn't drop the container from the report — knowing it exists
@@ -374,6 +399,34 @@ func (c *Client) ListDatabaseContainers(ctx context.Context) ([]ObservedDatabase
 	}
 
 	return observed, nil
+}
+
+// LabelDatabaseInstanceID carries the owning database_instances.id.
+const LabelDatabaseInstanceID = "lattice-database-instance-id"
+
+// DatabaseVolumePrefix is how the control plane names data volumes
+// (lattice-dbdata-<instance name>).
+const DatabaseVolumePrefix = "lattice-dbdata-"
+
+// ListDatabaseVolumes returns the names of every data volume on this host,
+// attached or not. A volume outlives its container by design (db_remove keeps
+// it unless asked to purge), so this is how the control plane finds data
+// volumes no instance owns any more.
+func (c *Client) ListDatabaseVolumes(ctx context.Context) ([]string, error) {
+	f := filters.NewArgs()
+	f.Add("name", DatabaseVolumePrefix)
+	resp, err := c.cli.VolumeList(ctx, volume.ListOptions{Filters: f})
+	if err != nil {
+		return nil, fmt.Errorf("list database volumes: %w", err)
+	}
+	names := make([]string, 0, len(resp.Volumes))
+	for _, v := range resp.Volumes {
+		// The name filter is a substring match; keep only true prefixes.
+		if v != nil && strings.HasPrefix(v.Name, DatabaseVolumePrefix) {
+			names = append(names, v.Name)
+		}
+	}
+	return names, nil
 }
 
 // defaultDBPort returns the default internal port for a database engine.
