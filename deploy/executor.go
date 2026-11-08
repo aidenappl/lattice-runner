@@ -69,6 +69,9 @@ type DeploymentSpec struct {
 	Containers   []ContainerSpec `json:"containers"`
 	Networks     []NetworkSpec   `json:"networks"`
 	Volumes      []VolumeSpec    `json:"volumes"`
+	// ImagePrune is the stack's post-deploy image prune setting; nil (an
+	// older lattice-api) means enabled, keep DEFAULT_IMAGE_KEEP.
+	ImagePrune *ImagePruneSpec `json:"image_prune,omitempty"`
 }
 
 type ContainerSpec struct {
@@ -315,6 +318,11 @@ func (e *Executor) execute(ctx context.Context, spec DeploymentSpec) (string, er
 		e.reportProgress(spec.DeploymentID, "failed", fmt.Sprintf("post-deploy verification failed: %v", verifyErr), nil)
 		return STEP_VERIFY, verifyErr
 	}
+
+	// The new containers passed verification, so the previous images are
+	// only rollback insurance now: keep the newest N per repository and
+	// remove the rest. Never fails the deploy.
+	e.pruneImages(ctx, spec)
 
 	e.reportProgress(spec.DeploymentID, "deployed", fmt.Sprintf("deployment completed successfully via %s strategy", strategyName), nil)
 	return "", nil
