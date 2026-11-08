@@ -79,7 +79,7 @@ func TestDoStreamReportsGoneContainer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ls := NewLogStreamer(fakeDockerLogs(t, tt.status), func(LogLine) {}, time.Hour)
-			_, gone := ls.doStream(context.Background(), "0a61bb2068c9", "trailblaze-auth-v2", time.Time{})
+			_, gone := ls.doStream(context.Background(), "0a61bb2068c9", "trailblaze-auth-v2", time.Time{}, nil)
 			if gone != tt.wantGone {
 				t.Errorf("gone = %v, want %v", gone, tt.wantGone)
 			}

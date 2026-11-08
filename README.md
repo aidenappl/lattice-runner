@@ -80,6 +80,7 @@ Loaded in `config/config.go`. Required variables cause a startup panic if missin
 | `WORKER_TOKEN` | **Yes** | — | Worker auth token; sent as `?token=` on the WS handshake. |
 | `WORKER_NAME` | No | hostname | Human-readable worker name in registration. |
 | `HEARTBEAT_INTERVAL` | No | `10s` | Metrics/heartbeat cadence. |
+| `LOG_LINES_PER_SECOND` | No | `200` | Per-container cap on streamed log lines (`0` = no cap). |
 | `RECONNECT_INTERVAL` | No | `5s` | WebSocket reconnect backoff. |
 | `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port. |
 | `DASHBOARD_BIND` | No | `127.0.0.1` | Dashboard bind address (localhost-only by default). |

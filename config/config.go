@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +16,8 @@ type Config struct {
 	ReconnectInterval time.Duration
 	DashboardPort     string
 	LatticeURL        string
+	// LogLinesPerSecond caps each container's streamed log lines; 0 = no cap.
+	LogLinesPerSecond int
 }
 
 func Load() *Config {
@@ -36,6 +39,7 @@ func Load() *Config {
 		ReconnectInterval: parseDuration("RECONNECT_INTERVAL", 5*time.Second),
 		DashboardPort:     getEnv("DASHBOARD_PORT", "9100"),
 		LatticeURL:        getEnv("LATTICE_URL", ""),
+		LogLinesPerSecond: parseInt("LOG_LINES_PER_SECOND", 200),
 	}
 	return cfg
 }
@@ -97,6 +101,19 @@ func hostname() string {
 		return "unknown"
 	}
 	return h
+}
+
+// parseInt reads a non-negative integer, falling back on a missing or bad value.
+func parseInt(key string, fallback int) int {
+	v := getEnv(key, "")
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }
 
 func parseDuration(key string, fallback time.Duration) time.Duration {
