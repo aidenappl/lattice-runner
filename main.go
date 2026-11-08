@@ -2954,6 +2954,7 @@ func main() {
 			},
 		})
 	}, 10*time.Second)
+	logStreamer.LinesPerSecond = cfg.LogLinesPerSecond
 	safeGoResilient("log-streamer", func() { logStreamer.Run(ctx) })
 
 	// Database observer — periodically reports the true state of managed

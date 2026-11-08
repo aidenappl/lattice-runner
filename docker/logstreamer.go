@@ -64,6 +64,9 @@ type LogStreamer struct {
 	docker   *Client
 	callback LogCallback
 	interval time.Duration
+	// LinesPerSecond caps each container's streamed lines (0 = no cap). Set
+	// before Run. See DEFAULT_LOG_LINES_PER_SECOND.
+	LinesPerSecond int
 
 	mu      sync.Mutex
 	tracked map[string]*streamEntry // containerID -> entry
@@ -71,10 +74,11 @@ type LogStreamer struct {
 
 func NewLogStreamer(docker *Client, callback LogCallback, pollInterval time.Duration) *LogStreamer {
 	return &LogStreamer{
-		docker:   docker,
-		callback: callback,
-		interval: pollInterval,
-		tracked:  make(map[string]*streamEntry),
+		docker:         docker,
+		callback:       callback,
+		interval:       pollInterval,
+		LinesPerSecond: DEFAULT_LOG_LINES_PER_SECOND,
+		tracked:        make(map[string]*streamEntry),
 	}
 }
 
@@ -166,9 +170,12 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 	var since time.Time // zero → use Tail:100 on first connect
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	// One limiter per container, kept across reconnects so a flapping stream
+	// cannot reset its own budget.
+	limiter := newLineLimiter(ls.LinesPerSecond)
 
 	for {
-		lastSeen, gone := ls.doStream(ctx, containerID, containerName, since)
+		lastSeen, gone := ls.doStream(ctx, containerID, containerName, since, limiter)
 		if !lastSeen.IsZero() {
 			since = lastSeen
 			// Reset backoff on successful stream that produced data
@@ -210,7 +217,14 @@ func (ls *LogStreamer) stream(ctx context.Context, containerID, containerName st
 // closes or the context is cancelled. Returns the timestamp of the last line
 // received so the caller can avoid replaying historical lines on reconnect, and
 // gone=true when Docker reports the container no longer exists.
-func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string, since time.Time) (lastSeen time.Time, gone bool) {
+func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName string, since time.Time, limiter *lineLimiter) (lastSeen time.Time, gone bool) {
+	// Whatever was suppressed when the stream ends is still reported.
+	defer func() {
+		if marker := limiter.flush(); marker != "" {
+			ls.callback(LogLine{ContainerID: containerID, ContainerName: containerName,
+				Stream: "stderr", Message: marker, RecordedAt: time.Now()})
+		}
+	}()
 	reader, err := ls.docker.StreamContainerLogs(ctx, containerID, since)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
@@ -309,6 +323,14 @@ func (ls *LogStreamer) doStream(ctx context.Context, containerID, containerName 
 
 		if message == "" {
 			continue
+		}
+		ok, marker := limiter.allow(lineTime)
+		if !ok {
+			continue
+		}
+		if marker != "" {
+			ls.callback(LogLine{ContainerID: containerID, ContainerName: containerName,
+				Stream: "stderr", Message: marker, RecordedAt: lineTime})
 		}
 		ls.callback(LogLine{
 			ContainerID:   containerID,

@@ -95,6 +95,7 @@ defers `telemetry.Recover`. ~2,978 lines. |
 | `deploy/canary.go` | Canary strategy: start one `-canary` container, monitor ~30s, then fall through to rolling if healthy. |
 | `docker/docker.go` | The Docker Engine API wrapper (`Client`): container CRUD/lifecycle, image pulls with registry auth, networks, volumes, exec sessions, `GracefulRecreate`, `ContainerStats`, env-key/host-path validation. |
 | `docker/logstreamer.go` | Per-container log streaming with `CanonicalContainerName` (strips deploy suffixes so logs map to the DB name). |
+| `docker/loglimit.go` | Per-container log rate limit (`LOG_LINES_PER_SECOND`, default 200, 0 = off): one-second windows, one limiter per container kept across reconnects; suppressed lines are counted and reported as one `[lattice] N log lines suppressed …` stderr line when the next window opens or the stream ends. Added after worker-6's two ClickHouse servers (log file unwritable, every message a stack trace on stderr) streamed 200–400 lines/s each and overflowed the socket send queue (2026-11-08). |
 | `docker/netmonitor.go` | Network health monitor: detects DNS failures, bridge-only containers, restart loops; attempts auto-repair; reports via `lifecycle_log`. |
 | `docker/database.go` | Database-container creation (`CreateDatabaseContainer`, `DatabaseSpec`) and dump/restore exec helpers (`ExecDatabaseDump`, `ExecDatabaseRestore`). |
 | `docker/snapshot.go` | Snapshot helpers used by the db snapshot/restore flows. |
@@ -651,6 +652,7 @@ Read in `config/config.go` (unless noted). Required vars **panic** if missing.
 | `WORKER_TOKEN` | **Yes** | — | Worker auth token; sent as `?token=` on the WS handshake. |
 | `WORKER_NAME` | No | hostname | Human-readable worker name in registration. |
 | `HEARTBEAT_INTERVAL` | No | `10s` | Metrics/heartbeat cadence. (README says 15s; code default is 10s.) |
+| `LOG_LINES_PER_SECOND` | No | `200` | Per-container cap on log lines streamed to lattice-api; excess is counted and summarized. `0` disables it. |
 | `RECONNECT_INTERVAL` | No | `5s` | WS reconnect backoff. |
 | `DASHBOARD_PORT` | No | `9100` | Local dashboard HTTP port. |
 | `LATTICE_URL` | No | `""` | Link back to the orchestrator UI, shown on the dashboard. |
