@@ -20,7 +20,9 @@ const DEFAULT_IMAGE_KEEP = 2
 const PRUNE_TIMEOUT = 2 * time.Minute
 
 // ImagePruneSpec is the stack's prune setting from the deploy spec. Absent
-// means enabled with DEFAULT_IMAGE_KEEP.
+// means enabled with DEFAULT_IMAGE_KEEP. lattice-api builds it from
+// stacks.image_prune_keep (-1 = off, 0–20 kept), set per stack in lattice-web's
+// Image Cleanup field.
 type ImagePruneSpec struct {
 	Enabled bool `json:"enabled"`
 	Keep    int  `json:"keep"`
