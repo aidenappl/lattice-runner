@@ -297,7 +297,7 @@ silently ignored.
 | Inbound `type` | Payload (key fields) | What the runner does | Outbound replies |
 |---|---|---|---|
 | `connected` | — | Orchestrator acked the socket; runner sends its registration | `registration` |
-| `deploy` | full `DeploymentSpec` (`deployment_id`, `stack_name`, `strategy`, `targeted`, `force`, `containers[]`, `networks[]`, `volumes[]`, `attempt`, `max_retries`) | Parse+validate spec, create nets/volumes, run strategy, verify | `deployment_progress` (repeated) |
+| `deploy` | full `DeploymentSpec` (`deployment_id`, `stack_name`, `strategy`, `targeted`, `force`, `containers[]`, `networks[]`, `volumes[]`, `attempt`, `max_retries`, `image_prune?`) | Parse+validate spec, create nets/volumes, run strategy, verify, prune old images | `deployment_progress` (repeated) |
 | `deployment_ping` | `deployment_id` | Report current in-memory deploy state | `deployment_status` |
 | `start` | `container_name` | Find + start container | `container_status`, `lifecycle_log` |
 | `stop` | `container_name` | Find + stop (30s timeout) | `container_status`, `lifecycle_log` |
@@ -398,6 +398,20 @@ carries a `DeploymentSpec`. `Executor.Execute` (in `deploy/executor.go`):
 7. `postDeployVerify` — 6 checks at 10s intervals (60s). Flags containers that vanished, are stuck
    `restarting`, `exited`/`dead`, have a non-zero `RestartCount`, or report `unhealthy`. Persistent
    issues at the final check fail the deployment.
+8. **Post-deploy image prune** (`deploy/prune.go`, APL-86) — only after verification passed. The
+   spec's `image_prune: {enabled, keep}` comes from the stack (lattice-api `stacks.image_prune_keep`);
+   absent (an older API) means enabled, keep `DEFAULT_IMAGE_KEEP` = 2. `selectPrune` takes the
+   repositories of the spec's images and removes local images that belong **only** to those
+   repositories (matched by tag *and* digest — a replaced `:latest` keeps only its digest), that **no
+   container on the worker uses** (any state, so a stopped db or retired container's image is kept),
+   beyond the newest `keep` per repository. Other stacks' images, managed database images, base
+   images and digest-less local builds are never touched. `RemoveImage` is not forced, so Docker
+   itself refuses an image in use. Reported as a `deployment_progress` (`status: validating`,
+   `step: image_prune`, `images_removed`, `bytes_reclaimed`) before the final `deployed`, so it lands
+   in the deployment log. Best-effort with a 2-minute bound: any error is logged (warn) and reported,
+   never fails the deploy. Kept images let a rollback start without a pull; a rollback past them
+   re-pulls the tag from the registry. Before this, worker-6's disk filled to 100% in one day of
+   Hillview deploys (111 of 124 images unused, HV-119).
 
 Progress is streamed as `deployment_progress` throughout; `main.go` layers retry bookkeeping
 (`attempt`/`max_retries`) on top. The **in-flight guard is atomic (single-lock check-and-set)** and
@@ -437,7 +451,8 @@ checks, then swaps — the low-conflict path used by the single-container `recre
 ### Metrics reporting
 
 `metrics/Collect` reads host stats from `/proc` and `syscall.Statfs` (CPU delta from `/proc/stat`,
-mem/swap from `/proc/meminfo`, disk from `Statfs("/")`, network from `/proc/net/dev` summing
+mem/swap from `/proc/meminfo`, disk from `Statfs("/")` (`disk_used_mb` = total − available, so
+free = `disk_total_mb − disk_used_mb`; lattice-api's health scan flags low disk from these), network from `/proc/net/dev` summing
 physical interfaces and excluding `docker*`/`br-*`/`veth*`/`virbr*`/`lo`, load/uptime/processes
 from `/proc`). `CollectRunnerMetrics` adds the runner's own goroutine count and heap/sys memory.
 Both are emitted every `HEARTBEAT_INTERVAL` in the `heartbeat` message; per-container resource

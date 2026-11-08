@@ -959,3 +959,32 @@ func (c *Client) ExecInContainer(ctx context.Context, containerID string, cmd []
 func (c *Client) Close() error {
 	return c.cli.Close()
 }
+
+// ImageInfo is the part of a local image the post-deploy prune needs.
+type ImageInfo struct {
+	ID          string
+	RepoTags    []string
+	RepoDigests []string
+	Created     int64
+	Size        int64
+}
+
+// ListImages returns every local image, including untagged ones.
+func (c *Client) ListImages(ctx context.Context) ([]ImageInfo, error) {
+	list, err := c.cli.ImageList(ctx, image.ListOptions{All: false})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ImageInfo, 0, len(list))
+	for _, im := range list {
+		out = append(out, ImageInfo{ID: im.ID, RepoTags: im.RepoTags, RepoDigests: im.RepoDigests, Created: im.Created, Size: im.Size})
+	}
+	return out, nil
+}
+
+// RemoveImage removes an image by ID without force, so Docker itself refuses
+// an image a container still uses.
+func (c *Client) RemoveImage(ctx context.Context, id string) error {
+	_, err := c.cli.ImageRemove(ctx, id, image.RemoveOptions{Force: false, PruneChildren: true})
+	return err
+}
