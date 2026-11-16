@@ -698,6 +698,19 @@ daemon on its host and the WebSocket to `lattice-api`. It does not import `go-fo
 
 ## Operations
 
+### Lattice releases
+
+A push to `main` is a **release** only when the head commit message (the merge subject) contains
+`[release-patch]`, `[release-minor]` or `[release-major]`: CI bumps the latest `vX.Y.Z` tag, tags the
+image with it and creates the GitHub release. Without a marker CI still builds and pushes a
+SHA-tagged image, but `create-release` is skipped and nothing is released.
+
+**Merged but unreleased is not shipped.** Workers update by version (`upgrade_runner` resolves the latest release tag), so unreleased runner code never reaches any worker. Since HV-138 the resolve-version job says so: a main
+push without a marker gets a `::warning::` annotation ("Built <sha> but no release was cut: the merge
+subject had no [release-patch|minor|major]. Nothing will deploy by version.") and the same text in
+the run's job summary. If you see it and meant to ship, land a follow-up commit or merge whose
+subject carries the marker.
+
 - **CI runners:** every GitHub Actions job runs on `[self-hosted, lattice-worker]` — a
   single-use runner started by `aidenappl/gh-runner-broker` on the CI host (`aplb-actions`,
   10.15.10.78), with the toolchain and shared Go/npm caches provisioned by
