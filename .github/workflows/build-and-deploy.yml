@@ -64,6 +64,24 @@ jobs:
           echo "is_release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $VERSION_VALUE (is_release: $IS_RELEASE)"
 
+          # HV-138: a merge without a release marker builds a SHA-tagged image
+          # and skips create-release, so nothing ships by version. Say so where
+          # people look: the run summary and an annotation on the commit.
+          if [ "$IS_RELEASE" = "false" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            SHORT_SHA="${GITHUB_SHA:0:7}"
+            NOTICE="Built $SHORT_SHA but no release was cut: the merge subject had no [release-patch|minor|major]. Nothing will deploy by version."
+            echo "::warning title=No release cut::$NOTICE"
+            {
+              echo "## :warning: No release cut"
+              echo
+              echo "$NOTICE"
+              echo
+              echo "Merged but unreleased is **not shipped**. To release, merge (or push to main) with a subject"
+              echo "containing \`[release-patch]\`, \`[release-minor]\` or \`[release-major]\`."
+              echo "See AGENTS.md, \"Lattice releases\"."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   test:
     runs-on: ${{ fromJSON(vars.LATTICE_CI_RUNS_ON || '["self-hosted","lattice-worker"]') }}
 
